@@ -73,3 +73,37 @@
 ---
 
 *Next: Milestone 3 — RiskGate, sizing, kill switches, lot ledger, wash-sale, leverage.*
+
+---
+
+## Milestone 3 — 2026-04-24 — Deterministic Guards
+
+**What was built:**
+- `execution/lots.py` — FIFO/LIFO tax lot ledger. Immutable `Lot` dataclass mutated via `dataclasses.replace`. Thread-safe with `threading.Lock`. `open_lot()` takes a BUY fill; `close_lots()` walks lots in FIFO or LIFO order consuming `remaining_qty`; `total_open_qty()` sums open lots with an explicit `Decimal("0")` start to satisfy mypy.
+- `execution/tax.py` — Wash-sale rule enforcement. `WashSaleChecker` records only loss-sales (pnl < 0); `is_blocked()` checks 30-day window (inclusive of boundary day); `harvesting_candidates()` returns open lots where `current_price < entry_price`. Cross-agent isolation: records keyed by `(agent_id, symbol)`.
+- `execution/kill_switch.py` — Global kill switch (intraday P&L + drawdown from rolling peak) and per-agent bench. One-directional escalation: states worsen (OK → HALVED → PAUSED → LIQUIDATE) and never auto-recover. `_DRAWDOWN_WORSE_STATES` frozenset prevents downgrading. DRAWDOWN_HALVED does NOT block `can_open_new()` — it signals the sizing layer to cut leverage, not the entry gate. Per-agent: 5 consecutive losses → 24h bench.
+- `execution/sizing.py` — EWMA vol-targeting (λ=0.94, 8% annual vol floor) + leverage caps (1.75× hard cap, ±10% day-over-day change cap). `effective_max_gross = base_max_gross × MASTER_CAPABILITY × vix_scalar × drawdown_scalar`. MC > 1.5 raises ValueError. `classify_vix()` maps VIX to VixBucket enum.
+- `execution/risk.py` — Pre-trade `RiskGate`. Nine ordered checks: (1) LIQUIDATE → only closes, (2) blocked states → no new entries, (3) agent benched, (4) FORCED_CASH bucket → no buys, (5–6) LETF whitelist + 5-day hold-period check, (7) options 20%-of-sleeve cap, (8) single-name weight cap (soft cap — `allowed=True, capped_weight=cap`), (9) effective_gross==0 → no buys.
+- `execution/budget.py` — Daily LLM spend ledger. JSON file persistence keyed by UTC date (not local time). Auto-resets on new day. `is_exhausted()` used by approval_queue before enqueueing.
+- `execution/approval_queue.py` — Pending intents inbox for AUTO_APPROVE=False path. TTL-based expiry, approve/reject by intent_id.
+
+**Test results:** 242/242 pass. Ruff: clean. mypy --strict on `core/` + `execution/`: clean.
+
+**New test files (127 new tests):**
+- `tests/test_lots_fifo.py` — 17 tests: open_lot, FIFO/LIFO close, partial close, spanning multiple lots, error handling, cross-agent isolation, total_open_qty
+- `tests/test_wash_sale.py` — 14 tests: record_sale (loss/gain/break-even/unclosed), is_blocked, harvesting_candidates
+- `tests/test_kill_switch.py` — 35 tests: all global states, drawdown ladder, no-downgrade invariant, heartbeat, reconciliation break, budget exhausted, per-agent bench, `classify_drawdown` parametrize
+- `tests/test_sizing.py` — 30 tests: EWMAVolEstimator (floor, decay), VolTargetSizer (target vol, high vol, 1.75× cap, ±10% day cap, final_leverage), effective_max_gross (per-agent, VIX scalars, drawdown scalars, MC > 1.5 error), `classify_vix` parametrize
+- `tests/test_risk_gate.py` — 24 tests: happy path, all kill switch states, agent bench, FORCED_CASH, LETF checks, options cap, weight cap (soft), zero gross, check_letf_auto_liquidations
+- `tests/test_budget_enforcer.py` — 12 tests: initial state, accumulation, exhaustion, remaining floor, reset_if_new_day, persistence, new instance loads data, stale date, corrupt file
+
+**What surprised me:**
+- `sum()` on an empty generator returns `Literal[0]` (int) not `Decimal` — mypy --strict catches this. Fixed with `sum(..., Decimal("0"))` start value.
+- StrEnum values are lowercase by default, so `KillSwitchState.DRAWDOWN_PAUSED` has string value `"drawdown_paused"`. The veto_reason uses `f"kill_switch:{ks}"` which interpolates the StrEnum value. Test assertions had to match lowercase.
+- Budget persistence: `_load()` must use `datetime.now(UTC).date()` not `date.today()` (local time). If machine timezone is behind UTC, a spend record could be treated as stale 8 hours early.
+- LETF auto-liquidation: a separate `check_letf_auto_liquidations()` method runs at market open, independent of the intent gate. Sells are always allowed through the gate even if overdue — they may be the liquidation itself.
+
+**Pending for M4+:**
+- `execution/risk.py` wash-sale check is wired (WashSaleChecker is a dependency) but not yet called in `check_intent()`. Will activate in M4 once OMS feedback loop provides loss-sale signals.
+- Budget ledger is standalone; wired to KillSwitchEngine.trip_budget_exhausted() will happen in M5 orchestration layer.
+- Approval queue tested but not integrated into the execution planner yet.
