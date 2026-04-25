@@ -171,6 +171,37 @@
 
 **Pending for M6+:**
 - `AlpacaMarketData` not yet wired into the agent observation loop — happens in M6.
+
+---
+
+## Milestone 6 — 2026-04-25 — Haiku Agent End-to-End (LLM + Memory + Calibration)
+
+**What was built:**
+- `agents/llm.py` — `LLMClient`: Anthropic SDK wrapper with (1) pre-call budget gate (raises `BudgetExhausted` if estimated cost > `BudgetLedger.remaining()`), (2) exponential-backoff retry on `RateLimitError`, (3) optional system-prompt caching via `cache_control: ephemeral` block, (4) actual token usage from `response.usage` for cost tracking, (5) `AgentMemo` creation and return. Pricing table for all three models including cache-hit (10% of input rate) and cache-write (125%) tiers.
+- `agents/memory.py` — `AgentMemory`: SQLite-backed (3 tables: `memories`, `journals`, `intent_log`). Thread-safe with `threading.Lock`. Key-value `remember/recall`, daily `write_journal/read_journal`, per-intent `record_intent/record_outcome`, `recent_intents_summary` for LLM context injection.
+- `agents/calibration.py` — `CalibrationTracker`: SQLite-backed Brier-style calibration. Records `(intent_id, agent_id, conviction, outcome)`. `brier_score()` computes `mean((conviction/10 - outcome_binary)^2)`. `calibration_table()` groups by conviction bucket (1-3, 4-6, 7-10) with n, win_rate, per-bucket Brier.
+- `agents/base.py` — `AgentState` dataclass (timestamp, bars_by_symbol, news, positions, account, kill_switch_state, master_capability, effective_max_gross, vix_value, manager text fields) + `BaseAgent` ABC with `observe(state) -> list[Intent]`.
+- `agents/haiku_agent.py` — `HaikuAgent`: reads prompt from `agents/prompts/haiku_agent.md`; guards on `DRAWDOWN_LIQUIDATE`; computes 210-day equity SMA and 50-day+14-day crypto trend; formats context block; calls `LLMClient.call()`; parses JSON response into `Intent` objects (clamped to 4 max, fields truncated to spec limits); records each intent into memory. Any LLM exception → log warning, return `[]`.
+
+**Test results:** 358/358 pass. Ruff: clean. mypy --strict on `core/` + `execution/` + `config/` + `data/` + `agents/`: clean (33 files).
+
+**New test file (28 tests): `tests/test_agents_offline.py`**
+- LLM budget gate (0 budget raises, tiny budget raises, spend recorded after call, memo has correct model)
+- Memory (remember/recall, overwrite, journal read/write, intent record + outcome, summary)
+- Calibration (Brier=0 on no records, near-perfect scores, per-agent filtering, 3-bucket table)
+- SMA/momentum helpers (insufficient history, exact period, positive momentum)
+- HaikuAgent integration (mocked LLM): valid JSON → 1 intent; DRAWDOWN_LIQUIDATE → []; BudgetExhausted → []; 6 intents capped to 4; bad JSON → []; intents recorded in memory; equity/crypto trend correctly computed with 220/70 bars
+
+**What surprised me:**
+- `anthropic.types.ContentBlock` is a union of `TextBlock | ToolUseBlock | ...` — accessing `.text` directly requires `# type: ignore[union-attr]`. Using `getattr(usage, "cache_creation_input_tokens", 0) or 0` handles the case where the field is present but None (SDK returns None when no cache write occurred, not 0).
+- `datetime.utcnow()` in `AgentMemory.remember()` triggered a DeprecationWarning in pytest — fixed to `datetime.now(UTC)` immediately.
+- `KillSwitchState.DRAWDOWN_LIQUIDATE` (not `LIQUIDATE`) is the correct enum value for the liquidate state. The haiku agent guards on this; tests had to use the correct value.
+- `BudgetLedger.record_spend(agent_id: str, ...)` — the signature takes `str`, not `AgentId`. Called with `str(agent_id)` in LLMClient.
+
+**Pending for M7+:**
+- M6 is "Haiku end-to-end" — the full loop (market data → Haiku → OMS → fill → reconcile) is not yet wired into a single `app.py` entrypoint. That wiring happens in M7/M8.
+- `LLMClient` not yet using the prompt-caching cache-read cost efficiently — the cache_creation cost is tracked but the system prompt split (static cached prefix vs. dynamic per-call user message) is not implemented in haiku_agent. Will instrument in M7.
+- Sonnet, Opus, and Manager agents deferred to M7.
 - `DataStore.load_news` Python-side symbol filter is O(n) — acceptable for current scale (≤10K news items/week).
 - No Parquet export yet (blueprint mentions partitioned Parquet files) — DuckDB tables are the primary store; Parquet export is a v1.5 optimization.
 - FRED and Reddit adapters omitted (low priority for v1; FRED data is more useful as macro context in the agent brief than as real-time news).
