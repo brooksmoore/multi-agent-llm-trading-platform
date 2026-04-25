@@ -205,3 +205,31 @@
 - `DataStore.load_news` Python-side symbol filter is O(n) — acceptable for current scale (≤10K news items/week).
 - No Parquet export yet (blueprint mentions partitioned Parquet files) — DuckDB tables are the primary store; Parquet export is a v1.5 optimization.
 - FRED and Reddit adapters omitted (low priority for v1; FRED data is more useful as macro context in the agent brief than as real-time news).
+
+---
+
+## Milestone 7 — 2026-04-24 — Sonnet, Opus, and Manager Agents
+
+**What was built:**
+- `agents/sonnet_agent.py` — `SonnetAgent(BaseAgent)`: multi-factor equity quant. Computes 12-1 price momentum proxy from available bar history (sorted by timestamp). Ranks all symbols by momentum, presents top 25 as the "factor ranking" context block. Parses the Sonnet prompt JSON schema: `market_observation`, `intents` (≤5), `calibration_note`, `next_check`. Maps non-standard actions (`"trim"` → `SELL`, `"add"` → `BUY`, `"exit"` → `SELL`). Guards on `DRAWDOWN_LIQUIDATE`; any LLM exception → `[]`. Records each emitted intent in `AgentMemory`.
+- `agents/opus_agent.py` — `OpusAgent(BaseAgent)`: concentrated GARP discretionary PM. Two call modes: `observe()` for daily thesis health checks (≤3 intents) and `deep_dive(state, symbol, doc_pack)` for Thursday/Friday extended-context analysis. `_ACTION_MAP` handles `"hold"` → None (no order), `"trim"` → `SELL`, `"add"` → `BUY`, `"exit"` → `SELL`. `_parse_json()` helper is shared between both modes for JSON extraction with fallback brace-finding. `deep_dive` returns the full deep-dive dict (bull_case, bear_case, kill_criteria, catalyst_calendar, intent) rather than `list[Intent]`.
+- `agents/manager_agent.py` — `ManagerAgent` (not a `BaseAgent` — has no `observe()`): CIO orchestrator with 7 distinct call methods: `regime_read`, `adversarial_critique`, `capital_reallocation`, `risk_check`, `drawdown_response`, `weekly_journal`, `master_capability_proposal`. All JSON calls share `_call_and_parse()` (format user message → LLM → JSON parse with brace-finding fallback → return `dict`). `weekly_journal` returns raw markdown string. Each method formats the appropriate user message from `AgentState` + call-specific arguments and uses the correct call_type string for `BudgetLedger` tracking.
+- `tests/test_agents_m7.py` — 27 tests covering all three agents (mocked LLM via `MagicMock(spec=LLMClient)`):
+  - SonnetAgent (8 tests): valid JSON → 1 intent, liquidate → [], bad JSON → [], budget exhausted → [], 8 intents capped to 5, "trim" → SELL, memory recording, factor signal computation
+  - OpusAgent (9 tests): valid JSON → 1 intent (add→buy), liquidate → [], bad JSON → [], budget exhausted → [], 5 intents capped to 3, hold → [] (no order), deep_dive returns dict, deep_dive failure → {}, memory recording
+  - ManagerAgent (10 tests): regime_read, regime_read failure, adversarial_critique, capital_reallocation, risk_check, drawdown_response, weekly_journal (returns string), weekly_journal failure (returns ""), master_capability_proposal, bad JSON → {}
+
+**Test results:** 385/385 pass. Ruff: clean. mypy --strict on `core/` + `execution/` + `data/` + `agents/` (34 files): clean.
+
+**What surprised me:**
+- `json.loads()` returns `Any`, and the type-ignore comment needs to match `[no-any-return]` rather than `[return-value]`. The cleaner fix is to assign to an explicitly typed intermediate variable (`result: dict[str, Any] = json.loads(...)`) and return that — no ignore comment needed, mypy is satisfied.
+- `ManagerAgent` deliberately does not inherit `BaseAgent`. The `BaseAgent` ABC requires `observe(state) -> list[Intent]`, but the Manager has 7 distinct call types returning different schemas (dict, str). Forcing it into the `observe()` pattern would require a `call_type` parameter that the ABC doesn't have. A standalone class with typed methods is the right design.
+- The `_ACTION_MAP` for OpusAgent includes `"hold" → None` — the intent parsing loop skips `None`-mapped actions. This correctly produces zero intents when the LLM returns a "hold" recommendation, which is the most common daily output for the Opus sleeve.
+- `deep_dive()` max_tokens is 4096 vs. the standard 1536 for all other call types — the deep-dive prompt is designed to produce 300–500 word analysis sections and needs the larger budget.
+
+**Pending for M8+:**
+- App entrypoint (`app.py` or `main.py`) wiring all four agents into a scheduled loop (APScheduler, Alpaca streaming, market-hours awareness).
+- Sleeve budget tracking: each agent's `AgentMemory` tracks intents, but there's no runtime object managing per-sleeve NAV, Sortino, and the 4-week performance snapshot the Manager needs for `capital_reallocation`.
+- `ManagerAgent.adversarial_critique` currently receives raw `list[Intent]` — a future enhancement feeds only the highest-conviction new intent per agent per day.
+- OpusAgent deep-dive scheduler: the Thursday/Friday cron job that selects which holding to deep-dive and fetches the document pack (10-Q/10-K via EDGAR + yfinance transcripts).
+- Weekly journal persistence: `weekly_journal()` returns a markdown string; writing it to `logs/WEEK_NN.md` and posting it to Telegram is part of the M8 ops layer.
