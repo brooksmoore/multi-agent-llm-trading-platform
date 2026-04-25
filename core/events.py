@@ -175,20 +175,16 @@ class EventBus:
             ]
 
     def publish(self, event: Event) -> None:
-        """Dispatch event to all registered handlers synchronously."""
+        """Dispatch event to name-specific handlers AND wildcard subscribers."""
         with self._lock:
-            handlers = list(self._handlers.get(event.name, []))
-        for handler in handlers:
+            specific = list(self._handlers.get(event.name, []))
+            wildcard = list(self._handlers.get("*", []))
+        for handler in specific + wildcard:
             handler(event)
 
     def subscribe_all(self, handler: EventHandler) -> None:
         """Register a handler that receives every event regardless of name."""
         self.subscribe("*", handler)
 
-    def publish_all(self, event: Event) -> None:
-        """Publish to name-specific handlers AND wildcard handlers."""
-        with self._lock:
-            specific = list(self._handlers.get(event.name, []))
-            wildcard = list(self._handlers.get("*", []))
-        for handler in specific + wildcard:
-            handler(event)
+    # Alias retained for legacy M1 test code; identical to publish().
+    publish_all = publish
