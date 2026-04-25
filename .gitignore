@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+
+# Data (never commit market data or SQLite state)
+data/
+*.db
+*.duckdb
+*.parquet
+
+# Logs (do commit build_journal.md; gitignore ephemeral agent memos)
+logs/*.json
+logs/agent_memos/
+logs/*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Test / coverage artifacts
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage
