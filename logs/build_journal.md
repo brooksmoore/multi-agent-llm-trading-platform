@@ -233,3 +233,36 @@
 - `ManagerAgent.adversarial_critique` currently receives raw `list[Intent]` — a future enhancement feeds only the highest-conviction new intent per agent per day.
 - OpusAgent deep-dive scheduler: the Thursday/Friday cron job that selects which holding to deep-dive and fetches the document pack (10-Q/10-K via EDGAR + yfinance transcripts).
 - Weekly journal persistence: `weekly_journal()` returns a markdown string; writing it to `logs/WEEK_NN.md` and posting it to Telegram is part of the M8 ops layer.
+
+---
+
+## Milestone 8 — 2026-04-25 — Dashboard (Plotly Dash, read-only)
+
+**What was built:**
+- `dashboard/data.py` — `DashboardData` read-only adapter. Aggregates from `OMSStore` (fills), `AgentMemory` (intents per agent), `CalibrationTracker` (Brier scores), and `BudgetLedger` (today's spend). Six dataclasses (`TopStripMetrics`, `IntentRow`, `FillRow`, `SpendBreakdown`, `AgentSummary`) define exact shapes for each panel. All stores are optional — passing `DashboardData()` with no args returns sensible empty defaults so the dashboard renders even before any trading has happened.
+- `dashboard/layout.py` — Pure Dash component builders. Dark "terminal" palette (`#0d1117` bg, `#58a6ff` accent, monospace). `render_top_strip`, `render_agent_column`, `render_intent_log`, `render_fill_log`, `render_spend_panel`, and `render_full_dashboard` (composes the page). Action colors: buy/add → green, sell/trim/exit → amber. Outcomes: win → green, loss → red, pending → dim.
+- `dashboard/app.py` — Replaces the M1 stdlib stub with the full Dash app. `build_app(data)` factory takes a `DashboardData` (testable in isolation). `_load_from_env()` reads paths from `OMS_DB`, `BUDGET_PATH`, `AGENT_MEMORY_DB`, `CALIBRATION_DB` env vars and opens read-only handles. Single 3-second `dcc.Interval` polls and re-renders the page (per blueprint Principle 9).
+- `dashboard/__init__.py` — Empty marker file. Required because `data.py` lives in both `data/` (the data layer) and `dashboard/` — without an explicit package, mypy complained "Source file found twice under different module names."
+- `agents/memory.py` — Added `recent_intents_rows(n)` returning structured `list[dict[str, str | int | None]]` for the dashboard. The existing `recent_intents_summary` returns a string for LLM context; the dashboard needs structured rows to render tables.
+- `tests/test_dashboard_data.py` — 21 tests covering every adapter method. Uses real (in-memory or tmp) `AgentMemory`, `CalibrationTracker`, `BudgetLedger`, and `OMSStore` — no mocks at the store layer because each store is small and self-contained. The end-to-end `render_full_dashboard` test catches any layout/data shape mismatch by actually building the Dash component tree.
+
+**Test results:** 406/406 pass. ruff: clean. mypy --strict on `agents/` + `core/` + `data/` + `execution/` + `dashboard/`: clean (38 source files).
+
+**What surprised me:**
+- `OMSStore.append()` requires `ts: datetime` as a positional arg — I'd written tests assuming an auto-`now()` default. Fixed by passing `_TS` explicitly. The strictness is correct: replay must be deterministic.
+- mypy "Source file found twice" — `dashboard/data.py` and `data/` both compile to a module named `data`. Solved by adding `dashboard/__init__.py` to make `dashboard` an explicit package; then `dashboard.data` is unambiguous. (`data/` already had `__init__.py`.)
+- After `dash` + `plotly` were `uv pip install`ed, mypy dropped its `untyped-decorator` complaint on `@app.callback` — Dash now ships PEP-561 type info. The previous `# type: ignore[untyped-decorator]` became "unused-ignore" and had to be removed. Trade-off: tests need dash installed to run (it's in pyproject.toml deps but the dev environment had only the dev extras installed).
+- The dashboard reads `BudgetLedger._entries` directly (one underscore-prefixed attribute) for the per-call-type / per-agent breakdown. The ledger's public API exposes only `today_spent()` aggregate; rather than adding a public accessor that's only used by the dashboard, it's cleaner for the dashboard adapter (which is the only reader of internal ledger state) to peek directly. Documented as a deliberate read-only access pattern.
+
+**Pending for v1.5:**
+- WebSocket / SSE push instead of 3s polling. Polling is fine for single-user local mode; SSE is the obvious upgrade if multiple users ever read the dashboard simultaneously.
+- Equity sparklines vs. SPY (Plotly mini-chart per agent column). The data layer can return the time series; layout just needs `dcc.Graph` calls. Skipped to keep M8 focused on the data adapter contract.
+- Approval-queue drawer (only relevant when `AUTO_APPROVE=false`). Layout slot exists in `top_strip` (`approval_queue_count` always 0 right now); wire when the queue exists.
+- `total_nav` and `day_pnl_gross` are `None` on every render — they require `BrokerAccount` polling or position aggregation. Will wire in the M9 ops layer alongside the scheduled loop.
+- Markdown rendering of weekly journals (`WEEK_NN.md`) inside the dashboard — currently the Manager produces these but the dashboard does not display them. A single `dcc.Markdown` panel reading the latest week file would close the loop.
+
+---
+
+## Build complete (M1 → M8)
+
+All eight milestones land. **406 tests pass. ruff clean. mypy --strict clean across 38 source files.** The four-agent system has data, agents, OMS, broker, risk, budget, memory, calibration — and now a dashboard to watch it run. Next: the ops layer (`app.py` scheduler, Telegram alerts, recovery cron) and graduation criteria evaluation.

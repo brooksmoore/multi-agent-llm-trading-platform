@@ -132,6 +132,32 @@ class AgentMemory:
             )
             self._conn.commit()
 
+    def recent_intents_rows(self, n: int = 10) -> list[dict[str, str | int | None]]:
+        """Return the *n* most recent intents as structured rows (for dashboard)."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT intent_id, symbol, action, conviction, rationale, outcome, logged_at
+                FROM intent_log
+                WHERE agent_id = ?
+                ORDER BY logged_at DESC
+                LIMIT ?
+                """,
+                (self._agent_id, n),
+            ).fetchall()
+        return [
+            {
+                "intent_id": row["intent_id"],
+                "symbol": row["symbol"],
+                "action": row["action"],
+                "conviction": row["conviction"],
+                "rationale": row["rationale"],
+                "outcome": row["outcome"],
+                "logged_at": row["logged_at"],
+            }
+            for row in rows
+        ]
+
     def recent_intents_summary(self, n: int = 3) -> str:
         """Return a human-readable summary of the *n* most recent intents."""
         with self._lock:
