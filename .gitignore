@@ -11,8 +11,12 @@ build/
 .env
 .env.local
 
-# Data (never commit market data or SQLite state)
-data/
+# Data files (never commit market data; DO track data/*.py source)
+data/*.db
+data/*.duckdb
+data/*.parquet
+data/*.json
+data/.cache/
 *.db
 *.duckdb
 *.parquet

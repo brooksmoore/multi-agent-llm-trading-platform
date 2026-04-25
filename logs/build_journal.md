@@ -137,3 +137,40 @@
 - Smoke test: live paper-trading round-trip (buy 1 SPY → fill → reconcile) deferred until `.env` is populated with real Alpaca paper credentials.
 - Dollar-value mismatch check in Reconciler (Principle 4 second criterion).
 - `AlpacaBroker.start_stream()` not yet wired into the orchestration startup sequence — will happen in M6.
+
+---
+
+## Milestone 5 — 2026-04-25 — MarketData + DataStore + News Adapters
+
+**What was built:**
+- `data/market.py` — `Bar` and `Quote` frozen dataclasses (Decimal fields, `Quote.mid` property). `Timeframe(StrEnum)` with MINUTE/HOUR/DAY. `MarketData` structural Protocol. `AlpacaMarketData` wraps `StockHistoricalDataClient` (separate from TradingClient) for live bars/quotes/snapshots. `ReplayMarketData` is a pure in-memory adapter for backtesting, filtering by date range.
+- `data/store.py` — `DataStore` backed by DuckDB. Two tables: `bars` (PK: symbol+timestamp) and `news` (PK: url). `save_bars`/`save_news` use `ON CONFLICT DO UPDATE` upsert semantics. Decimal round-tripped as strings. `symbols` stored as JSON array. `threading.Lock` on every `execute` call for thread safety. `:memory:` for tests, file path for persistence.
+- `data/news.py` — Four adapters, each returns `list[NewsItem]` and swallows all errors gracefully (returns `[]`):
+  - `FinnhubAdapter` — Finnhub `/company-news` REST endpoint; maps unix timestamps to UTC datetime
+  - `EDGARAdapter` — EFTS full-text search endpoint with User-Agent header; builds headline from form_type + entity_name
+  - `RSSAdapter` — feedparser over multiple feed URLs; deduplicates by URL; skips bad feeds per-feed; falls back to `datetime.now(UTC)` when `published_parsed` is None
+  - `YFinanceAdapter` — wraps `yf.Ticker(symbol).news`
+- `data/cache.py` — `Cache` wraps `diskcache.Cache` with `get/set/delete/clear/close` and a `cached()` decorator keyed by `qualname + args + kwargs`.
+- `data/summarize.py` — `BriefingSummarizer` produces token-capped briefings: `summarize_bars` (O/H/L/C/V table, most-recent-first, with optional VWAP), `summarize_news` (numbered headline list with sentiment), `build_market_brief` (60/40 budget split bars/news).
+
+**Test results:** 330/330 pass. Ruff: clean. mypy --strict on `core/` + `execution/` + `config/` + `data/`: clean.
+
+**New test files (60 new tests):**
+- `tests/test_market_data.py` — 15 tests: Bar/Quote types, Replay date filtering, AlpacaMarketData with mocked StockHistoricalDataClient
+- `tests/test_data_store.py` — 16 tests: bar/news round-trips, upsert, filters, ordering, persistence across close/reopen
+- `tests/test_news_adapters.py` — 15 tests: all four adapters, error handling, empty responses, param validation
+- `tests/test_data_cache.py` — 8 tests: get/set/delete/clear, cached decorator, persistence
+- `tests/test_summarize.py` — 6 tests: symbol presence, truncation, headline, empty-news, multi-symbol, VWAP
+
+**What surprised me:**
+- `types-requests` stubs weren't in dev deps. `requests` is a runtime dep but mypy --strict requires stubs; added `types-requests>=2.31.0` to dev extras and installed via uv.
+- `AlpacaMarketData` uses `StockHistoricalDataClient` (from `alpaca.data.historical.stock`) — a completely separate client from `TradingClient`. They have different constructors and endpoints. The mypy overrides for `alpaca.*` mean `cast()` is still needed for return types.
+- `BarSet.data` is `dict[str, list[AlpacaBar]]` — a named attribute, not a subscript on the BarSet itself. The struct is `bar_set.data.get(symbol, [])`.
+- feedparser's `published_parsed` is a `time.struct_time | None`. When None (malformed RSS), falling back to `datetime.now(UTC)` is better than skipping the entry since the headline is still valuable.
+- DuckDB `ON CONFLICT (col) DO UPDATE SET` syntax works exactly as in PostgreSQL; no SQLite-compat quirks needed.
+
+**Pending for M6+:**
+- `AlpacaMarketData` not yet wired into the agent observation loop — happens in M6.
+- `DataStore.load_news` Python-side symbol filter is O(n) — acceptable for current scale (≤10K news items/week).
+- No Parquet export yet (blueprint mentions partitioned Parquet files) — DuckDB tables are the primary store; Parquet export is a v1.5 optimization.
+- FRED and Reddit adapters omitted (low priority for v1; FRED data is more useful as macro context in the agent brief than as real-time news).
