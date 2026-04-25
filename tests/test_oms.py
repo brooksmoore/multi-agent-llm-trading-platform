@@ -335,7 +335,6 @@ class TestFillIntegrity:
             symbol="SPY", side=OrderSide.BUY, qty=Decimal("1"), agent_id=AgentId.HAIKU,
         )
         # Hand-craft a state where the order is in our table but never reached the broker
-        from dataclasses import replace as dr_replace  # noqa: PLC0415
         from core.state_machine import build_order_fsm  # noqa: PLC0415
         oms._orders[order.id] = order  # noqa: SLF001
         oms._fsms[order.id] = build_order_fsm(OrderState.SUBMITTED)  # noqa: SLF001

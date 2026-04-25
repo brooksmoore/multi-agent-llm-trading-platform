@@ -107,3 +107,33 @@
 - `execution/risk.py` wash-sale check is wired (WashSaleChecker is a dependency) but not yet called in `check_intent()`. Will activate in M4 once OMS feedback loop provides loss-sale signals.
 - Budget ledger is standalone; wired to KillSwitchEngine.trip_budget_exhausted() will happen in M5 orchestration layer.
 - Approval queue tested but not integrated into the execution planner yet.
+
+---
+
+## Milestone 4 — 2026-04-24 — AlpacaBroker Adapter + Reconciler
+
+**What was built:**
+- `config/__init__.py` + `config/settings.py` — pydantic-settings `Settings` class. Reads from `.env` via `SettingsConfigDict`. Fields: `alpaca_api_key`, `alpaca_secret_key`, `alpaca_paper`, `anthropic_api_key`, `master_capability`, `auto_approve`, `daily_spend_cap`, `reconciler_interval_secs`, `reconciler_qty_tolerance`. Module-level `settings = Settings()` singleton for import.
+- `execution/alpaca_broker.py` — Production `Broker` adapter wrapping alpaca-py's `TradingClient` (REST) and `TradingStream` (WebSocket). Status translation tables at module level (`_ALPACA_STATUS_TO_BROKER`, `_ALPACA_TRADE_EVENT_TO_STATE`, `_ALPACA_ASSET_CLASS_TO_OURS`). Key methods: `submit_order` (market + limit, with 422-idempotency fallback), `cancel_order`, `get_order`, `find_order_by_client_id`, `list_positions`, `get_account`, `start_stream`, `stop_stream`. `_trade_update_to_event` translates WS updates into `BrokerOrderEvent` with `Fill` on fill/partial_fill events.
+- `execution/reconciler.py` — `Reconciler` runs every 60s in a daemon thread. Two checks: (1) order reconciliation — for each open OMS order, fetches broker status and calls `oms.on_broker_event()` if terminal state not yet recorded; (2) position reconciliation — sums OMS fills into expected net positions, compares with broker positions, trips `KillSwitchEngine.RECONCILIATION_BREAK` if any symbol deviates by ≥ `qty_tolerance` shares.
+- `execution/oms.py` — Added `on_broker_event(event)` public method (was previously private `_on_broker_event`) so Reconciler can drive the same callback path used by the broker stream.
+- `tests/test_alpaca_broker.py` — 19 tests covering: submit market/limit/unsupported/missing-price, 4xx→BrokerRejection, 5xx→BrokerUnavailable, 422-idempotency fallback, cancel, get_order (filled/partial/not-found), find_by_client_id, list_positions (multi/short/crypto), get_account, register_callback.
+- `tests/test_reconciler.py` — 9 tests covering: empty OMS, no mismatch, position mismatch trips kill switch, within-tolerance no-trip, order drift detection, start/stop thread, idempotent start, multiple symbols, sell reduces position.
+
+**Test results:** 270/270 pass. Ruff: clean (M4 files). mypy --strict on `core/` + `execution/` + `config/`: clean.
+
+**What surprised me:**
+- `OrderId = uuid.UUID` is a bare type alias (not `NewType`), so `OrderId(some_uuid)` resolves to `UUID(some_uuid)` which treats the UUID object as the `hex` argument — calling `.replace()` on it — and raises `AttributeError`. Never wrap an existing UUID with `OrderId()`; use `UUID(str_value)` directly.
+- alpaca-py stubs declare return types as `Order | dict[str, Any]` for most REST calls — even though in practice it's always `Order`. Fixed with `cast(AlpacaOrder, ...)` at each call site (5 casts total). Added `"TC002"` to ruff ignore list so alpaca model imports don't get moved to `TYPE_CHECKING` block (they're used at runtime for attribute access, not just annotation).
+- `FakeBroker.force_full_fill` fires the OMS callback synchronously, so by the time the test checks OMS state the order is already FILLED and no longer in `list_open_orders()`. The reconciler drift test had to directly mutate `broker._orders[broker_id].status` under `broker._lock` to simulate a broker-side cancel that bypassed the event stream — mimicking a real disconnect scenario.
+- `TradingStream.run()` is a blocking asyncio call; it must run in a daemon thread. The `@stream.subscribe_trade_updates` decorator accepts an `async def` handler and works correctly even when the decorator runs before the thread starts.
+
+**Decisions worth flagging:**
+- `oms.on_broker_event()` is a thin public wrapper around the private `_on_broker_event()` handler. This keeps the Broker Protocol contract clean (broker calls `register_event_callback`, not `on_broker_event`) while giving Reconciler a stable entry point.
+- Position reconciliation tolerance is 1 share (configurable). Blueprint Principle 4 says "1-share or $1 mismatch flips to RECONCILIATION_BREAK". Dollar mismatch is not yet implemented — deferred to M6 when we have real-time pricing.
+- Short positions: Alpaca `Position.qty` is always positive; the `side` field (`"short"`) triggers negation in `_translate_position`. This matches how OMS net positions work (BUY adds, SELL subtracts).
+
+**Pending for M5+:**
+- Smoke test: live paper-trading round-trip (buy 1 SPY → fill → reconcile) deferred until `.env` is populated with real Alpaca paper credentials.
+- Dollar-value mismatch check in Reconciler (Principle 4 second criterion).
+- `AlpacaBroker.start_stream()` not yet wired into the orchestration startup sequence — will happen in M6.

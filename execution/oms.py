@@ -242,6 +242,14 @@ class OMS:
         with self._lock:
             return list(self._fills_by_order.get(order_id, []))
 
+    def on_broker_event(self, event: BrokerOrderEvent) -> None:
+        """Public entry point for broker events (used by Reconciler and tests).
+
+        Same logic as the internal callback registered with the broker at
+        construction time. Thread-safe.
+        """
+        self._on_broker_event(event)
+
     # ─── Recovery ─────────────────────────────────────────────────────────────
 
     def recover(self) -> ReconcileSummary:

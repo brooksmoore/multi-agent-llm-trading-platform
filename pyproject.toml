@@ -62,6 +62,7 @@ select = ["E", "F", "W", "I", "N", "UP", "ANN", "B", "A", "C4", "RET", "SIM", "T
 ignore = [
     "ANN401",  # dynamically typed expressions (Any) — allowed in adapters
     "TC001",   # app imports needed at runtime (Protocol annotations, dataclass fields)
+    "TC002",   # third-party imports needed at runtime (alpaca-py model attributes)
     "TC003",   # stdlib imports needed at runtime (dataclass fields, __post_init__)
     "UP046",   # Generic[T] is fine; PEP-695 syntax optional at Python 3.12
     "N818",    # Broker* exceptions are domain concepts, not generic Errors
