@@ -47,7 +47,6 @@ def render_top_strip(m: TopStripMetrics) -> html.Div:
             f"${m.day_spend_usd:.4f} / ${m.spend_limit_usd:.2f} ({m.spend_pct:.0f}%)",
             color=spend_color,
         ),
-        _strip_cell("MC", f"{float(m.master_capability):.2f}", color=_ACCENT),
         _strip_cell("MAX GROSS", f"{float(m.effective_max_gross):.2f}x"),
         _strip_cell("REGIME", m.regime_label.upper()),
         _strip_cell("VIX", m.vix_bucket.upper()),
