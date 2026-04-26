@@ -413,3 +413,47 @@ Smoke test suite (`tests/test_smoke.py`, 11 tests):
 - A full trading-day run (requires real credentials). The `dispatch_observation → OMS` bridge doesn't exist yet (`ExecutionPlanner` is M10 P0). The smoke test verified each component independently; the `OMS.submit_order` path was exercised directly (not via dispatch). This gap is honest: the bot will not submit orders until M10's `execution/planner.py` is built.
 
 **Completion reports written:** `logs/v1_complete.md` and `logs/m9_complete.md`.
+
+---
+
+## Milestone 10 Sub-tasks 1A + 1B + Integration — 2026-04-26
+
+**What was built:**
+
+**1A — `execution/planner.py`** (`ExecutionPlanner`):
+- Blueprint §16 sizing: `effective_max_gross = base_max_gross × MC × vix_scalar × dd_scalar`, `effective_vol_target = base_vol_target × MC`, `position_value = vol_targeted_position_value(target_weight, equity, realized_vol_30d, effective_vol_tgt)`, capped at `effective_max_gross × equity`.
+- `MASTER_CAPABILITY` read dynamically from `runtime_store` on every intent (dashboard slider propagates immediately).
+- CLOSE intents bypass sizing math; `LotLedger.total_open_qty()` is used for exact close qty.
+- Options detection via `intent.legs`; whole-contract quantization (÷100).
+- `IntentSizedEvent` emitted for every sized intent (binding_constraint: "vol_target" | "max_gross" | "close").
+- Adds `AGENT_BASE_VOL_TARGET` dict and `vol_targeted_position_value()` function to `execution/sizing.py`.
+- Adds `MarketSnapshot` dataclass to `core/types.py`, `IntentSizedEvent` to `core/events.py`.
+- 31 tests covering sizing math, all drawdown/VIX ladder combinations, runtime MC reads, options contracts, close path, and full OMS integration. Commits: `72fc6a2`.
+
+**1B — `execution/agent_state_tracker.py`** (`AgentStateTracker`):
+- 5-day recovery rule before loosening a drawdown bucket (tightening is immediate).
+- Consecutive-loss benching: 5 losing SELL fills → `KillSwitchEngine.record_agent_result()` + 24h bench.
+- Per-agent avg-cost tracking at fill time (avoids LotLedger ordering dependency).
+- Equity model: `starting_equity + realized_pnl(LotLedger) + unrealized_pnl(mark_prices)`.
+- Rolling 30-day peak for drawdown % computation; FORCED_CASH at >25% drawdown.
+- SQLite persistence (`agent_tracker_state` table); cold-start rebuild from LotLedger fills.
+- 21 tests covering tightening/loosening, consecutive losses, equity tracking, cold-start, forced-cash, and SQLite round-trips. Commit: `b1df2aa`.
+
+**Integration — `app.py` wiring**:
+- `dispatch_observation()` now: calls `tracker.update_on_mark(agent_id, prices)` before observe, gets live `CoreAgentState` from `tracker.get_state(intent.agent_id)` per intent, routes approved intents through `planner.plan()` then `oms.submit_order()`.
+- `_evaluate_with_risk_gate()` takes a live `CoreAgentState` instead of the hardcoded NORMAL bucket stub.
+- `_build_market_snapshot()` derives `MarketSnapshot` from bars (last close as mark, 30-day EWMA vol, VIX bucket from `classify_vix()`).
+- `_on_fill_received()` subscribed to `fill.received` events → `tracker.update_on_fill()`.
+- `settings.starting_equity` added (default $100k).
+- Smoke test `test_dispatch_observation_submits_order_via_planner` confirms end-to-end flow. Commit: `5683ed0`.
+
+**Test results:** 525/525 pass. ruff: clean. mypy --strict on new modules: clean (pre-existing yaml/dashboard errors unchanged).
+
+**What surprised me:**
+- The key pitfall in drawdown/VIX bucket tests: the vol-target constraint binds *before* the max_gross cap when `target_weight` is small. Tests that check bucket scalars must use `target_weight=1.0` (or any weight that makes vol_targeted > gross_cap) so max_gross actually binds and the scalars become visible in the qty.
+- Recovery rule state: tracking `recovery_target`, `recovery_since`, and `recovery_days` is trickier than it sounds — tightening must immediately reset all three, and "new trading day" detection (comparing `today != rec.last_update_date`) is the only reliable boundary since the tracker is called on arbitrary schedules.
+- The `sum()` builtin without a start value is typed as returning `int` by mypy when called on `list[Decimal]`. Fixed by using `sum(returns, Decimal("0"))` and `Decimal(len(n))` throughout the vol computation in `_build_market_snapshot`.
+
+**Pending (M10 remaining):**
+- Sub-task 2: Real Telegram integration (`ops/telegram.py`) — python-telegram-bot v21+, MarkdownV2, 1-min dedup, Acknowledge button.
+- Sub-task 3 (BLOCKED): Baseline backtest engine — must confirm with Brooks before starting.
