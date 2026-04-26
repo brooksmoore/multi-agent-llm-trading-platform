@@ -82,7 +82,7 @@ def main() -> None:
     data = _load_from_env()
     app = build_app(data)
     log.info("dashboard starting on http://localhost:%d", port)
-    app.run(host="0.0.0.0", port=port, debug=False)  # noqa: S104
+    app.run(host="127.0.0.1", port=port, debug=False)
 
 
 if __name__ == "__main__":
