@@ -317,3 +317,42 @@ All eight milestones land. **406 tests pass. ruff clean. mypy --strict clean acr
 - `app.py` entrypoint: APScheduler + all 8 scheduled jobs, singletons (OMS, RiskGate, BudgetWatcher, KillSwitchEngine, Reconciler, etc.), reactive scans, heartbeat, dashboard thread.
 - `ops/heartbeat.py`, `ops/alerts.py` (ntfy.sh), `ops/journal.py`.
 - Smoke test (requires Opus model for orchestration depth).
+
+---
+
+## M9 Sub-task 3 — 2026-04-26 — `app.py` Entrypoint + Ops Modules (Opus 4.7)
+
+**What was built:**
+- `app.py` (~570 LOC): single-process orchestrator. `App` class owns every singleton (`EventBus`, `KillSwitchEngine`, `OMS`, `OMSStore`, `Broker`, `MarketData`, `LotLedger`, `WashSaleChecker`, `RiskGate`, `BudgetLedger`, `BudgetWatcher`, `Reconciler`, four `LLMClient`s, four `AgentMemory` SQLite dbs, four agents, `HeartbeatWriter`, `AlertManager`, `BackgroundScheduler`). Construction is deterministic — no threads start until `app.start()`. Broker / market-data are injectable so the test suite never touches Alpaca.
+- 13 scheduled cron jobs registered with NYSE timezone (`ET`):
+  - mon-fri market-hours: `sonnet_pre_open` 09:25, `sonnet_mid_morning` 10:30, `sonnet_midday` 12:00, `haiku_news_scan` 13:30, `sonnet_power_hour` 15:00, `haiku_close` 15:55, `sonnet_eod` 16:30, `opus_daily` 16:30
+  - weekly: `opus_thursday_deepdive` Thu 16:30, `opus_friday_deepdive` Fri 16:30, `manager_friday` Fri 17:00 (regime read + weekly journal + 4-week reallocation on every 4th iso-week)
+  - 24/7: `haiku_crypto` hourly
+  - daily: `budget_reset` UTC midnight (resets ledger + KillSwitch daily)
+- Deep-dive rotation: Thu picks oldest `last_deep_dive_date` from current Opus holdings; Fri picks the second-oldest. `last_deep_dive_date:{symbol}` persisted in Opus's `AgentMemory`.
+- Reactive volatility scanner: 60s background poll during market hours; macro-event trigger fires Haiku scan on the day of any `config/macro_events.yaml` event (NFP/CPI/FOMC/GDP).
+- Lifecycle: `start()` calls `oms.recover()` (replays append-only event log), boots all subsystems in order (alerts → heartbeat → budget watcher → reconciler → scheduler → optional dashboard + vol scanner). `stop()` is idempotent under a lock; tears down in reverse, snapshots agent memories, writes `logs/shutdown_{TIMESTAMP}.json`.
+- SIGINT/SIGTERM handlers in `main()`. Real-money guard: refuses to start if `alpaca_paper=False` or `master_capability > 1.5` without `OVERRIDE_KEY`.
+- `dispatch_observation(agent)`: builds shared `AgentState`, calls `agent.observe()`, runs each emitted intent through `RiskGate` (logs vetoes), respects BUDGET_EXHAUSTED → Haiku-only-mode degradation per blueprint §5 Layer 3.
+- `ops/heartbeat.py`: `HeartbeatWriter` — 30s daemon-thread tick writes `{"ts": iso8601, "uptime_s": int}` to `logs/heartbeat.json` atomically (temp file + `Path.replace`). Also calls `KillSwitchEngine.record_heartbeat()` so a stuck main loop trips `HEARTBEAT_MISSED` after 60s.
+- `ops/alerts.py`: `AlertManager` — subscribes to `kill_switch.tripped`, `reconciliation.break`, `budget.exhausted`, `leverage.rotation_flag` channels; pushes formatted notifications to `https://ntfy.sh/{topic}`. 60s deduplication keyed by `(channel, identity)` so flapping conditions don't spam. HTTP poster is injectable for tests; empty topic = silent (dev / test default).
+- `config/macro_events.yaml`: 11 high-impact events for May–July 2026 (NFP, CPI, FOMC, GDP).
+
+**Test results:** 446/446 pass. Ruff: clean across all sub-task 3 files. 24 new test cases:
+- `test_app_lifecycle.py` (10): construction without side effects, clean start→stop with shutdown summary, agent-state population (bars/positions/account/MC), multi-agent dispatch via mocked `observe`, exception swallow, BUDGET_EXHAUSTED → Haiku-only, idempotent stop, macro calendar load, empty-credentials construction (parametrized).
+- `test_app_scheduler.py` (7): all 13 blueprint job IDs registered; market-hours jobs use `mon-fri` cron; Fri-only and Thu-only jobs verified; cron times match blueprint §2 exactly; `budget_reset` uses UTC; `haiku_crypto` hourly; reset handler is idempotent.
+- `test_app_recovery.py` (5): order survives via event log when app1 "crashes" (no `stop()`) and app2 boots against the same OMS db; empty-log recovery is no-op; event count > 0 after restart; kill switch starts in OK; shutdown summary reflects `open_orders=0`.
+
+**What surprised me:**
+- `data/market.py` imports `alpaca` at module top, so `agents/base.py` (which imports `Bar`) fails at import time without the alpaca-py library installed. Test environment now installs alpaca-py + dash + plotly + duckdb + diskcache + feedparser + pydantic-settings. (Optional-import refactor of `data/market.py` is filed for M10.)
+- APScheduler `CronTrigger.fields` exposes the parsed cron parts as a list with `.name` and `__str__`, but `str(field)` for a literal day produces e.g. `"mon-fri"` not `"mon,tue,wed,thu,fri"`. Asserting against `str(field)` is what the tests use; reaching into `field.expressions` would be more brittle.
+- `core.types.AgentState` (the per-agent risk/state record) is a different dataclass from `agents.base.AgentState` (the LLM observation snapshot). app.py imports both via `AgentState as CoreAgentState`. Worth a rename in M10 — `RiskAgentState` vs `ObservationState` would prevent confusion.
+- Initial signature for `effective_max_gross()` had `vix_bucket: VixBucket` and `drawdown_bucket: DrawdownBucket` (not `vix_pct` / `drawdown_pct` as I'd assumed). The defaults in `build_agent_state` use `SWEET_SPOT` + `NORMAL` until live VIX wiring lands.
+- Pre-trade routing (`Intent` → `Order`) is NOT implemented in app.py — there is no `ExecutionPlanner` yet. `dispatch_observation` runs `RiskGate.check_intent()` and logs the decision; full sizing-→-Order construction is deferred to the smoke test (sub-task 5) and will likely materialize as `execution/planner.py` in M10.
+
+**Deferred to M10 (filed in `logs/m10_backlog.md`):**
+- `execution/planner.py` — turns approved Intents into Orders (sizing × MC × kill-switch scalars, then `OMS.submit_order`).
+- Optional-import refactor of `data/market.py` so `agents/base.py` imports without alpaca installed.
+- Live VIX feed for `build_agent_state` (currently a static SWEET_SPOT default).
+- Per-agent drawdown bucket tracking (currently NORMAL placeholder in `_evaluate_with_risk_gate`).
+- Volatility scanner: full 30-day rolling realized-vol math (placeholder skips the 2σ branch).

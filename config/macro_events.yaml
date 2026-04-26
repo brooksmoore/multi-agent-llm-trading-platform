@@ -1,0 +1,58 @@
+# Macro event calendar for reactive volatility-trigger scans.
+# Reactive Haiku news scan is fired on the day-of these events.
+# Add events 60-90 days ahead; remove past entries periodically.
+#
+# Schema: list of dicts with `date` (YYYY-MM-DD), `type`, `description`, `impact`.
+
+events:
+  # NFP — first Friday of each month
+  - date: 2026-05-01
+    type: NFP
+    description: Non-Farm Payrolls (BLS Employment Situation)
+    impact: high
+  - date: 2026-06-05
+    type: NFP
+    description: Non-Farm Payrolls (BLS Employment Situation)
+    impact: high
+  - date: 2026-07-03
+    type: NFP
+    description: Non-Farm Payrolls (BLS Employment Situation)
+    impact: high
+
+  # CPI — typically 10–15th of month
+  - date: 2026-05-13
+    type: CPI
+    description: Consumer Price Index (BLS)
+    impact: high
+  - date: 2026-06-10
+    type: CPI
+    description: Consumer Price Index (BLS)
+    impact: high
+  - date: 2026-07-15
+    type: CPI
+    description: Consumer Price Index (BLS)
+    impact: high
+
+  # FOMC — meeting + statement
+  - date: 2026-04-29
+    type: FOMC
+    description: FOMC statement + press conference
+    impact: high
+  - date: 2026-06-17
+    type: FOMC
+    description: FOMC statement + press conference + SEP
+    impact: high
+  - date: 2026-07-29
+    type: FOMC
+    description: FOMC statement + press conference
+    impact: high
+
+  # GDP — quarterly advance estimate
+  - date: 2026-04-30
+    type: GDP
+    description: Q1 2026 GDP advance estimate (BEA)
+    impact: medium
+  - date: 2026-07-30
+    type: GDP
+    description: Q2 2026 GDP advance estimate (BEA)
+    impact: medium
