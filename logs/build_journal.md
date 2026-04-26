@@ -356,3 +356,60 @@ All eight milestones land. **406 tests pass. ruff clean. mypy --strict clean acr
 - Live VIX feed for `build_agent_state` (currently a static SWEET_SPOT default).
 - Per-agent drawdown bucket tracking (currently NORMAL placeholder in `_evaluate_with_risk_gate`).
 - Volatility scanner: full 30-day rolling realized-vol math (placeholder skips the 2σ branch).
+
+---
+
+## M9 Sub-task 4 — 2026-04-26
+
+**Commit:** `19a7d9a`
+
+**Files changed:** `ops/journal.py` (new), `tests/test_journal.py` (new), `pyproject.toml` (+pyyaml, +apscheduler)
+
+**What was built:**
+- `ops/journal.py`: Two atomic-write persistence helpers.
+  - `write_weekly_journal(markdown, ref_date, logs_dir) → Path`: Writes Manager's weekly journal (a markdown string) to `logs/WEEK_{YYYY}_{WW:02d}.md`. ISO week numbering via `date.isocalendar()`. Zero-padded week (`01`–`53`).
+  - `write_daily_memo(content, agent_id, ref_date, logs_dir) → Path`: Writes per-agent daily memos to `logs/daily/{agent}_{YYYY-MM-DD}.md`. Accepts both `AgentId` enum and plain strings.
+  - Both use `_write_atomic()`: write to `.tmp` sibling, then `Path.replace()` onto destination. Idempotent — re-running overwrites the file, never appends.
+  - Both call `Path.parent.mkdir(parents=True, exist_ok=True)` so the caller doesn't need to pre-create directories.
+
+**Missing deps discovered and fixed:**
+- `pyyaml` was not in `pyproject.toml` but `app.py` imports `yaml` for `config/macro_events.yaml`. Added `pyyaml>=6.0` to deps.
+- `apscheduler` was in `pyproject.toml` but not installed in the `.venv` (uv's vectorbt resolution had issues). Force-installed `apscheduler==3.11.2` via `uv pip install`.
+
+**Test results:** 461/461 pass. Ruff: clean. 15 new tests in `test_journal.py`:
+- `test_weekly_journal_*` (7): correct filename, content roundtrip, idempotent overwrite, zero-padded week number, creates missing parent dirs, no .tmp leftover, empty content still creates file.
+- `test_daily_memo_*` (8): correct path under `daily/`, content roundtrip, idempotent overwrite, all three agents get separate files, accepts string agent_id, creates `daily/` subdirectory, no .tmp leftover, different dates create different files.
+
+**What surprised me:** Nothing — the module was straightforward. The real work was discovering that `pyyaml` and `apscheduler` weren't installed in the test venv. All 22 pre-existing app tests (lifecycle/scheduler/recovery) that were erroring on `ModuleNotFoundError` now pass correctly.
+
+---
+
+## M9 Sub-task 5 — 2026-04-26
+
+**Commit:** _(see git log)_
+
+**Files changed:** `tests/test_smoke.py` (new), `logs/v1_complete.md` (new), `logs/m9_complete.md` (new), `logs/build_journal.md` (this entry)
+
+**What was built:**
+
+Smoke test suite (`tests/test_smoke.py`, 11 tests):
+1. `test_full_startup_shutdown_cycle` — App.start() → App.stop() → shutdown summary has correct fields (kill_switch_state=ok, open_orders=0, started_at, shutdown_at).
+2. `test_intent_through_riskgate_returns_accepted_list` — BUY 10% SPY intent from mocked Haiku observe() passes through RiskGate and is returned as accepted.
+3. `test_oms_submit_fill_ledger_cycle` — Full OMS → FakeBroker → fill cycle: `submit_order` returns accepted, order appears in OMS, FakeBroker shows 5 SPY in positions.
+4. `test_heartbeat_file_written_by_tick_once` — HeartbeatWriter.tick_once() writes valid JSON with `ts` and `uptime_s`; no .tmp leftover.
+5. `test_heartbeat_writer_starts_and_stops_with_app` — Thread is alive after start(), dead after stop().
+6. `test_reconciler_clean_state_no_halt` — Reconciler.reconcile_once() on empty OMS + empty broker returns 0 position_mismatches, kill switch stays OK.
+7. `test_budget_watcher_no_trip_with_headroom` — BudgetWatcher.check_once() on a fresh ledger keeps kill switch OK.
+8. `test_multiple_agents_dispatched_independently` — All three agents dispatched without interference; each observe() called exactly once.
+9. `test_journal_weekly_and_daily_written_to_logs_dir` — write_weekly_journal() and write_daily_memo() produce correct files under logs/.
+10. `test_no_real_money_path_in_settings` — App raises RuntimeError when alpaca_paper=False (real-money guard).
+11. `test_macro_calendar_loads_without_error` — config/macro_events.yaml loads and has ≥1 event.
+
+**Final test counts:** 472 collected, 472 passing, 0 failures. 27 test files.
+
+**Codebase metrics:** ~8,600 production LOC, ~7,500 test LOC, 16,100 total.
+
+**What the smoke test could NOT verify:**
+- A full trading-day run (requires real credentials). The `dispatch_observation → OMS` bridge doesn't exist yet (`ExecutionPlanner` is M10 P0). The smoke test verified each component independently; the `OMS.submit_order` path was exercised directly (not via dispatch). This gap is honest: the bot will not submit orders until M10's `execution/planner.py` is built.
+
+**Completion reports written:** `logs/v1_complete.md` and `logs/m9_complete.md`.
