@@ -45,6 +45,10 @@ HAIKU_MODEL = "claude-haiku-4-5-20251001"
 SONNET_MODEL = "claude-sonnet-4-6"
 OPUS_MODEL = "claude-opus-4-7"
 
+# Backoff schedule for Anthropic 529 (overloaded): [1s, 4s, 16s] + 0–1s jitter.
+# Applied per-attempt independently of the 429 retry counter.
+_BACKOFF_529_SECS: list[float] = [1.0, 4.0, 16.0]
+
 
 class BudgetExhausted(Exception):
     """Raised before any API call when the estimated cost exceeds the remaining budget."""
@@ -164,7 +168,12 @@ class LLMClient:
         user: str,
         max_tokens: int,
     ) -> anthropic.types.Message:
-        """Attempt the API call up to max_retries times with backoff."""
+        """Attempt the API call up to max_retries times with backoff.
+
+        - 429 RateLimitError: exponential backoff 2^attempt + 0–1s jitter.
+        - 529 APIStatusError (Anthropic overloaded): [1, 4, 16]s + 0–1s jitter.
+        - Other 5xx APIStatusError: flat 1s sleep per attempt.
+        """
         last_exc: BaseException = RuntimeError("no attempts made")
         for attempt in range(self._max_retries):
             try:
@@ -176,12 +185,17 @@ class LLMClient:
                 )
             except anthropic.RateLimitError as exc:
                 last_exc = exc
+                if attempt >= self._max_retries - 1:
+                    raise
                 # Exponential backoff with jitter to avoid thundering herd
                 # when multiple agents hit a 429 simultaneously.
                 time.sleep(2**attempt + random.uniform(0, 1))
             except anthropic.APIStatusError as exc:
                 last_exc = exc
-                if attempt == self._max_retries - 1:
+                if attempt >= self._max_retries - 1:
                     raise
-                time.sleep(1.0)
+                if getattr(exc, "status_code", None) == 529 and attempt < len(_BACKOFF_529_SECS):
+                    time.sleep(_BACKOFF_529_SECS[attempt] + random.uniform(0, 1))
+                else:
+                    time.sleep(1.0)
         raise last_exc

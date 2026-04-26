@@ -160,7 +160,7 @@ class DashboardData:
                         symbol=str(row["symbol"]),
                         action=str(row["action"]),
                         conviction=int(row["conviction"] or 0),
-                        outcome=row["outcome"] if row["outcome"] is None else str(row["outcome"]),
+                        outcome=str(row["outcome"]) if row["outcome"] is not None else None,
                         rationale=str(row["rationale"] or "")[:200],
                     )
                 )
@@ -186,23 +186,18 @@ class DashboardData:
     def recent_fills(self, n: int = 50) -> list[FillRow]:
         if self._oms is None:
             return []
-        fills: list[FillRow] = []
-        for ev in self._oms.iter_all():
-            if ev.kind != EventKind.FILL_RECEIVED:
-                continue
-            payload = ev.payload
-            fills.append(
-                FillRow(
-                    timestamp=ev.ts.isoformat(),
-                    order_id=str(ev.order_id),
-                    symbol=str(payload.get("symbol", "")),
-                    side=str(payload.get("side", "")),
-                    qty=_as_decimal(payload.get("qty", 0)),
-                    price=_as_decimal(payload.get("price", 0)),
-                )
+        events = self._oms.recent_by_kind(EventKind.FILL_RECEIVED, n)
+        return [
+            FillRow(
+                timestamp=ev.ts.isoformat(),
+                order_id=str(ev.order_id),
+                symbol=str(ev.payload.get("symbol", "")),
+                side=str(ev.payload.get("side", "")),
+                qty=_as_decimal(ev.payload.get("qty", 0)),
+                price=_as_decimal(ev.payload.get("price", 0)),
             )
-        # Most recent last in iter_all (monotonic seq); reverse and trim.
-        return list(reversed(fills))[:n]
+            for ev in events
+        ]
 
     def recent_intents(self, n: int = 50) -> list[IntentRow]:
         all_rows: list[IntentRow] = []
@@ -215,7 +210,7 @@ class DashboardData:
                         symbol=str(row["symbol"]),
                         action=str(row["action"]),
                         conviction=int(row["conviction"] or 0),
-                        outcome=row["outcome"] if row["outcome"] is None else str(row["outcome"]),
+                        outcome=str(row["outcome"]) if row["outcome"] is not None else None,
                         rationale=str(row["rationale"] or "")[:200],
                     )
                 )
@@ -236,8 +231,7 @@ class DashboardData:
 
         today_total = self._budget.today_spent()
         limit = self._budget.daily_limit()
-        # Direct read of internal entries — the BudgetLedger persists these.
-        entries: list[Any] = list(getattr(self._budget, "_entries", []))
+        entries: list[Any] = self._budget.entries()
 
         by_call_type: dict[str, Decimal] = {}
         by_agent: dict[str, Decimal] = {}

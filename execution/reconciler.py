@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from core.types import Order, OrderSide, OrderState
-from execution.broker import Broker, BrokerOrderEvent, BrokerOrderState
+from execution.broker import Broker, BrokerOrderEvent, BrokerOrderState, BrokerPosition
 from execution.kill_switch import KillSwitchEngine
 from execution.oms import OMS
 
@@ -36,6 +36,7 @@ _OPEN_STATES = frozenset({
 })
 
 _QTY_TOLERANCE_DEFAULT = Decimal("1")
+_DOLLAR_TOLERANCE = Decimal("1.00")
 
 
 @dataclass(frozen=True)
@@ -163,7 +164,9 @@ class Reconciler:
         """
         expected = self._compute_expected_positions()
         try:
-            broker_positions = {p.symbol: p.qty for p in self._broker.list_positions()}
+            broker_positions: dict[str, BrokerPosition] = {
+                p.symbol: p for p in self._broker.list_positions()
+            }
         except Exception:
             logger.warning("Reconciler: could not fetch broker positions", exc_info=True)
             return 0, False
@@ -173,12 +176,16 @@ class Reconciler:
 
         for sym in all_symbols:
             our_qty = expected.get(sym, Decimal("0"))
-            broker_qty = broker_positions.get(sym, Decimal("0"))
-            drift = abs(our_qty - broker_qty)
-            if drift >= self._qty_tolerance:
+            broker_pos = broker_positions.get(sym)
+            broker_qty = broker_pos.qty if broker_pos is not None else Decimal("0")
+            qty_drift = abs(our_qty - broker_qty)
+            price = broker_pos.current_price if broker_pos is not None else Decimal("0")
+            dollar_drift = qty_drift * price
+            if qty_drift >= self._qty_tolerance or dollar_drift > _DOLLAR_TOLERANCE:
                 logger.error(
-                    "Reconciler: position mismatch on %s — expected=%.4f broker=%.4f",
-                    sym, our_qty, broker_qty,
+                    "Reconciler: position mismatch on %s — expected=%.4f broker=%.4f "
+                    "(qty_drift=%.4f dollar_drift=$%.2f)",
+                    sym, our_qty, broker_qty, qty_drift, dollar_drift,
                 )
                 mismatches.append(sym)
 

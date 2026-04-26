@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from agents.base import AgentState
-from agents.llm import LLMClient
+from agents.json_utils import parse_json_object
+from agents.llm import BudgetExhausted, LLMClient
 from agents.memory import AgentMemory
 from core.types import AgentId, Intent
 
@@ -118,6 +119,9 @@ class ManagerAgent:
                 call_type="weekly_journal",
                 max_tokens=2048,
             )
+        except BudgetExhausted:
+            _log.warning("ManagerAgent.weekly_journal skipped: budget exhausted")
+            return ""
         except Exception:
             _log.warning("ManagerAgent.weekly_journal LLM call failed", exc_info=True)
             return ""
@@ -165,21 +169,15 @@ class ManagerAgent:
                 call_type=call_type,
                 max_tokens=1536,
             )
+        except BudgetExhausted:
+            _log.warning("ManagerAgent.%s skipped: budget exhausted", call_type)
+            return {}
         except Exception:
             _log.warning("ManagerAgent.%s LLM call failed", call_type, exc_info=True)
             return {}
 
-        try:
-            result: dict[str, Any] = json.loads(response_text)
-            return result
-        except json.JSONDecodeError:
-            start = response_text.find("{")
-            end = response_text.rfind("}")
-            if start != -1 and end > start:
-                try:
-                    extracted: dict[str, Any] = json.loads(response_text[start : end + 1])
-                    return extracted
-                except json.JSONDecodeError:
-                    pass
+        parsed = parse_json_object(response_text)
+        if parsed is None:
             _log.warning("ManagerAgent.%s: could not parse JSON response", call_type)
             return {}
+        return parsed

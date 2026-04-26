@@ -161,15 +161,33 @@ class OMSStore:
             cursor = self._conn.execute(
                 "SELECT seq, ts, kind, order_id, payload FROM oms_events ORDER BY seq ASC"
             )
-            rows = cursor.fetchall()
-        for seq, ts, kind, order_id, payload in rows:
-            yield LoggedEvent(
+            for seq, ts, kind, order_id, payload in cursor:
+                yield LoggedEvent(
+                    seq=seq,
+                    ts=datetime.fromisoformat(ts),
+                    kind=EventKind(kind),
+                    order_id=uuid.UUID(order_id),
+                    payload=loads(payload),
+                )
+
+    def recent_by_kind(self, kind: EventKind, n: int) -> list[LoggedEvent]:
+        """Return the *n* most recent events of a given kind, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, ts, kind, order_id, payload FROM oms_events "
+                "WHERE kind = ? ORDER BY seq DESC LIMIT ?",
+                (str(kind), n),
+            ).fetchall()
+        return [
+            LoggedEvent(
                 seq=seq,
                 ts=datetime.fromisoformat(ts),
-                kind=EventKind(kind),
+                kind=EventKind(k),
                 order_id=uuid.UUID(order_id),
                 payload=loads(payload),
             )
+            for seq, ts, k, order_id, payload in rows
+        ]
 
     def iter_for_order(self, order_id: OrderId) -> Iterator[LoggedEvent]:
         with self._lock:

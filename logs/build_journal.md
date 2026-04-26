@@ -266,3 +266,54 @@
 ## Build complete (M1 → M8)
 
 All eight milestones land. **406 tests pass. ruff clean. mypy --strict clean across 38 source files.** The four-agent system has data, agents, OMS, broker, risk, budget, memory, calibration — and now a dashboard to watch it run. Next: the ops layer (`app.py` scheduler, Telegram alerts, recovery cron) and graduation criteria evaluation.
+
+---
+
+## M9 Sub-task 1 — 2026-04-26 — Blueprint Compliance Fixes
+
+**What was fixed (4 blueprint violations):**
+- `agents/llm.py`: `cache_control` now carries `{"type": "ephemeral", "ttl": "1h"}`. Previously lacked the explicit `ttl` field, causing Anthropic to silently default to 5-minute TTL — approximately 12× more expensive for prompts reused across hour boundaries.
+- `dashboard/app.py`: `host="0.0.0.0"` → `host="127.0.0.1"`, removing the `# noqa: S104` suppression. Dashboard now binds localhost-only per blueprint Principle 9.
+- `dashboard/app.py`: `POLL_INTERVAL_MS = 5000` → `3000`. Blueprint §9 specifies 3s polling.
+- `dashboard/app.py` + new `config/runtime_store.py`: Replaced static MC `_strip_cell` with `dcc.Slider` (id=`mc-slider`) placed OUTSIDE the polling `div#root` so it doesn't reset on every 3s tick. A `dcc.Store(id=mc-store)` holds the current slider value server-side. New `RuntimeStore` singleton (thread-safe, clamps at 1.5×) writes the change immediately.
+
+**New files:** `config/runtime_store.py`, `tests/test_llm_cache_ttl.py` (3 tests)
+
+**Commits:** 3eb1235 (cache TTL), f456d6d (host/poll), 9c9dde4 (MC slider)
+
+---
+
+## M9 Sub-task 2 — 2026-04-26 — Wire Deferred Plumbing
+
+**What was built:**
+- `execution/tax.py`: Added `WashSaleChecker.days_remaining(agent_id, symbol, check_date)` — returns days left in the 30-day window for display in veto reasons.
+- `core/types.py`: Added `legs: tuple[OptionLeg, ...]` field to `Intent` (default empty tuple). Forward reference works via `from __future__ import annotations`. This enables multi-leg options intents throughout the system.
+- `core/events.py`: Added `LeverageRotationFlagEvent` (14th event type on the bus) — carries `agent_id`, `symbol`, `category`, `reopen_count`. Emitted when the anti-rotation rule fires.
+- `execution/budget.py`: Added `BudgetWatcher` — daemon thread polls `BudgetLedger.is_exhausted()` every 30s; calls `KillSwitchEngine.trip_budget_exhausted()` on exhaustion (blueprint §5 Layer 3: Haiku-only mode). `TYPE_CHECKING` guard prevents circular import from `budget.py` → `kill_switch.py`.
+- `execution/reconciler.py`: Added `_DOLLAR_TOLERANCE = Decimal("1.00")`. Position mismatch now trips on either ≥1-share OR >$1.00 dollar drift (blueprint Principle 4 full implementation). Uses full `BrokerPosition` objects (not just qty) to get `current_price` for dollar calculation.
+- `execution/risk.py` (major rewrite): Added 5 new capabilities:
+  1. **Wash-sale check** (check #5): Blocks BUY intents for symbols sold at a loss within 30 days. Also checks `WASH_SALE_PROXIES` map (SPY↔IVV, QQQ↔QQQM, TQQQ↔UPRO, SQQQ↔SPXU). Veto reason includes days remaining.
+  2. **LETF anti-rotation rule** (check #7b): Tracks LETF opens per-agent per-category (LETF_EQUIV_MAP groups TQQQ/UPRO=NDX_LONG_3X etc.). After ≥3 opens in the same category within 21 days: emits `LeverageRotationFlagEvent` and rejects intent.
+  3. **Options structural check** (check #9): Rejects options-sleeve opening intents with no legs (naked), or with all legs on the same side (one-sided ratio). Requires both BUY and SELL legs (vertical/condor structure).
+  4. **`record_letf_open/exit`** public methods for the main loop to call after fill confirmation.
+  5. `RiskGate.__init__` now accepts optional `event_bus: EventBus | None = None` — backward-compatible (all existing code passes 3 args, new bus arg defaults to None).
+- `agents/llm.py`: Added `_BACKOFF_529_SECS = [1.0, 4.0, 16.0]`. `_call_with_retry` now handles `anthropic.APIStatusError` with status 529 (overloaded) using this schedule + 0–1s jitter. Other 5xx errors get flat 1s sleep.
+- Pre-existing M7/M8 uncommitted changes bundled into this commit: `agents/haiku_agent.py` and `agents/manager_agent.py` use new `agents/json_utils.parse_json_object` helper (centralizes JSON-with-fallback parsing); `manager_agent.py` now catches `BudgetExhausted` on `weekly_journal` and logs warning. `dashboard/data.py` and `data/cache.py` minor cleanups. `execution/oms_store.py` minor fix.
+
+**Test results:** 277/277 pass (core tests; alpaca/dash/market-data tests excluded — require optional deps not installed in CI). Ruff: clean across all 11 changed files.
+
+**New/extended tests (25 new test cases):**
+- `test_budget_enforcer.py` (+3): BudgetWatcher trips kill switch, no-trip when not exhausted, idempotent after trip
+- `test_llm_cache_ttl.py` (+2): 529 retry succeeds after 2 failures (backoff values verified), raises after max retries
+- `test_reconciler.py` (+2): dollar-only mismatch trips kill switch, within-tolerance test updated (0.005 shares @ $100 = $0.50 < $1.00 is the new valid "within tolerance" case)
+- `test_risk_gate.py` (+18): wash-sale blocked/allowed/proxy/sell-bypass; LETF rotation blocked/allowed; naked/spread/one-sided options structural tests; updated `test_options_within_20pct_allowed` to use a proper vertical spread (legs=(BUY+SELL))
+
+**What surprised me:**
+- Reconciler dollar-mismatch: the existing `test_reconcile_within_tolerance_no_trip` used 0.5 shares at $100 = $50 drift, which EXCEEDS the new $1.00 dollar threshold. Updated the test to use 0.005 shares ($0.50 drift) — below both qty tolerance (1 share) and dollar tolerance ($1.00).
+- The `_check_options_structure` fires AFTER the exposure cap check (check order 8 → 9), so `test_options_exceeding_20pct_blocked` continues to pass with empty legs — the cap check fires first and the structural check is never reached.
+- `_call_with_retry` was accidentally placed at module scope (not as a class method) during an earlier Edit. Fixed by rewriting `agents/llm.py` in full via the Write tool.
+
+**Pending for M9 Sub-task 3:**
+- `app.py` entrypoint: APScheduler + all 8 scheduled jobs, singletons (OMS, RiskGate, BudgetWatcher, KillSwitchEngine, Reconciler, etc.), reactive scans, heartbeat, dashboard thread.
+- `ops/heartbeat.py`, `ops/alerts.py` (ntfy.sh), `ops/journal.py`.
+- Smoke test (requires Opus model for orchestration depth).

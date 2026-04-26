@@ -138,6 +138,17 @@ class LETFAutoLiquidatedEvent(Event):
     held_days: int = 0
 
 
+@dataclass(frozen=True)
+class LeverageRotationFlagEvent(Event):
+    """Emitted when an agent reopens equivalent LETF exposure ≥3 times in the window."""
+
+    name: str = field(default="leverage.rotation_flag", init=False)
+    agent_id: AgentId = AgentId.HAIKU
+    symbol: str = ""
+    category: str = ""
+    reopen_count: int = 0
+
+
 # ─── Sentinel factories (only used as dataclass defaults) ─────────────────────
 
 def _missing_intent() -> Intent:

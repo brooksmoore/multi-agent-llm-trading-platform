@@ -6,7 +6,8 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from execution.budget import DEFAULT_DAILY_LIMIT, BudgetLedger
+from execution.budget import DEFAULT_DAILY_LIMIT, BudgetLedger, BudgetWatcher
+from execution.kill_switch import KillSwitchEngine
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -138,3 +139,48 @@ def test_corrupt_file_starts_fresh(tmp_path: Path) -> None:
     ledger = BudgetLedger(path)
     assert ledger.today_spent() == Decimal("0")
     assert ledger.is_exhausted() is False
+
+
+# ── BudgetWatcher ─────────────────────────────────────────────────────────────
+
+
+def test_budget_watcher_trips_kill_switch_when_exhausted(tmp_path: Path) -> None:
+    ledger = BudgetLedger(tmp_path / "spend.json", daily_limit=Decimal("0.10"))
+    kill = KillSwitchEngine()
+    watcher = BudgetWatcher(ledger, kill)
+
+    ledger.reset_if_new_day(DAY1)
+    ledger.record_spend("haiku", Decimal("0.10"), "brief", _ts(DAY1))
+    assert ledger.is_exhausted() is True
+
+    tripped = watcher.check_once()
+    assert tripped is True
+    from core.types import KillSwitchState  # noqa: PLC0415
+    assert kill.state == KillSwitchState.BUDGET_EXHAUSTED
+
+
+def test_budget_watcher_no_trip_when_not_exhausted(tmp_path: Path) -> None:
+    ledger = BudgetLedger(tmp_path / "spend.json", daily_limit=Decimal("0.95"))
+    kill = KillSwitchEngine()
+    watcher = BudgetWatcher(ledger, kill)
+
+    ledger.reset_if_new_day(DAY1)
+    ledger.record_spend("haiku", Decimal("0.10"), "brief", _ts(DAY1))
+
+    tripped = watcher.check_once()
+    assert tripped is False
+    from core.types import KillSwitchState  # noqa: PLC0415
+    assert kill.state == KillSwitchState.OK
+
+
+def test_budget_watcher_check_once_idempotent_after_trip(tmp_path: Path) -> None:
+    """check_once() returns False on subsequent calls after the initial trip."""
+    ledger = BudgetLedger(tmp_path / "spend.json", daily_limit=Decimal("0.10"))
+    kill = KillSwitchEngine()
+    watcher = BudgetWatcher(ledger, kill)
+
+    ledger.reset_if_new_day(DAY1)
+    ledger.record_spend("haiku", Decimal("0.10"), "brief", _ts(DAY1))
+
+    assert watcher.check_once() is True   # first call: trips
+    assert watcher.check_once() is False  # already tripped, no-op

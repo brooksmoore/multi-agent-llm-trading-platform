@@ -77,7 +77,7 @@ def test_reconcile_position_mismatch_trips_kill_switch() -> None:
 
 
 def test_reconcile_within_tolerance_no_trip() -> None:
-    """Fractional qty below 1-share tolerance does not trip the kill switch."""
+    """Drift below both 1-share AND $1.00 dollar tolerances does not trip the kill switch."""
     rec, oms, broker, kill = _setup()
 
     order = make_market_order(
@@ -85,9 +85,9 @@ def test_reconcile_within_tolerance_no_trip() -> None:
     )
     oms.submit_order(order)
 
-    # Artificially adjust broker position by 0.5 shares (within 1-share tolerance)
+    # FakeBroker default price = $100. Drift: 0.005 shares * $100 = $0.50 < $1.00 threshold.
     pos = broker._positions["SPY"]  # noqa: SLF001
-    broker._positions["SPY"] = dc_replace(pos, qty=Decimal("9.5"))  # noqa: SLF001
+    broker._positions["SPY"] = dc_replace(pos, qty=Decimal("9.995"))  # noqa: SLF001
 
     result = rec.reconcile_once(_TS)
     assert result.kill_switch_tripped is False
@@ -161,6 +161,24 @@ def test_reconcile_multiple_symbols_all_match() -> None:
         oms.submit_order(order)
     result = rec.reconcile_once(_TS)
     assert result.kill_switch_tripped is False
+
+
+def test_reconcile_dollar_only_mismatch_trips_kill_switch() -> None:
+    """A sub-1-share drift that exceeds $1.00 in dollar value trips the kill switch."""
+    rec, oms, broker, kill = _setup()
+
+    order = make_market_order(
+        symbol="SPY", side=OrderSide.BUY, qty=Decimal("10"), agent_id=AgentId.HAIKU,
+    )
+    oms.submit_order(order)
+
+    # FakeBroker default price = $100. Drift: 0.02 shares * $100 = $2.00 > $1.00 threshold.
+    pos = broker._positions["SPY"]  # noqa: SLF001
+    broker._positions["SPY"] = dc_replace(pos, qty=Decimal("9.98"))  # noqa: SLF001
+
+    result = rec.reconcile_once(_TS)
+    assert result.position_mismatches >= 1
+    assert result.kill_switch_tripped is True
 
 
 def test_reconcile_sell_reduces_expected_position() -> None:

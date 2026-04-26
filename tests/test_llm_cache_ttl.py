@@ -2,6 +2,8 @@
 
 Without the explicit ttl Anthropic silently defaults to 5 minutes, which is ~12x
 more expensive than budgeted across hour boundaries (non-negotiable rule #2).
+
+Also tests that 529 (Anthropic overloaded) retries use [1, 4, 16]s backoff.
 """
 
 from __future__ import annotations
@@ -11,8 +13,9 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import anthropic
+import httpx
 
-from agents.llm import HAIKU_MODEL, LLMClient
+from agents.llm import _BACKOFF_529_SECS, HAIKU_MODEL, LLMClient
 from core.types import AgentId
 from execution.budget import BudgetLedger
 
@@ -113,3 +116,65 @@ def test_no_cache_control_when_caching_disabled() -> None:
         assert isinstance(system_param, str), (
             "When use_caching=False, system should be a plain string"
         )
+
+
+# ── 529 overloaded retry tests ────────────────────────────────────────────────
+
+
+def _make_529_error() -> anthropic.APIStatusError:
+    """Build an APIStatusError with status_code=529 (Anthropic overloaded)."""
+    response = httpx.Response(529, request=httpx.Request("POST", "https://api.anthropic.com"))
+    return anthropic.APIStatusError("overloaded", response=response, body=None)
+
+
+def test_529_retries_and_succeeds() -> None:
+    """After two 529 errors the client succeeds on the third attempt."""
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(Path(tmp))
+        client._max_retries = 4  # allow 4 attempts so [1, 4, 16] backoff can apply
+
+        side_effects = [_make_529_error(), _make_529_error(), _fake_response()]
+        with (
+            patch.object(
+                client._client.messages, "create", side_effect=side_effects
+            ) as mock_create,
+            patch("agents.llm.time.sleep") as mock_sleep,
+        ):
+            text, memo = client.call(
+                system="System",
+                user="User",
+                agent_id=AgentId.HAIKU,
+                call_type="test",
+                max_tokens=64,
+            )
+
+        assert text == '{"ok": true}'
+        assert mock_create.call_count == 3
+        # First sleep: _BACKOFF_529_SECS[0] + jitter; second: _BACKOFF_529_SECS[1] + jitter
+        assert mock_sleep.call_count == 2
+        first_sleep_duration = mock_sleep.call_args_list[0][0][0]
+        second_sleep_duration = mock_sleep.call_args_list[1][0][0]
+        assert _BACKOFF_529_SECS[0] <= first_sleep_duration < _BACKOFF_529_SECS[0] + 1.0
+        assert _BACKOFF_529_SECS[1] <= second_sleep_duration < _BACKOFF_529_SECS[1] + 1.0
+
+
+def test_529_raises_after_max_retries() -> None:
+    """Exhausting all retries on 529 propagates the final APIStatusError."""
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(Path(tmp))
+        client._max_retries = 2  # only 2 attempts
+
+        side_effects = [_make_529_error(), _make_529_error()]
+        with (
+            patch.object(client._client.messages, "create", side_effect=side_effects),
+            patch("agents.llm.time.sleep"),
+        ):
+            import pytest  # noqa: PLC0415
+            with pytest.raises(anthropic.APIStatusError):
+                client.call(
+                    system="System",
+                    user="User",
+                    agent_id=AgentId.HAIKU,
+                    call_type="test",
+                    max_tokens=64,
+                )

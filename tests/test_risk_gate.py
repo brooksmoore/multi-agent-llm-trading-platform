@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from core.events import EventBus, LeverageRotationFlagEvent
 from core.types import (
     Action,
     AgentId,
     AgentState,
     AssetClass,
     DrawdownBucket,
+    Fill,
     Intent,
     KillSwitchState,
+    Lot,
+    OptionLeg,
     OrderSide,
     Position,
     Sleeve,
@@ -273,7 +277,23 @@ def test_non_letf_symbol_passes_without_hold_check() -> None:
 
 def test_options_within_20pct_allowed() -> None:
     gate, _, _ = _gate()
-    intent = _intent(symbol="AAPL_OPT", weight="0.10", sleeve=Sleeve.OPTIONS)
+    legs = (
+        OptionLeg(symbol="AAPL251219C00200000", side=OrderSide.BUY, ratio_qty=1),
+        OptionLeg(symbol="AAPL251219C00210000", side=OrderSide.SELL, ratio_qty=1),
+    )
+    intent = Intent(
+        id=new_id(),
+        agent_id=AgentId.HAIKU,
+        symbol="AAPL251219C00200000",
+        action=Action.BUY,
+        target_weight=Decimal("0.10"),
+        sleeve=Sleeve.OPTIONS,
+        signal="test",
+        conviction=7,
+        rationale="test",
+        timestamp=_TS,
+        legs=legs,
+    )
     state = _agent_state(sleeve_equity="1000")
     decision = gate.check_intent(intent, state, Decimal("1.0"), [], _TS)
     assert decision.allowed is True
@@ -387,7 +407,6 @@ def test_auto_liquidations_fresh_letf_not_returned() -> None:
 
 def test_auto_liquidations_ignores_non_letf() -> None:
     gate, _, lots = _gate()
-    from core.types import Fill
     old_ts = datetime(2026, 4, 14, 10, 0, tzinfo=UTC)
     buy_fill = Fill(
         id=new_id(), order_id=new_id(), agent_id=AgentId.HAIKU, symbol="AAPL",
@@ -397,3 +416,211 @@ def test_auto_liquidations_ignores_non_letf() -> None:
     positions = [_position(symbol="AAPL", qty="10", price="200")]
     to_liq = gate.check_letf_auto_liquidations(AgentId.HAIKU, positions, _TS)
     assert "AAPL" not in to_liq
+
+
+# ── Wash-sale checks ──────────────────────────────────────────────────────────
+
+
+def _loss_lot(
+    symbol: str,
+    agent: AgentId,
+    sale_date_offset_days: int,
+    entry_price: str = "500",
+    exit_price: str = "450",
+) -> Lot:
+    """Create a closed lot with a realized loss, with exit_date = TODAY - offset."""
+    exit_date = _TODAY - timedelta(days=sale_date_offset_days)
+    entry_date = exit_date - timedelta(days=10)
+    return Lot(
+        id=new_id(),
+        agent_id=agent,
+        symbol=symbol,
+        qty=Decimal("10"),
+        entry_price=Decimal(entry_price),
+        entry_date=entry_date,
+        entry_fill_id=new_id(),
+        remaining_qty=Decimal("0"),
+        exit_fill_id=new_id(),
+        exit_date=exit_date,
+        exit_price=Decimal(exit_price),
+        is_closed=True,
+    )
+
+
+def test_wash_sale_blocks_buy_within_30_days() -> None:
+    kill = KillSwitchEngine()
+    wash = WashSaleChecker()
+    lots = LotLedger()
+    gate = RiskGate(kill, wash, lots)
+
+    wash.record_sale(_loss_lot("SPY", AgentId.HAIKU, sale_date_offset_days=5))
+
+    decision = gate.check_intent(
+        _intent(symbol="SPY", action=Action.BUY), _agent_state(), Decimal("1.0"), [], _TS
+    )
+    assert decision.allowed is False
+    assert "wash_sale" in (decision.veto_reason or "").lower()
+
+
+def test_wash_sale_allows_buy_after_30_days() -> None:
+    kill = KillSwitchEngine()
+    wash = WashSaleChecker()
+    lots = LotLedger()
+    gate = RiskGate(kill, wash, lots)
+
+    wash.record_sale(_loss_lot("SPY", AgentId.HAIKU, sale_date_offset_days=31))
+
+    decision = gate.check_intent(
+        _intent(symbol="SPY", action=Action.BUY), _agent_state(), Decimal("1.0"), [], _TS
+    )
+    assert decision.allowed is True
+
+
+def test_wash_sale_blocks_proxy_buy() -> None:
+    """Selling SPY at a loss within 30 days blocks buying the proxy IVV."""
+    kill = KillSwitchEngine()
+    wash = WashSaleChecker()
+    lots = LotLedger()
+    gate = RiskGate(kill, wash, lots)
+
+    wash.record_sale(_loss_lot("SPY", AgentId.HAIKU, sale_date_offset_days=10))
+
+    decision = gate.check_intent(
+        _intent(symbol="IVV", action=Action.BUY), _agent_state(), Decimal("1.0"), [], _TS
+    )
+    assert decision.allowed is False
+    assert "wash_sale" in (decision.veto_reason or "").lower()
+    assert "IVV" in (decision.veto_reason or "")
+
+
+def test_wash_sale_allows_sell_regardless() -> None:
+    """Wash-sale check only applies to opening actions; sells are always allowed."""
+    kill = KillSwitchEngine()
+    wash = WashSaleChecker()
+    lots = LotLedger()
+    gate = RiskGate(kill, wash, lots)
+
+    wash.record_sale(_loss_lot("SPY", AgentId.HAIKU, sale_date_offset_days=5))
+
+    decision = gate.check_intent(
+        _intent(symbol="SPY", action=Action.SELL), _agent_state(), Decimal("1.0"), [], _TS
+    )
+    assert decision.allowed is True
+
+
+# ── LETF anti-rotation checks ─────────────────────────────────────────────────
+
+
+def test_letf_rotation_blocks_after_three_opens() -> None:
+    """After 3 opens in the same LETF category within 21 days, the 4th is rejected."""
+    kill = KillSwitchEngine()
+    wash = WashSaleChecker()
+    lots = LotLedger()
+    bus = EventBus()
+    gate = RiskGate(kill, wash, lots, event_bus=bus)
+
+    events: list[LeverageRotationFlagEvent] = []
+    bus.subscribe("leverage.rotation_flag", lambda e: events.append(e))  # type: ignore[arg-type]
+
+    base = _TODAY - timedelta(days=10)
+    gate.record_letf_open(AgentId.HAIKU, "TQQQ", base)
+    gate.record_letf_open(AgentId.HAIKU, "UPRO", base + timedelta(days=3))
+    gate.record_letf_open(AgentId.HAIKU, "TQQQ", base + timedelta(days=6))
+
+    decision = gate.check_intent(
+        _intent(symbol="UPRO"), _agent_state(), Decimal("1.0"), [], _TS
+    )
+    assert decision.allowed is False
+    assert "letf_rotation" in (decision.veto_reason or "").lower()
+    assert len(events) == 1
+    assert events[0].reopen_count == 3
+
+
+def test_letf_rotation_allows_below_threshold() -> None:
+    """Two opens within 21 days should not yet trigger the rotation block."""
+    kill = KillSwitchEngine()
+    wash = WashSaleChecker()
+    lots = LotLedger()
+    gate = RiskGate(kill, wash, lots)
+
+    base = _TODAY - timedelta(days=5)
+    gate.record_letf_open(AgentId.HAIKU, "TQQQ", base)
+    gate.record_letf_open(AgentId.HAIKU, "UPRO", base + timedelta(days=2))
+
+    decision = gate.check_intent(
+        _intent(symbol="TQQQ"), _agent_state(), Decimal("1.0"), [], _TS
+    )
+    assert decision.allowed is True
+
+
+# ── Options structural check ──────────────────────────────────────────────────
+
+
+def test_naked_option_no_legs_rejected() -> None:
+    """An options-sleeve opening intent with no legs is rejected (naked)."""
+    gate, _, _ = _gate()
+    intent = Intent(
+        id=new_id(),
+        agent_id=AgentId.HAIKU,
+        symbol="SPY251219C00500000",
+        action=Action.BUY,
+        target_weight=Decimal("0.05"),
+        sleeve=Sleeve.OPTIONS,
+        signal="naked call attempt",
+        conviction=5,
+        rationale="test",
+        timestamp=_TS,
+        legs=(),
+    )
+    decision = gate.check_intent(intent, _agent_state(), Decimal("1.0"), [], _TS)
+    assert decision.allowed is False
+    assert "naked" in (decision.veto_reason or "").lower()
+
+
+def test_options_vertical_spread_allowed() -> None:
+    """A two-leg vertical spread (long+short) satisfies the defined-risk requirement."""
+    gate, _, _ = _gate()
+    legs = (
+        OptionLeg(symbol="SPY251219C00500000", side=OrderSide.BUY, ratio_qty=1),
+        OptionLeg(symbol="SPY251219C00510000", side=OrderSide.SELL, ratio_qty=1),
+    )
+    intent = Intent(
+        id=new_id(),
+        agent_id=AgentId.HAIKU,
+        symbol="SPY251219C00500000",
+        action=Action.BUY,
+        target_weight=Decimal("0.05"),
+        sleeve=Sleeve.OPTIONS,
+        signal="bull call spread",
+        conviction=6,
+        rationale="test",
+        timestamp=_TS,
+        legs=legs,
+    )
+    decision = gate.check_intent(intent, _agent_state(), Decimal("1.0"), [], _TS)
+    assert decision.allowed is True
+
+
+def test_options_one_sided_legs_rejected() -> None:
+    """Multi-leg with all legs on the same side (all-buy ratio spread) is rejected."""
+    gate, _, _ = _gate()
+    legs = (
+        OptionLeg(symbol="SPY251219C00500000", side=OrderSide.BUY, ratio_qty=1),
+        OptionLeg(symbol="SPY251219C00510000", side=OrderSide.BUY, ratio_qty=2),
+    )
+    intent = Intent(
+        id=new_id(),
+        agent_id=AgentId.HAIKU,
+        symbol="SPY251219C00500000",
+        action=Action.BUY,
+        target_weight=Decimal("0.05"),
+        sleeve=Sleeve.OPTIONS,
+        signal="one-sided ratio",
+        conviction=5,
+        rationale="test",
+        timestamp=_TS,
+        legs=legs,
+    )
+    decision = gate.check_intent(intent, _agent_state(), Decimal("1.0"), [], _TS)
+    assert decision.allowed is False
+    assert "one-sided" in (decision.veto_reason or "").lower()

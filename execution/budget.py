@@ -14,12 +14,18 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
+
+if TYPE_CHECKING:
+    from execution.kill_switch import KillSwitchEngine
+
+log = logging.getLogger(__name__)
 
 DEFAULT_DAILY_LIMIT: Decimal = Decimal("0.95")
 
@@ -121,6 +127,11 @@ class BudgetLedger:
     def daily_limit(self) -> Decimal:
         return self._limit
 
+    def entries(self) -> list[_EntryDict]:
+        """Snapshot of today's spend entries (for read-only callers)."""
+        with self._lock:
+            return list(self._entries)
+
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def _load(self) -> None:
@@ -153,3 +164,70 @@ class BudgetLedger:
             self._today = today
             self._total = Decimal("0")
             self._entries = []
+
+
+class BudgetWatcher:
+    """Polls BudgetLedger and trips KillSwitchEngine when daily spend is exhausted.
+
+    Per blueprint §5 Layer 3: on exhaustion the system degrades to Haiku-only mode.
+    The kill switch trip (BUDGET_EXHAUSTED) is what triggers that degradation in app.py.
+    """
+
+    def __init__(
+        self,
+        ledger: BudgetLedger,
+        kill: KillSwitchEngine,
+        poll_interval_secs: float = 30.0,
+    ) -> None:
+        self._ledger = ledger
+        self._kill = kill
+        self._poll_interval = poll_interval_secs
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._tripped = False
+
+    def start(self) -> None:
+        """Start the background polling loop."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run_loop, daemon=True, name="budget-watcher"
+        )
+        self._thread.start()
+        log.info("BudgetWatcher: started (poll_interval=%.0fs)", self._poll_interval)
+
+    def stop(self) -> None:
+        """Stop the polling loop (waits up to 5s for the thread to exit)."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    def check_once(self) -> bool:
+        """Synchronous single check. Returns True if budget just tripped the kill switch."""
+        if self._tripped:
+            return False
+        if self._ledger.is_exhausted():
+            self._kill.trip_budget_exhausted()
+            self._tripped = True
+            log.warning(
+                "BudgetWatcher: daily spend exhausted ($%.4f >= $%.4f) — "
+                "kill switch tripped; system degraded to Haiku-only mode",
+                float(self._ledger.today_spent()),
+                float(self._ledger.daily_limit()),
+            )
+            return True
+        return False
+
+    def reset(self) -> None:
+        """Reset the tripped flag. Call alongside BudgetLedger.reset_if_new_day()."""
+        self._tripped = False
+
+    def _run_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.check_once()
+            except Exception:
+                log.exception("BudgetWatcher: error in poll loop")
+            self._stop_event.wait(self._poll_interval)

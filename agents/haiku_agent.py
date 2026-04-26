@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from agents.base import AgentState, BaseAgent
+from agents.json_utils import parse_json_object
 from agents.llm import LLMClient
 from agents.memory import AgentMemory
 from core.types import Action, AgentId, Intent, KillSwitchState, Sleeve, new_id
@@ -198,20 +198,10 @@ class HaikuAgent(BaseAgent):
         ])
 
     def _parse_intents(self, response_text: str, state: AgentState) -> list[Intent]:
-        data: dict[str, Any]
-        try:
-            data = json.loads(response_text)
-        except json.JSONDecodeError:
-            start = response_text.find("{")
-            end = response_text.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                _log.warning("HaikuAgent: could not find JSON block in LLM response")
-                return []
-            try:
-                data = json.loads(response_text[start : end + 1])
-            except json.JSONDecodeError:
-                _log.warning("HaikuAgent: JSON extraction failed", exc_info=True)
-                return []
+        data = parse_json_object(response_text)
+        if data is None:
+            _log.warning("HaikuAgent: could not parse JSON from LLM response")
+            return []
 
         regime = str(data.get("regime_observation", ""))
         intents: list[Intent] = []

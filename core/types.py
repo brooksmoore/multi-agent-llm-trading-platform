@@ -165,6 +165,7 @@ class Intent:
     timestamp: datetime
     regime_observation: str = ""    # optional context from agent
     requires_approval: bool = False  # overridden by AUTO_APPROVE flag
+    legs: tuple[OptionLeg, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

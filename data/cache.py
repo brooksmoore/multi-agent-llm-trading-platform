@@ -11,6 +11,8 @@ import diskcache
 
 F = TypeVar("F", bound=Callable[..., Any])
 
+_MISS = object()
+
 
 class Cache:
     def __init__(
@@ -19,8 +21,8 @@ class Cache:
         self._cache = diskcache.Cache(str(directory))
         self._default_ttl = default_ttl
 
-    def get(self, key: str) -> Any | None:
-        return self._cache.get(key)
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._cache.get(key, default=default)
 
     def set(self, key: str, value: Any, ttl: int | None = None) -> None:
         expire = ttl if ttl is not None else self._default_ttl
@@ -40,8 +42,8 @@ class Cache:
             @functools.wraps(func)
             def wrapper(*args: Any, **kwargs: Any) -> Any:
                 key = f"{func.__qualname__}:{args!r}:{sorted(kwargs.items())!r}"
-                cached_val = self.get(key)
-                if cached_val is not None:
+                cached_val = self.get(key, default=_MISS)
+                if cached_val is not _MISS:
                     return cached_val
                 result = func(*args, **kwargs)
                 self.set(key, result, ttl=ttl)

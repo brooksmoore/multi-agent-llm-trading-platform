@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 from core.types import AgentId, Lot
@@ -81,6 +81,19 @@ class WashSaleChecker:
             if price < lot.entry_price:
                 candidates.append(lot)
         return candidates
+
+    def days_remaining(self, agent_id: AgentId, symbol: str, check_date: date) -> int:
+        """Return days remaining in the 30-day wash-sale window (0 if not blocked)."""
+        with self._lock:
+            best = 0
+            for rec in self._records:
+                if rec.agent_id != agent_id or rec.symbol != symbol:
+                    continue
+                window_end = rec.sale_date + timedelta(days=WASH_SALE_WINDOW_DAYS)
+                if check_date <= window_end:
+                    remaining = (window_end - check_date).days
+                    best = max(best, remaining)
+            return best
 
     def all_records(self) -> list[WashSaleRecord]:
         with self._lock:
