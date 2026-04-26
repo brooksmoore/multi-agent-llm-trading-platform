@@ -54,5 +54,8 @@ class Settings(BaseSettings):
     reconciler_interval_secs: int = 60
     reconciler_qty_tolerance: Decimal = Decimal("1")   # shares
 
+    # ── Per-agent tracker ──────────────────────────────────────────────────────
+    starting_equity: Decimal = Decimal("100000")   # per-agent sleeve starting equity
+
 
 settings = Settings()

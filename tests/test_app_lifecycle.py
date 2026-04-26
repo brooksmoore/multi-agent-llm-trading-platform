@@ -16,7 +16,7 @@ import pytest
 
 from app import App
 from config.settings import Settings
-from core.types import AgentId
+from core.types import Action, AgentId, Intent, Sleeve, new_id
 from data.market import Bar, Timeframe
 from execution.fake_broker import FakeBroker
 
@@ -189,6 +189,56 @@ def test_macro_calendar_loaded(tmp_path: Path) -> None:
     app = _build_app(tmp_path)
     # The yaml ships with at least 1 event; if missing, fall back to []
     assert isinstance(app._macro_calendar, list)
+    app.stop()
+
+
+def test_dispatch_observation_submits_order_via_planner(tmp_path: Path) -> None:
+    """Integration: intent → RiskGate → ExecutionPlanner → OMS → FakeBroker fill.
+
+    Verifies the full wiring added in M10 sub-task integration commit:
+    dispatch_observation() now routes approved intents through the planner and
+    submits them to OMS, which fills them via FakeBroker.
+    """
+    broker = FakeBroker()
+    app = _build_app(tmp_path, broker=broker)
+
+    # Give the app enough bars so the vol-snapshot has a valid mark price.
+    ts = datetime(2026, 4, 25, 10, 0, tzinfo=UTC)
+    bars = {
+        "SPY": [_make_bar("SPY", ts, "500.00")],
+        "QQQ": [_make_bar("QQQ", ts, "450.00")],
+        "AAPL": [_make_bar("AAPL", ts, "200.00")],
+    }
+    app.market_data = StubMarketData(bars)  # type: ignore[assignment]
+    app.universe = list(bars.keys())
+
+    # Stub Sonnet.observe to return a deterministic BUY intent for SPY.
+    spy_intent = Intent(
+        id=new_id(),
+        agent_id=AgentId.SONNET,
+        symbol="SPY",
+        action=Action.BUY,
+        target_weight=Decimal("0.10"),
+        sleeve=Sleeve.EQUITY,
+        signal="test-signal",
+        conviction=7,
+        rationale="integration smoke test",
+        timestamp=ts,
+    )
+    app.sonnet.observe = MagicMock(return_value=[spy_intent])  # type: ignore[method-assign]
+
+    result = app.dispatch_observation(app.sonnet)
+
+    # Intent was accepted and routed to OMS.
+    assert len(result) == 1
+    assert result[0].symbol == "SPY"
+
+    # OMS has at least one order for SPY.
+    all_orders = app.oms.list_orders()
+    spy_orders = [o for o in all_orders if o.symbol == "SPY"]
+    assert len(spy_orders) >= 1, "Expected at least one SPY order in OMS"
+    assert spy_orders[0].agent_id == AgentId.SONNET
+
     app.stop()
 
 

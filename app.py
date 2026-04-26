@@ -51,26 +51,29 @@ from agents.sonnet_agent import SonnetAgent
 from config.runtime_store import runtime_store
 from config.settings import Settings
 from core.clock import ET, Clock, WallClock
-from core.events import EventBus
+from core.events import EventBus, FillReceivedEvent
 from core.types import (
     AgentId,
     DrawdownBucket,
     Intent,
     KillSwitchState,
+    MarketSnapshot,
     VixBucket,
 )
 from core.types import (
     AgentState as CoreAgentState,
 )
+from execution.agent_state_tracker import AgentStateTracker
 from execution.broker import Broker, BrokerAccount
 from execution.budget import BudgetLedger, BudgetWatcher
 from execution.kill_switch import KillSwitchEngine
 from execution.lots import LotLedger
 from execution.oms import OMS
 from execution.oms_store import OMSStore
+from execution.planner import ExecutionPlanner
 from execution.reconciler import Reconciler
 from execution.risk import RiskGate
-from execution.sizing import effective_max_gross
+from execution.sizing import classify_vix, effective_max_gross
 from execution.tax import WashSaleChecker
 from ops.alerts import AlertManager
 from ops.heartbeat import HeartbeatWriter
@@ -182,6 +185,17 @@ class App:
 
         self.store = OMSStore(self._oms_db_path)
         self.oms = OMS(self.broker, self.store, self.bus, clock=self.clock)
+
+        tracker_db = str(data_dir / "agent_tracker.db")
+        self.tracker = AgentStateTracker(
+            kill_switch=self.kill,
+            lot_ledger=self.lots,
+            starting_equity=settings.starting_equity,
+            db_path=tracker_db,
+        )
+        self.planner = ExecutionPlanner(self.oms, self.lots, self.bus)
+        self.bus.subscribe("fill.received", self._on_fill_received)
+
         self.reconciler = Reconciler(
             self.oms,
             self.broker,
@@ -375,17 +389,17 @@ class App:
     # ── Agent dispatch ────────────────────────────────────────────────────────
 
     def dispatch_observation(self, agent: BaseAgent) -> list[Intent]:
-        """Build state, call agent.observe(), log emitted intents.
-
-        Order routing (Sizing → OMS) is wired in the smoke test (sub-task 5);
-        for now we log the intents and let RiskGate evaluate them so any
-        veto reasons surface in the journal.
-        """
+        """Build state, call agent.observe(), route approved intents through planner → OMS."""
         if self.kill.state == KillSwitchState.BUDGET_EXHAUSTED and agent.agent_id != AgentId.HAIKU:
             log.info("Skip %s: budget exhausted (Haiku-only mode)", agent.agent_id)
             return []
 
         state = self.build_agent_state()
+        snapshot = self._build_market_snapshot(state)
+
+        # Keep mark prices current for drawdown bucket computation.
+        self.tracker.update_on_mark(agent.agent_id, snapshot.current_prices)
+
         try:
             intents = agent.observe(state)
         except BudgetExhausted:
@@ -397,47 +411,93 @@ class App:
 
         accepted: list[Intent] = []
         for intent in intents:
-            decision = self._evaluate_with_risk_gate(intent, state)
-            if decision.allowed:
-                accepted.append(intent)
-            else:
+            core_state = self.tracker.get_state(intent.agent_id)
+            decision = self._evaluate_with_risk_gate(intent, state, core_state)
+            if not decision.allowed:
                 log.info(
                     "RiskGate vetoed %s/%s: %s",
                     intent.agent_id, intent.symbol, decision.veto_reason,
                 )
+                continue
+
+            order = self.planner.plan(intent, core_state, snapshot)
+            if order is None:
+                log.debug(
+                    "planner: no order for %s/%s (sub-minimum)",
+                    intent.agent_id, intent.symbol,
+                )
+                continue
+
+            try:
+                self.oms.submit_order(order)
+                accepted.append(intent)
+            except Exception:
+                log.exception("OMS.submit_order failed for %s/%s", intent.agent_id, intent.symbol)
+
         log.info(
-            "%s observed: %d intents, %d accepted",
+            "%s observed: %d intents, %d submitted",
             agent.agent_id, len(intents), len(accepted),
         )
         return accepted
 
-    def _evaluate_with_risk_gate(self, intent: Intent, state: AgentState) -> Any:
-        """Run the intent through RiskGate. Returns a RiskDecision.
-
-        Builds a minimal CoreAgentState from broker account snapshot. Full
-        per-agent state tracking (peak equity, consecutive losses, drawdown
-        bucket) is wired into the agent memory and consumed here in M10.
-        """
-        agent_state = CoreAgentState(
-            agent_id=intent.agent_id,
-            sleeve_equity=state.account.equity,
-            sleeve_peak_equity=state.account.equity,
-            drawdown_bucket=DrawdownBucket.NORMAL,
-            drawdown_bucket_entry_date=None,
-            consecutive_losses=0,
-            is_benched=False,
-            bench_until=None,
-            day_trade_count=0,
-            orders_today=0,
-            last_memo_id=None,
-        )
+    def _evaluate_with_risk_gate(
+        self,
+        intent: Intent,
+        state: AgentState,
+        core_state: CoreAgentState,
+    ) -> Any:
+        """Run the intent through RiskGate using live per-agent CoreAgentState."""
         return self.risk.check_intent(
             intent=intent,
-            agent_state=agent_state,
+            agent_state=core_state,
             effective_gross=state.effective_max_gross,
             positions=[],
             ts=state.timestamp,
         )
+
+    def _build_market_snapshot(self, state: AgentState) -> MarketSnapshot:
+        """Derive a MarketSnapshot from the current AgentState."""
+        current_prices: dict[str, Decimal] = {}
+        realized_vol: dict[str, Decimal] = {}
+
+        for sym, bars in state.bars_by_symbol.items():
+            if not bars:
+                continue
+            current_prices[sym] = bars[-1].close
+
+            # Compute annualized 30-day realized vol from daily log-returns.
+            # Fall back to the 8% floor if fewer than 2 bars are available.
+            returns = [
+                (bars[i].close - bars[i - 1].close) / bars[i - 1].close
+                for i in range(max(1, len(bars) - 30), len(bars))
+                if bars[i - 1].close > Decimal("0")
+            ]
+            if len(returns) >= 2:
+                n = Decimal(len(returns))
+                mean: Decimal = sum(returns, Decimal("0")) / n
+                variance: Decimal = sum(((r - mean) ** 2 for r in returns), Decimal("0")) / n
+                daily_vol = variance.sqrt() if variance > Decimal("0") else Decimal("0")
+                ann_vol = daily_vol * Decimal("252").sqrt()
+                realized_vol[sym] = max(ann_vol, Decimal("0.08"))
+
+        vix = state.vix_value or Decimal("18")
+        vix_bucket = classify_vix(vix)
+
+        return MarketSnapshot(
+            current_prices=current_prices,
+            realized_vol_30d=realized_vol,
+            vix_bucket=vix_bucket,
+            timestamp=state.timestamp,
+        )
+
+    def _on_fill_received(self, event: Any) -> None:
+        """Forward fill events to AgentStateTracker."""
+        if not isinstance(event, FillReceivedEvent):
+            return
+        try:
+            self.tracker.update_on_fill(event.fill)
+        except Exception:
+            log.exception("tracker.update_on_fill failed for fill %s", event.fill.id)
 
     # ── Scheduled jobs ────────────────────────────────────────────────────────
 
