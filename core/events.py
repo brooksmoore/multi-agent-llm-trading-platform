@@ -149,6 +149,23 @@ class LeverageRotationFlagEvent(Event):
     reopen_count: int = 0
 
 
+@dataclass(frozen=True)
+class IntentSizedEvent(Event):
+    """Emitted by ExecutionPlanner after sizing an intent into an order."""
+
+    name: str = field(default="intent.sized", init=False)
+    intent_id: IntentId = field(default_factory=uuid.uuid4)
+    agent_id: AgentId = AgentId.HAIKU
+    symbol: str = ""
+    target_weight: Decimal = Decimal("0")
+    position_value_usd: Decimal = Decimal("0")
+    qty: Decimal = Decimal("0")
+    effective_vol_target: Decimal = Decimal("0")
+    effective_max_gross_val: Decimal = Decimal("0")
+    realized_vol_30d: Decimal = Decimal("0")
+    binding_constraint: str = ""  # "vol_target" | "max_gross" | "close"
+
+
 # ─── Sentinel factories (only used as dataclass defaults) ─────────────────────
 
 def _missing_intent() -> Intent:

@@ -359,3 +359,13 @@ class AgentState:
         if self.sleeve_peak_equity == Decimal("0"):
             return Decimal("0")
         return (self.sleeve_peak_equity - self.sleeve_equity) / self.sleeve_peak_equity
+
+
+@dataclass(frozen=True)
+class MarketSnapshot:
+    """Minimal price + vol data the ExecutionPlanner needs to size an order."""
+
+    current_prices: dict[str, Decimal]       # symbol → last mark price
+    realized_vol_30d: dict[str, Decimal]     # symbol → annualized 30-day realized vol
+    vix_bucket: VixBucket
+    timestamp: datetime

@@ -43,6 +43,15 @@ AGENT_BASE_MAX_GROSS: dict[AgentId, Decimal] = {
     AgentId.MANAGER: Decimal("1.00"),
 }
 
+# ── Per-agent base vol targets (at MASTER_CAPABILITY = 1.0) ──────────────────
+
+AGENT_BASE_VOL_TARGET: dict[AgentId, Decimal] = {
+    AgentId.HAIKU:   Decimal("0.14"),  # trend following — linear Sharpe with leverage
+    AgentId.SONNET:  Decimal("0.12"),  # multi-factor — moderate
+    AgentId.OPUS:    Decimal("0.11"),  # concentrated GARP — idiosyncratic risk
+    AgentId.MANAGER: Decimal("0.10"),  # unused (Manager holds no positions)
+}
+
 # ── VIX ladder scalars ────────────────────────────────────────────────────────
 
 VIX_SCALARS: dict[VixBucket, Decimal] = {
@@ -191,3 +200,24 @@ class VolTargetSizer:
     ) -> Decimal:
         """Return min(vol_target_leverage, max_gross) — the binding constraint wins."""
         return min(self.target_leverage(), max_gross)
+
+
+# ── Stateless sizing helper for ExecutionPlanner ──────────────────────────────
+
+
+def vol_targeted_position_value(
+    target_weight: Decimal,
+    agent_equity: Decimal,
+    realized_vol_annual: Decimal,
+    effective_vol_target: Decimal,
+) -> Decimal:
+    """Compute vol-targeted position value from an intent's target_weight.
+
+    sizing_multiplier = min(effective_vol_target / realized_vol, 1.75)
+    position_value    = target_weight × agent_equity × sizing_multiplier
+
+    The 8% annual vol floor is applied before division (vol-paradox guard).
+    """
+    realized_vol = max(realized_vol_annual, VOL_FLOOR_ANNUAL)
+    sizing_mult = min(effective_vol_target / realized_vol, VOL_TARGET_CAP_LEVERAGE)
+    return target_weight * agent_equity * sizing_mult
