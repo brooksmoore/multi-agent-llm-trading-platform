@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import random
 import time
+import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -94,8 +96,6 @@ class LLMClient:
 
         Raises BudgetExhausted if the estimated cost exceeds remaining budget.
         """
-        import uuid
-
         est_input = (len(system) + len(user)) // 4
         est_cost = _cost(self._model, est_input, max_tokens)
         if est_cost > self._budget.remaining():
@@ -112,7 +112,7 @@ class LLMClient:
                 {
                     "type": "text",
                     "text": system,
-                    "cache_control": {"type": "ephemeral"},
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
                 }
             ]
         else:
@@ -176,7 +176,9 @@ class LLMClient:
                 )
             except anthropic.RateLimitError as exc:
                 last_exc = exc
-                time.sleep(2**attempt)
+                # Exponential backoff with jitter to avoid thundering herd
+                # when multiple agents hit a 429 simultaneously.
+                time.sleep(2**attempt + random.uniform(0, 1))
             except anthropic.APIStatusError as exc:
                 last_exc = exc
                 if attempt == self._max_retries - 1:
