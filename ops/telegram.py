@@ -1,47 +1,160 @@
-"""Telegram notification adapter — STUB for v1.5.
+"""Outbound Telegram notification adapter.
 
-Full implementation deferred to milestone 7 (post-milestone-6 agent wiring).
-The real adapter will use the Telegram Bot API via httpx.
+Sends messages to a Telegram chat using the Bot API directly via httpx.
+No polling or webhook required — purely outbound.
 
-This stub provides the same interface so the rest of the system can
-import and call it without error during v1 development.
+Configure via .env:
+    TELEGRAM_BOT_TOKEN=<token from @BotFather>
+    TELEGRAM_CHAT_ID=<numeric chat / group ID>
+
+MarkdownV2 formatting is used throughout; all dynamic strings are escaped
+via _escape() before insertion so malformed text never causes an API error.
+
+Deduplication: the same dedup key is suppressed for dedupe_window_secs (60 s
+default) so a flapping kill-switch does not flood the chat.
+
+HALT alerts include a Telegram URL inline button ("Acknowledge") that opens
+the Telegram app. This is the correct outbound-only approach: a url-type
+button does not require a webhook to be functional.
+
+Graceful degradation: every network error is caught and logged. The adapter
+never raises — callers can ignore the return value.
 """
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import logging
+import re
+import threading
+import time
+from typing import Any
 
-logger = logging.getLogger(__name__)
+import httpx
+
+log = logging.getLogger(__name__)
+
+_TELEGRAM_API = "https://api.telegram.org"
+_HTTP_TIMEOUT = 5.0        # seconds per call
+_DEDUPE_WINDOW = 60.0      # seconds
+_MAX_CHARS = 4096          # Telegram hard message limit
+
+# All characters that must be escaped in MarkdownV2 mode per Telegram docs.
+_MDV2_SPECIAL = re.compile(r"([_*\[\]()~`>#\+\-=|{}.!\\])")
+
+
+def _escape(text: str) -> str:
+    """Escape all MarkdownV2 reserved characters in a plain-text string."""
+    return _MDV2_SPECIAL.sub(r"\\\1", text)
+
+
+def _truncate(text: str) -> str:
+    return text if len(text) <= _MAX_CHARS else text[: _MAX_CHARS - 1] + "…"
 
 
 class TelegramAdapter:
-    """Stub Telegram notification adapter.
+    """Outbound-only Telegram notification adapter.
 
-    All methods are no-ops in v1. The interface matches what ops/alerts.py
-    will call, so swapping in the real implementation in v1.5 requires zero
-    changes to callers.
+    Thread-safe. Never raises. All sends return True (delivered) or False
+    (disabled / deduped / network error).
+
+    Pass an httpx.Client via http_client to inject a mock in tests.
     """
 
-    def __init__(self, bot_token: str = "", chat_id: str = "") -> None:
+    def __init__(
+        self,
+        bot_token: str = "",
+        chat_id: str = "",
+        *,
+        http_client: httpx.Client | None = None,
+        dedupe_window_secs: float = _DEDUPE_WINDOW,
+    ) -> None:
+        self._token = bot_token
+        self._chat_id = chat_id
         self._enabled = bool(bot_token and chat_id)
-        if not self._enabled:
-            logger.debug("TelegramAdapter: no credentials — stub mode, all sends are no-ops")
+        self._http: httpx.Client | None = (
+            http_client if http_client is not None
+            else (httpx.Client(timeout=_HTTP_TIMEOUT) if self._enabled else None)
+        )
+        self._lock = threading.Lock()
+        self._last_sent: dict[str, float] = {}
+        self._dedupe_window = dedupe_window_secs
 
-    async def send(self, message: str) -> bool:
-        """Send a text message. Returns True on success, False on failure."""
         if not self._enabled:
-            logger.debug("TelegramAdapter.send() [stub]: %s", message[:80])
+            log.debug("TelegramAdapter: no credentials — notifications disabled")
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    # ── Public API ─────────────────────────────────────────────────────────────
+
+    def send(
+        self,
+        text: str,
+        *,
+        key: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        """Send a pre-formatted MarkdownV2 message.
+
+        key: dedup key — re-sends within dedupe_window_secs are suppressed.
+             Defaults to an MD5 of the first 200 chars of text.
+        reply_markup: optional Telegram reply_markup dict (e.g. inline keyboard).
+        """
+        if not self._enabled:
+            log.debug("TelegramAdapter.send [disabled]: %.80s", text)
             return False
-        # v1.5: POST https://api.telegram.org/bot{token}/sendMessage
-        # with json={"chat_id": self._chat_id, "text": message, "parse_mode": "Markdown"}
-        logger.warning("TelegramAdapter.send() called but not yet implemented (v1.5)")
-        return False
 
-    async def send_halt_alert(self, reason: str, agent: str | None = None) -> bool:
-        tag = f"[{agent}] " if agent else ""
-        return await self.send(f"🚨 HALT — {tag}{reason}")
+        dedup_key = key or hashlib.md5(text[:200].encode(), usedforsecurity=False).hexdigest()
+        now = time.monotonic()
+        with self._lock:
+            last = self._last_sent.get(dedup_key)
+            if last is not None and (now - last) < self._dedupe_window:
+                log.debug("TelegramAdapter: deduped key='%s'", dedup_key)
+                return False
+            self._last_sent[dedup_key] = now
 
-    async def send_fill_notification(
+        payload: dict[str, Any] = {
+            "chat_id": self._chat_id,
+            "text": _truncate(text),
+            "parse_mode": "MarkdownV2",
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+
+        url = f"{_TELEGRAM_API}/bot{self._token}/sendMessage"
+        try:
+            assert self._http is not None  # guarded by self._enabled check above
+            resp = self._http.post(url, json=payload)
+            if not resp.is_success:
+                log.warning(
+                    "TelegramAdapter: API error %d — %.200s",
+                    resp.status_code,
+                    resp.text,
+                )
+                return False
+        except Exception:
+            log.warning("TelegramAdapter: send failed", exc_info=True)
+            return False
+
+        log.debug("TelegramAdapter: sent key='%s'", dedup_key)
+        return True
+
+    def send_halt_alert(self, reason: str, agent: str | None = None) -> bool:
+        """Send a HALT alert with an inline Acknowledge URL button."""
+        agent_part = f" \\[{_escape(agent)}\\]" if agent else ""
+        text = f"🚨 *HALT*{agent_part}\n{_escape(reason)}"
+        markup = {
+            "inline_keyboard": [[
+                {"text": "✅ Acknowledge", "url": "https://t.me"},
+            ]]
+        }
+        key = f"halt:{agent}:{reason[:60]}"
+        return self.send(text, key=key, reply_markup=markup)
+
+    def send_fill_notification(
         self,
         agent: str,
         symbol: str,
@@ -49,11 +162,25 @@ class TelegramAdapter:
         qty: str,
         price: str,
     ) -> bool:
-        return await self.send(
-            f"✅ FILL [{agent}] {side.upper()} {qty} {symbol} @ {price}"
+        """Send a fill notification."""
+        text = (
+            f"✅ *FILL* \\[{_escape(agent)}\\]\n"
+            f"{_escape(side.upper())} {_escape(qty)} "
+            f"{_escape(symbol)} @ {_escape(price)}"
         )
+        # Fills can be rapid — key includes symbol+side so partial fills dedup separately.
+        key = f"fill:{agent}:{symbol}:{side.lower()}"
+        return self.send(text, key=key)
 
-    async def send_weekly_report(self, report_md: str) -> bool:
-        # Telegram has a 4096-char message limit; truncate gracefully
-        truncated = report_md[:4000] + "…" if len(report_md) > 4000 else report_md
-        return await self.send(truncated)
+    def send_weekly_report(self, report_md: str) -> bool:
+        """Send the manager's weekly journal. Deduped once per calendar day."""
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        today = datetime.now(UTC).date().isoformat()
+        return self.send(report_md, key=f"weekly:{today}")
+
+    def close(self) -> None:
+        """Close the underlying httpx.Client (call once on shutdown)."""
+        if self._http is not None:
+            with contextlib.suppress(Exception):
+                self._http.close()

@@ -77,6 +77,7 @@ from execution.sizing import classify_vix, effective_max_gross
 from execution.tax import WashSaleChecker
 from ops.alerts import AlertManager
 from ops.heartbeat import HeartbeatWriter
+from ops.telegram import TelegramAdapter
 
 if TYPE_CHECKING:
     from data.market import Bar, MarketData
@@ -226,7 +227,11 @@ class App:
 
         # Ops
         self.heartbeat = HeartbeatWriter(self._heartbeat_path, kill=self.kill)
-        self.alerts = AlertManager(self.bus, settings.ntfy_topic)
+        self.telegram = TelegramAdapter(
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+        )
+        self.alerts = AlertManager(self.bus, settings.ntfy_topic, telegram=self.telegram)
 
         # Scheduler (NYSE timezone for cron triggers)
         self.scheduler = BackgroundScheduler(timezone=ET)
@@ -314,6 +319,7 @@ class App:
 
         # Close OMS store
         self._safe_call(self.store.close)
+        self._safe_call(self.telegram.close)
 
         # Write shutdown summary
         self._write_shutdown_summary()
@@ -631,6 +637,7 @@ class App:
             journal = self.manager.weekly_journal(state, week_data="(no historical snapshot)")
             if journal:
                 self._memories[AgentId.MANAGER].write_journal(state.timestamp.date(), journal)
+                self.telegram.send_weekly_report(journal)
         except Exception:
             log.exception("manager.weekly_journal failed")
 

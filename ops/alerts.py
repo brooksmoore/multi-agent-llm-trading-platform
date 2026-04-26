@@ -27,10 +27,12 @@ from core.events import (
     BudgetExhaustedEvent,
     Event,
     EventBus,
+    FillReceivedEvent,
     KillSwitchTrippedEvent,
     LeverageRotationFlagEvent,
     ReconciliationBreakEvent,
 )
+from ops.telegram import TelegramAdapter
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +68,7 @@ class AlertManager:
         *,
         poster: HttpPoster | None = None,
         dedupe_window_secs: float = DEDUPE_WINDOW_SECS,
+        telegram: TelegramAdapter | None = None,
     ) -> None:
         self._bus = bus
         self._topic = topic
@@ -75,6 +78,7 @@ class AlertManager:
         self._last_sent: dict[str, float] = {}  # message_key → monotonic ts
         self._sent_count: int = 0
         self._dedup_count: int = 0
+        self._telegram = telegram
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -84,9 +88,12 @@ class AlertManager:
         self._bus.subscribe("reconciliation.break", self._on_reconciliation_break)
         self._bus.subscribe("budget.exhausted", self._on_budget_exhausted)
         self._bus.subscribe("leverage.rotation_flag", self._on_leverage_rotation)
+        if self._telegram is not None and self._telegram.enabled:
+            self._bus.subscribe("fill.received", self._on_fill_received)
         log.info(
-            "AlertManager: started (topic=%s dedupe=%.0fs)",
+            "AlertManager: started (topic=%s telegram=%s dedupe=%.0fs)",
             self._topic or "<disabled>",
+            "enabled" if (self._telegram is not None and self._telegram.enabled) else "disabled",
             self._dedupe_window,
         )
 
@@ -96,6 +103,8 @@ class AlertManager:
         self._bus.unsubscribe("reconciliation.break", self._on_reconciliation_break)
         self._bus.unsubscribe("budget.exhausted", self._on_budget_exhausted)
         self._bus.unsubscribe("leverage.rotation_flag", self._on_leverage_rotation)
+        if self._telegram is not None and self._telegram.enabled:
+            self._bus.unsubscribe("fill.received", self._on_fill_received)
 
     # ── Stats (for dashboard / tests) ─────────────────────────────────────────
 
@@ -116,8 +125,12 @@ class AlertManager:
             return
         title = "🚨 Kill switch tripped"
         msg = f"state={event.new_state} reason={event.reason}"
-        priority = "urgent"
-        self._send(title=title, message=msg, key=f"ks:{event.new_state}", priority=priority)
+        self._send(title=title, message=msg, key=f"ks:{event.new_state}", priority="urgent")
+        if self._telegram is not None:
+            self._telegram.send_halt_alert(
+                reason=f"{event.new_state} — {event.reason}",
+                agent=str(event.agent_id) if event.agent_id else None,
+            )
 
     def _on_reconciliation_break(self, event: Event) -> None:
         if not isinstance(event, ReconciliationBreakEvent):
@@ -128,6 +141,10 @@ class AlertManager:
             f"delta=${event.delta_usd}"
         )
         self._send(title=title, message=msg, key=f"recon:{event.symbol}", priority="high")
+        if self._telegram is not None:
+            self._telegram.send_halt_alert(
+                reason=f"Reconciliation break {event.symbol}: delta=${event.delta_usd}",
+            )
 
     def _on_budget_exhausted(self, event: Event) -> None:
         if not isinstance(event, BudgetExhaustedEvent):
@@ -135,6 +152,11 @@ class AlertManager:
         title = "💸 Daily LLM budget exhausted"
         msg = f"spent_today=${event.spent_today} (system → Haiku-only)"
         self._send(title=title, message=msg, key="budget", priority="high")
+        if self._telegram is not None:
+            self._telegram.send_halt_alert(
+                reason=f"Daily LLM budget exhausted — spent ${event.spent_today}",
+                agent=str(event.agent_id) if event.agent_id else None,
+            )
 
     def _on_leverage_rotation(self, event: Event) -> None:
         if not isinstance(event, LeverageRotationFlagEvent):
@@ -145,6 +167,18 @@ class AlertManager:
             f"category={event.category} reopens={event.reopen_count}"
         )
         self._send(title=title, message=msg, key=f"rot:{event.agent_id}:{event.category}")
+
+    def _on_fill_received(self, event: Event) -> None:
+        if not isinstance(event, FillReceivedEvent) or self._telegram is None:
+            return
+        f = event.fill
+        self._telegram.send_fill_notification(
+            agent=str(f.agent_id),
+            symbol=f.symbol,
+            side=str(f.side),
+            qty=str(f.qty),
+            price=str(f.price),
+        )
 
     # ── Send + dedupe ─────────────────────────────────────────────────────────
 
