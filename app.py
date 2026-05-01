@@ -47,6 +47,7 @@ from agents.llm import HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL, BudgetExhausted, L
 from agents.manager_agent import ManagerAgent
 from agents.memory import AgentMemory
 from agents.opus_agent import OpusAgent
+from agents.outcome_recorder import OutcomeRecorder
 from agents.sonnet_agent import SonnetAgent
 from config.runtime_store import runtime_store
 from config.settings import Settings
@@ -224,6 +225,11 @@ class App:
         self.sonnet = SonnetAgent(self._llm_sonnet, self._memories[AgentId.SONNET])
         self.opus = OpusAgent(self._llm_opus, self._memories[AgentId.OPUS])
         self.manager = ManagerAgent(self._llm_manager, self._memories[AgentId.MANAGER])
+
+        # Routes terminal intent outcomes (filled / rejected / cancelled /
+        # expired / vetoed / unsized) back to per-agent intent_log so the LLM
+        # context can distinguish completed from silently-failed intents.
+        self.outcome_recorder = OutcomeRecorder(self._memories, self.oms, self.bus)
 
         # Ops
         self.heartbeat = HeartbeatWriter(self._heartbeat_path, kill=self.kill)
@@ -424,6 +430,10 @@ class App:
                     "RiskGate vetoed %s/%s: %s",
                     intent.agent_id, intent.symbol, decision.veto_reason,
                 )
+                self.outcome_recorder.record(
+                    intent.id, intent.agent_id,
+                    f"vetoed:{decision.veto_reason or 'risk_gate'}",
+                )
                 continue
 
             order = self.planner.plan(intent, core_state, snapshot)
@@ -432,6 +442,7 @@ class App:
                     "planner: no order for %s/%s (sub-minimum)",
                     intent.agent_id, intent.symbol,
                 )
+                self.outcome_recorder.record(intent.id, intent.agent_id, "unsized")
                 continue
 
             try:
@@ -439,6 +450,7 @@ class App:
                 accepted.append(intent)
             except Exception:
                 log.exception("OMS.submit_order failed for %s/%s", intent.agent_id, intent.symbol)
+                self.outcome_recorder.record(intent.id, intent.agent_id, "submit_error")
 
         log.info(
             "%s observed: %d intents, %d submitted",
