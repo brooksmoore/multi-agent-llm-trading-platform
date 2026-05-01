@@ -135,16 +135,20 @@ class AgentMemory:
     def recent_intents_rows(self, n: int = 10) -> list[dict[str, str | int | None]]:
         """Return the *n* most recent intents as structured rows (for dashboard)."""
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT intent_id, symbol, action, conviction, rationale, outcome, logged_at
-                FROM intent_log
-                WHERE agent_id = ?
-                ORDER BY logged_at DESC
-                LIMIT ?
-                """,
-                (self._agent_id, n),
-            ).fetchall()
+            try:
+                rows = self._conn.execute(
+                    """
+                    SELECT intent_id, symbol, action, conviction, rationale, outcome, logged_at
+                    FROM intent_log
+                    WHERE agent_id = ?
+                    ORDER BY logged_at DESC
+                    LIMIT ?
+                    """,
+                    (self._agent_id, n),
+                ).fetchall()
+            except sqlite3.ProgrammingError:
+                # DB closed during shutdown; dashboard polling can race.
+                return []
         return [
             {
                 "intent_id": row["intent_id"],

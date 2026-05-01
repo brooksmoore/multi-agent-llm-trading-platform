@@ -102,7 +102,18 @@ def _to_alpaca_side(side: OrderSide) -> alpaca_enums.OrderSide:
     return alpaca_enums.OrderSide(side.value)
 
 
-def _to_alpaca_tif(tif: str) -> alpaca_enums.TimeInForce:
+# Crypto symbols traded on Alpaca. TIF=DAY is rejected for crypto (only GTC/IOC
+# accepted), so we override DAY → GTC at submit time.
+_CRYPTO_SYMBOLS: frozenset[str] = frozenset({"BTCUSD", "ETHUSD", "SOLUSD"})
+
+
+def _is_crypto_symbol(symbol: str) -> bool:
+    return symbol in _CRYPTO_SYMBOLS or "/" in symbol
+
+
+def _to_alpaca_tif(tif: str, symbol: str) -> alpaca_enums.TimeInForce:
+    if _is_crypto_symbol(symbol) and tif == "day":
+        return alpaca_enums.TimeInForce.GTC
     return alpaca_enums.TimeInForce(tif)
 
 
@@ -153,7 +164,7 @@ class AlpacaBroker:
             )
 
         side = _to_alpaca_side(order.side)
-        tif = _to_alpaca_tif(order.time_in_force.value)
+        tif = _to_alpaca_tif(order.time_in_force.value, order.symbol)
 
         try:
             if order.order_type == OrderType.MARKET:

@@ -21,7 +21,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from core.types import Order, OrderSide, OrderState
+from core.events import EventBus, KillSwitchResetEvent, KillSwitchTrippedEvent
+from core.types import Fill, KillSwitchState, Order, OrderSide, OrderState, new_id
 from execution.broker import Broker, BrokerOrderEvent, BrokerOrderState, BrokerPosition
 from execution.kill_switch import KillSwitchEngine
 from execution.oms import OMS
@@ -65,6 +66,7 @@ class Reconciler:
         kill: KillSwitchEngine,
         interval_secs: int = 60,
         qty_tolerance: Decimal = _QTY_TOLERANCE_DEFAULT,
+        bus: EventBus | None = None,
     ) -> None:
         self._oms = oms
         self._broker = broker
@@ -73,6 +75,8 @@ class Reconciler:
         self._qty_tolerance = qty_tolerance
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._bus = bus
+        self._last_kill_state: KillSwitchState = kill.state
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -81,6 +85,22 @@ class Reconciler:
         open_orders = self._oms.list_open_orders()
         orders_updated = self._reconcile_orders(open_orders)
         mismatches, tripped = self._reconcile_positions()
+        # Auto-clear a prior reconciliation break once books agree again.
+        if mismatches == 0:
+            self._kill.clear_reconciliation_break()
+        # Publish state-change events when kill switch flips. The
+        # KillSwitchEngine doesn't carry an event bus, so we observe its state
+        # transitions here and forward them to subscribers (alerts/Telegram).
+        new_state = self._kill.state
+        if self._bus is not None and new_state != self._last_kill_state:
+            if new_state == KillSwitchState.OK:
+                self._bus.publish(KillSwitchResetEvent())
+            else:
+                reason = "reconciliation_break" if tripped else str(new_state)
+                self._bus.publish(KillSwitchTrippedEvent(
+                    new_state=new_state, reason=reason,
+                ))
+            self._last_kill_state = new_state
         return ReconcileResult(
             orders_checked=len(open_orders),
             orders_updated=orders_updated,
@@ -144,11 +164,44 @@ class Reconciler:
                 continue
 
             if self._status_requires_update(order.state, status.state):
+                # Synthesize a Fill for any qty the broker has filled that
+                # isn't yet recorded locally. This is the polling fallback
+                # when the trade-update stream is down or events were missed.
+                fill: Fill | None = None
+                delta_qty = status.filled_qty - order.filled_qty
+                broker_terminal_filled = status.state in (
+                    BrokerOrderState.PARTIALLY_FILLED, BrokerOrderState.FILLED,
+                )
+                if broker_terminal_filled and delta_qty > Decimal("0"):
+                    fill = Fill(
+                        id=new_id(),
+                        order_id=order.id,
+                        agent_id=order.agent_id,
+                        symbol=order.symbol,
+                        side=order.side,
+                        qty=delta_qty,
+                        price=status.avg_fill_price or Decimal("0"),
+                        timestamp=status.updated_at,
+                        commission=Decimal("0"),
+                        is_partial=status.state != BrokerOrderState.FILLED,
+                    )
+                elif (
+                    broker_terminal_filled
+                    and status.state == BrokerOrderState.FILLED
+                    and delta_qty <= Decimal("0")
+                ):
+                    # Broker confirms FILLED and we already have all the fill
+                    # qty recorded locally — order is stuck non-terminal due to
+                    # qty-precision drift. Force-close locally; don't emit a
+                    # fill=None FILLED event (OMS would reject it).
+                    self._oms.force_close_filled(order.id, ts=status.updated_at)
+                    updated += 1
+                    continue
                 event = BrokerOrderEvent(
                     broker_order_id=status.broker_order_id,
                     client_order_id=status.client_order_id,
                     new_state=status.state,
-                    fill=None,   # fills come via stream; here we just sync state
+                    fill=fill,
                     timestamp=status.updated_at,
                 )
                 self._oms.on_broker_event(event)

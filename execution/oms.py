@@ -349,7 +349,10 @@ class OMS:
 
         # Update aggregated Order snapshot
         new_filled_qty = order.filled_qty + fill.qty
-        is_full = new_filled_qty >= order.qty
+        # Tolerance: brokers round fill qty (typically 9dp) while the order qty
+        # may carry more precision from sizing math. Treat as fully filled when
+        # the residual is below 1e-9 to avoid orders stuck in PARTIALLY_FILLED.
+        is_full = (order.qty - new_filled_qty) < Decimal("1e-9")
         if order.filled_avg_price is None:
             new_avg = fill.price
         else:
@@ -370,6 +373,25 @@ class OMS:
 
         # Publish FillReceivedEvent (dashboard / journal / lots ledger)
         self._bus.publish(FillReceivedEvent(fill=fill))
+
+    def force_close_filled(self, order_id: OrderId, ts: datetime) -> None:
+        """Force-transition an order to FILLED when broker confirms terminal
+        FILLED but local fills already cover the recorded broker qty (typically
+        precision drift between order.qty and rounded fill qtys).
+        Idempotent: no-op if order is already terminal."""
+        with self._lock:
+            order = self._orders.get(order_id)
+            if order is None:
+                return
+            if order.state in (
+                OrderState.FILLED, OrderState.CANCELLED,
+                OrderState.REJECTED, OrderState.EXPIRED,
+            ):
+                return
+            self._orders[order_id] = replace(
+                order, qty=order.filled_qty, filled_at=ts,
+            )
+            self._transition(order_id, OrderEvent.FULL_FILL, ts=ts)
 
     def _handle_cancellation(self, order_id: OrderId, ts: datetime) -> None:
         if self._orders[order_id].state in (

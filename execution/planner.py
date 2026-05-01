@@ -46,8 +46,19 @@ log = logging.getLogger(__name__)
 
 _MIN_NOTIONAL: Decimal = Decimal("1.00")
 _OPTIONS_MULTIPLIER: Decimal = Decimal("100")   # 1 equity-options contract = 100 shares
+# Alpaca caps fractional qty at 9dp; submitting more precision is silently
+# truncated by the broker, leaving the OMS unable to reconcile filled_qty.
+_FRACTIONAL_QTY_PRECISION: Decimal = Decimal("0.000000001")
 
 _CLOSING_ACTIONS: frozenset[Action] = frozenset({Action.SELL, Action.CLOSE})
+
+
+def _normalize_symbol(symbol: str) -> str:
+    """Strip slash from crypto pairs (BTC/USD → BTCUSD) so intents from agents
+    that use the slashed form resolve against the universe + broker form.
+    Equity tickers pass through unchanged.
+    """
+    return symbol.replace("/", "") if "/" in symbol else symbol
 
 
 class ExecutionPlanner:
@@ -87,6 +98,20 @@ class ExecutionPlanner:
         if intent.action == Action.CLOSE:
             return self._plan_close(intent, agent_state, market_snapshot)
 
+        # SELL fail-safe: refuse to size a SELL for a symbol the agent has
+        # never bought. Without this guard, an LLM that hallucinates ownership
+        # (e.g. seeing another sleeve's position in its context) could place
+        # an unauthorized sell. CLOSE has its own analogous check below.
+        if intent.action == Action.SELL:
+            check_symbol = _normalize_symbol(intent.symbol)
+            held = self._ledger.total_open_qty(intent.agent_id, check_symbol)
+            if held <= Decimal("0"):
+                log.warning(
+                    "planner: SELL %s/%s rejected — agent has no open lots",
+                    intent.agent_id, check_symbol,
+                )
+                return None
+
         # Read MC dynamically so dashboard-slider changes take effect immediately.
         mc = runtime_store.master_capability
 
@@ -102,8 +127,9 @@ class ExecutionPlanner:
 
         effective_vol_tgt = AGENT_BASE_VOL_TARGET[intent.agent_id] * mc
 
+        symbol = _normalize_symbol(intent.symbol)
         realized_vol = market_snapshot.realized_vol_30d.get(
-            intent.symbol, Decimal("0.08")
+            symbol, Decimal("0.08")
         )
 
         position_value = vol_targeted_position_value(
@@ -129,9 +155,9 @@ class ExecutionPlanner:
             return None
 
         # ── Mark price + qty ──────────────────────────────────────────────────
-        current_mark = market_snapshot.current_prices.get(intent.symbol)
+        current_mark = market_snapshot.current_prices.get(symbol)
         if current_mark is None or current_mark <= Decimal("0"):
-            log.warning("planner: no mark for %s — cannot size", intent.symbol)
+            log.warning("planner: no mark for %s — cannot size", symbol)
             return None
 
         if is_options:
@@ -140,8 +166,10 @@ class ExecutionPlanner:
                 Decimal("1"), rounding=ROUND_DOWN
             )
         else:
-            # Equities / crypto: fractional supported.
-            qty = position_value / current_mark
+            # Equities / crypto: fractional supported, rounded to broker precision.
+            qty = (position_value / current_mark).quantize(
+                _FRACTIONAL_QTY_PRECISION, rounding=ROUND_DOWN
+            )
 
         if qty <= Decimal("0"):
             return None
@@ -200,18 +228,19 @@ class ExecutionPlanner:
         market_snapshot: MarketSnapshot,
     ) -> Order | None:
         """Plan a CLOSE intent: sell exactly the current open lot qty."""
-        open_qty = self._ledger.total_open_qty(intent.agent_id, intent.symbol)
+        symbol = _normalize_symbol(intent.symbol)
+        open_qty = self._ledger.total_open_qty(intent.agent_id, symbol)
         if open_qty <= Decimal("0"):
             log.info(
                 "planner: CLOSE %s/%s — no open lots, skipping",
                 intent.agent_id,
-                intent.symbol,
+                symbol,
             )
             return None
 
-        current_mark = market_snapshot.current_prices.get(intent.symbol)
+        current_mark = market_snapshot.current_prices.get(symbol)
         if current_mark is None or current_mark <= Decimal("0"):
-            log.warning("planner: no mark for %s — cannot size CLOSE", intent.symbol)
+            log.warning("planner: no mark for %s — cannot size CLOSE", symbol)
             return None
 
         notional = open_qty * current_mark
@@ -231,7 +260,7 @@ class ExecutionPlanner:
             id=new_id(),
             intent_id=intent.id,
             agent_id=intent.agent_id,
-            symbol=intent.symbol,
+            symbol=symbol,
             side=OrderSide.SELL,
             qty=open_qty,
             order_type=OrderType.MARKET,
@@ -239,14 +268,14 @@ class ExecutionPlanner:
             time_in_force=TimeInForce.DAY,
             state=OrderState.PENDING,
             created_at=datetime.now(UTC),
-            is_letf=intent.symbol in LETF_WHITELIST,
+            is_letf=symbol in LETF_WHITELIST,
         )
 
         self._bus.publish(
             IntentSizedEvent(
                 intent_id=intent.id,
                 agent_id=intent.agent_id,
-                symbol=intent.symbol,
+                symbol=symbol,
                 target_weight=Decimal("0"),
                 position_value_usd=notional,
                 qty=open_qty,
