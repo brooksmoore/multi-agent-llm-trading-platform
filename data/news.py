@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -174,27 +175,71 @@ class RSSAdapter:
         return items
 
 
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+
+def _strip_html(text: str) -> str:
+    """Remove HTML tags and collapse whitespace. yfinance descriptions arrive
+    as HTML fragments with embedded <a> links; we want the plain prose for
+    NewsItem.summary."""
+    return _WS_RE.sub(" ", _HTML_TAG_RE.sub("", text)).strip()
+
+
 class YFinanceAdapter:
     def get_news(self, symbol: str) -> list[NewsItem]:
+        """Pull recent news for a ticker.
+
+        Yahoo restructured the response some time back: fields the legacy
+        adapter read (`title`, `link`, `providerPublishTime`) no longer exist
+        at the top level. Real shape is nested under `content` with
+        `clickThroughUrl.url` / `canonicalUrl.url` for the link and
+        `pubDate` (ISO 8601 string) for the timestamp. Without this fix the
+        adapter silently returned [] for every call.
+        """
         try:
             ticker = yf.Ticker(symbol)
             news_items: list[dict[str, Any]] = ticker.news
-            items: list[NewsItem] = []
-            for item in news_items:
-                try:
-                    items.append(
-                        NewsItem(
-                            source=NewsSource.YFINANCE,
-                            headline=item["title"],
-                            url=item["link"],
-                            published_at=datetime.fromtimestamp(
-                                item["providerPublishTime"], UTC
-                            ),
-                            symbols=(symbol,),
-                        )
-                    )
-                except (KeyError, TypeError, ValueError):
-                    continue
-            return items
         except Exception:
             return []
+        items: list[NewsItem] = []
+        for item in news_items:
+            try:
+                content = item.get("content") or {}
+                title = content.get("title")
+                if not title:
+                    continue
+
+                url = (
+                    (content.get("clickThroughUrl") or {}).get("url")
+                    or (content.get("canonicalUrl") or {}).get("url")
+                )
+                if not url:
+                    continue
+
+                pub_str = content.get("pubDate") or content.get("displayTime")
+                if not pub_str:
+                    continue
+                # ISO 8601 with trailing Z → +00:00 for fromisoformat.
+                published_at = datetime.fromisoformat(
+                    pub_str.replace("Z", "+00:00")
+                )
+                if published_at.tzinfo is None:
+                    published_at = published_at.replace(tzinfo=UTC)
+
+                desc = content.get("description") or ""
+                summary = _strip_html(desc)[:500] if desc else None
+
+                items.append(
+                    NewsItem(
+                        source=NewsSource.YFINANCE,
+                        headline=str(title),
+                        url=str(url),
+                        published_at=published_at,
+                        symbols=(symbol,),
+                        summary=summary or None,
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return items

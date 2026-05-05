@@ -256,20 +256,79 @@ def test_rss_deduplicates_by_url() -> None:
 
 
 def test_yfinance_returns_news() -> None:
+    """Yahoo's current response shape: fields nested under `content`,
+    `clickThroughUrl.url` for the link, ISO-8601 `pubDate`. Description is
+    HTML and must be stripped into a plain-text summary."""
     mock_ticker = MagicMock()
     mock_ticker.news = [
         {
-            "title": "Test",
-            "link": "https://c.com/1",
-            "providerPublishTime": 1737043200,
-            "publisher": "Yahoo",
+            "id": "abc",
+            "content": {
+                "title": "AMD beats Q1 estimates",
+                "description": (
+                    "<p>Advanced Micro Devices (<a href=\"...\">AMD</a>) posted "
+                    "first quarter results that beat Wall Street estimates.</p>"
+                ),
+                "pubDate": "2026-05-05T20:42:03Z",
+                "clickThroughUrl": {"url": "https://finance.yahoo.com/video/amd-q1.html"},
+                "canonicalUrl": {"url": "https://finance.yahoo.com/video/amd-q1.html"},
+                "contentType": "STORY",
+            },
         }
     ]
     with patch("data.news.yf.Ticker", return_value=mock_ticker):
         adapter = YFinanceAdapter()
-        items = adapter.get_news("SPY")
+        items = adapter.get_news("AMD")
     assert len(items) == 1
-    assert items[0].source == NewsSource.YFINANCE
+    n = items[0]
+    assert n.source == NewsSource.YFINANCE
+    assert n.headline == "AMD beats Q1 estimates"
+    assert n.url == "https://finance.yahoo.com/video/amd-q1.html"
+    assert n.published_at.isoformat() == "2026-05-05T20:42:03+00:00"
+    # HTML stripped, prose preserved
+    assert n.summary is not None
+    assert "<" not in n.summary
+    assert "AMD" in n.summary
+    assert "first quarter results" in n.summary
+
+
+def test_yfinance_skips_legacy_shape() -> None:
+    """Items missing the `content` wrapper (old shape) are skipped, not
+    crashed on. Protects against partial responses during another API drift."""
+    mock_ticker = MagicMock()
+    mock_ticker.news = [
+        # Legacy shape — no `content` key.
+        {"title": "old", "link": "https://x", "providerPublishTime": 1737043200},
+        # Valid current shape.
+        {
+            "content": {
+                "title": "new",
+                "pubDate": "2026-05-05T12:00:00Z",
+                "canonicalUrl": {"url": "https://y"},
+            },
+        },
+    ]
+    with patch("data.news.yf.Ticker", return_value=mock_ticker):
+        items = YFinanceAdapter().get_news("AMD")
+    assert len(items) == 1
+    assert items[0].headline == "new"
+
+
+def test_yfinance_falls_back_to_canonical_url() -> None:
+    """If clickThroughUrl is missing, canonicalUrl must be used."""
+    mock_ticker = MagicMock()
+    mock_ticker.news = [
+        {
+            "content": {
+                "title": "t",
+                "pubDate": "2026-05-05T12:00:00Z",
+                "canonicalUrl": {"url": "https://canonical.example/article"},
+            },
+        }
+    ]
+    with patch("data.news.yf.Ticker", return_value=mock_ticker):
+        items = YFinanceAdapter().get_news("AMD")
+    assert items[0].url == "https://canonical.example/article"
 
 
 def test_yfinance_error_returns_empty() -> None:
