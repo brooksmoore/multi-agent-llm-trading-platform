@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 import time
 from datetime import UTC, datetime
@@ -12,6 +13,23 @@ import requests
 import yfinance as yf
 
 from core.types import NewsItem, NewsSource
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+
+def _strip_html(text: str) -> str:
+    """Remove HTML tags, decode entities, and collapse whitespace.
+
+    Used by yfinance and EDGAR body extraction to turn HTML fragments into
+    plain prose for NewsItem.summary / NewsItem.body. Entities like &nbsp;
+    and &amp; are decoded — without this, body text reads as garbage and
+    LLM tokenization wastes context on noise.
+    """
+    no_tags = _HTML_TAG_RE.sub(" ", text)
+    decoded = html.unescape(no_tags)
+    return _WS_RE.sub(" ", decoded).strip()
 
 
 class FinnhubAdapter:
@@ -59,9 +77,34 @@ class FinnhubAdapter:
 class EDGARAdapter:
     _BASE = "https://efts.sec.gov/LATEST/search-index"
     _HEADERS = {"User-Agent": "Multi-Agent-Bot/1.0 bcm3000@gmail.com"}
+    # SEC publishes a 10 req/sec rate limit on edgar.sec.gov. We're well under
+    # that since fetch_filings only fires during the Thu/Fri Opus deep-dive.
+    _BODY_FETCH_TIMEOUT = 10
+    _BODY_MAX_CHARS = 8000  # ~2 KB compressed; doc_pack uses body[:1000]
 
-    def __init__(self, session: requests.Session | None = None) -> None:
+    def __init__(
+        self,
+        session: requests.Session | None = None,
+        fetch_body: bool = True,
+    ) -> None:
         self._session = session if session is not None else requests.Session()
+        # Disable for tests / dry-runs to avoid the per-filing HTTPS round trip.
+        self._fetch_body = fetch_body
+
+    def _fetch_filing_body(self, url: str) -> str | None:
+        """Download a filing document and return stripped text body, or None
+        on any failure. Best-effort: a 4xx/5xx or timeout silently returns
+        None so the parent get_filings still emits the headline+URL."""
+        try:
+            resp = self._session.get(
+                url, headers=self._HEADERS, timeout=self._BODY_FETCH_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                return None
+            text = _strip_html(resp.text)
+            return text[: self._BODY_MAX_CHARS] if text else None
+        except (requests.RequestException, ValueError):
+            return None
 
     def get_filings(
         self,
@@ -121,6 +164,16 @@ class EDGARAdapter:
                     # Fall back to the EDGAR file viewer for the accession number.
                     url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ciks[0] if ciks else ''}"
 
+                # Best-effort body fetch — only when we built a real archive
+                # URL (not the fallback browse-edgar landing page) and only
+                # when fetch_body=True. Failure returns None and we still
+                # persist headline+URL.
+                body: str | None = None
+                if self._fetch_body and url.startswith(
+                    "https://www.sec.gov/Archives/"
+                ):
+                    body = self._fetch_filing_body(url)
+
                 items.append(
                     NewsItem(
                         source=NewsSource.EDGAR,
@@ -128,6 +181,7 @@ class EDGARAdapter:
                         url=url,
                         published_at=published_at,
                         symbols=(symbol,),
+                        body=body,
                     )
                 )
             except (KeyError, TypeError, ValueError):
@@ -175,17 +229,6 @@ class RSSAdapter:
         return items
 
 
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_WS_RE = re.compile(r"\s+")
-
-
-def _strip_html(text: str) -> str:
-    """Remove HTML tags and collapse whitespace. yfinance descriptions arrive
-    as HTML fragments with embedded <a> links; we want the plain prose for
-    NewsItem.summary."""
-    return _WS_RE.sub(" ", _HTML_TAG_RE.sub("", text)).strip()
-
-
 class YFinanceAdapter:
     def get_news(self, symbol: str) -> list[NewsItem]:
         """Pull recent news for a ticker.
@@ -228,7 +271,12 @@ class YFinanceAdapter:
                     published_at = published_at.replace(tzinfo=UTC)
 
                 desc = content.get("description") or ""
-                summary = _strip_html(desc)[:500] if desc else None
+                stripped = _strip_html(desc) if desc else ""
+                summary = stripped[:500] if stripped else None
+                # Store the fuller description as body for Opus deep-dives.
+                # doc_pack.py already emits body[:1000] under deep-dive items.
+                # Cap at 4 KB to keep the news.db row size reasonable.
+                body = stripped[:4000] if len(stripped) > 500 else None
 
                 items.append(
                     NewsItem(
@@ -238,6 +286,7 @@ class YFinanceAdapter:
                         published_at=published_at,
                         symbols=(symbol,),
                         summary=summary or None,
+                        body=body,
                     )
                 )
             except (KeyError, TypeError, ValueError):

@@ -151,6 +151,113 @@ def test_edgar_parses_real_response_shape() -> None:
     assert n.symbols == ("NVDA",)
 
 
+def test_edgar_fetches_body_from_filing_url() -> None:
+    """When fetch_body=True, the adapter follows the archive URL and stores
+    HTML-stripped filing text as NewsItem.body (capped). Powers Opus deep-
+    dives' body[:1000] consumption path in doc_pack.py."""
+    mock_session = MagicMock()
+    # First call: search-index. Second call: filing-document fetch.
+    search_response = MagicMock()
+    search_response.raise_for_status = MagicMock()
+    search_response.json.return_value = {
+        "hits": {
+            "hits": [
+                {
+                    "_id": "0001045810-26-000026:nvda-20260424.htm",
+                    "_source": {
+                        "ciks": ["0001045810"],
+                        "adsh": "0001045810-26-000026",
+                        "display_names": ["NVIDIA CORP  (NVDA)"],
+                        "form": "8-K",
+                        "file_date": "2026-04-27",
+                        "items": ["5.02"],
+                    },
+                }
+            ]
+        }
+    }
+    body_response = MagicMock()
+    body_response.status_code = 200
+    body_response.text = (
+        "<html><body><p>Item 5.02 Departure of Directors&nbsp;or "
+        "Certain Officers; Election of Directors.</p>"
+        "<p>On April 24, 2026 the Board of Directors approved...</p>"
+        "</body></html>"
+    )
+    mock_session.get.side_effect = [search_response, body_response]
+
+    adapter = EDGARAdapter(session=mock_session, fetch_body=True)
+    items = adapter.get_filings("NVDA", form_type="8-K")
+    assert len(items) == 1
+    n = items[0]
+    assert n.body is not None
+    assert "Item 5.02" in n.body
+    assert "Departure of Directors" in n.body
+    assert "&nbsp;" not in n.body  # entity decoded
+    assert "<" not in n.body       # tags stripped
+
+
+def test_edgar_body_fetch_disabled_skips_network() -> None:
+    """fetch_body=False emits headline+URL but never calls the body endpoint —
+    used by tests / dry-runs that don't want the per-filing round trip."""
+    mock_session = MagicMock()
+    mock_session.get.return_value.json.return_value = {
+        "hits": {
+            "hits": [
+                {
+                    "_id": "0001045810-26-000026:nvda-20260424.htm",
+                    "_source": {
+                        "ciks": ["0001045810"],
+                        "adsh": "0001045810-26-000026",
+                        "display_names": ["NVIDIA CORP  (NVDA)"],
+                        "form": "8-K",
+                        "file_date": "2026-04-27",
+                    },
+                }
+            ]
+        }
+    }
+    mock_session.get.return_value.raise_for_status = MagicMock()
+    adapter = EDGARAdapter(session=mock_session, fetch_body=False)
+    items = adapter.get_filings("NVDA")
+    assert items[0].body is None
+    # Only the search call was made — no body fetch.
+    assert mock_session.get.call_count == 1
+
+
+def test_edgar_body_fetch_failure_falls_back_to_no_body() -> None:
+    """Body fetch returning 4xx/5xx must not break the adapter — headline+URL
+    still emit, body=None."""
+    mock_session = MagicMock()
+    search_response = MagicMock()
+    search_response.raise_for_status = MagicMock()
+    search_response.json.return_value = {
+        "hits": {
+            "hits": [
+                {
+                    "_id": "0001045810-26-000026:nvda-20260424.htm",
+                    "_source": {
+                        "ciks": ["0001045810"],
+                        "adsh": "0001045810-26-000026",
+                        "display_names": ["NVIDIA CORP"],
+                        "form": "8-K",
+                        "file_date": "2026-04-27",
+                    },
+                }
+            ]
+        }
+    }
+    body_response = MagicMock()
+    body_response.status_code = 503
+    mock_session.get.side_effect = [search_response, body_response]
+
+    adapter = EDGARAdapter(session=mock_session, fetch_body=True)
+    items = adapter.get_filings("NVDA")
+    assert len(items) == 1
+    assert items[0].body is None
+    assert items[0].headline.startswith("8-K")
+
+
 def test_edgar_form_type_in_params() -> None:
     mock_session = MagicMock()
     mock_session.get.return_value.json.return_value = {"hits": {"hits": []}}
@@ -312,6 +419,40 @@ def test_yfinance_skips_legacy_shape() -> None:
         items = YFinanceAdapter().get_news("AMD")
     assert len(items) == 1
     assert items[0].headline == "new"
+
+
+def test_yfinance_populates_body_from_full_description() -> None:
+    """Long descriptions populate `body` (capped 4KB) so doc_pack deep-dives
+    get the fuller article text. Short descriptions stay in summary only."""
+    long_html = "<p>" + ("Real article prose. " * 80) + "</p>"  # ~1.6KB
+    mock_ticker = MagicMock()
+    mock_ticker.news = [
+        {
+            "content": {
+                "title": "long article",
+                "description": long_html,
+                "pubDate": "2026-05-05T12:00:00Z",
+                "canonicalUrl": {"url": "https://x"},
+            },
+        },
+        {
+            "content": {
+                "title": "short article",
+                "description": "<p>only a sentence.</p>",
+                "pubDate": "2026-05-05T12:00:00Z",
+                "canonicalUrl": {"url": "https://y"},
+            },
+        },
+    ]
+    with patch("data.news.yf.Ticker", return_value=mock_ticker):
+        items = YFinanceAdapter().get_news("AMD")
+    long_item = next(i for i in items if i.headline == "long article")
+    short_item = next(i for i in items if i.headline == "short article")
+    assert long_item.body is not None
+    assert "Real article prose" in long_item.body
+    assert "<" not in long_item.body
+    # Short descriptions don't fill body — summary already captures them.
+    assert short_item.body is None
 
 
 def test_yfinance_falls_back_to_canonical_url() -> None:
