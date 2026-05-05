@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from core.types import AgentId, AgentState, DrawdownBucket, Fill, OrderSide
+from core.types import AgentId, AgentState, DrawdownBucket, Fill, OrderSide, normalize_symbol
 from execution.kill_switch import (
     CONSECUTIVE_LOSS_BENCH_TRIGGER,
     KillSwitchEngine,
@@ -99,6 +99,7 @@ class AgentStateTracker:
         lot_ledger: LotLedger,
         starting_equity: Decimal = Decimal("1000"),
         db_path: str | None = None,
+        bus: object | None = None,
     ) -> None:
         self._kill = kill_switch
         self._ledger = lot_ledger
@@ -106,6 +107,10 @@ class AgentStateTracker:
         self._lock = threading.Lock()
         self._records: dict[AgentId, _PerAgentRecord] = {}
         self._db_path = db_path
+        # Optional EventBus reference. If supplied, the tracker publishes a
+        # DrawdownLadderFiredEvent on every bucket-tightening transition so
+        # the Manager (or any other subscriber) can react in real time.
+        self._bus = bus
 
         self._init_db()
         self._load_or_init_records()
@@ -142,6 +147,17 @@ class AgentStateTracker:
                             fill.agent_id,
                             rec.consecutive_losses,
                         )
+                        if self._bus is not None:
+                            try:
+                                from core.events import AgentBenchedEvent
+                                self._bus.publish(AgentBenchedEvent(
+                                    agent_id=fill.agent_id,
+                                    consecutive_losses=rec.consecutive_losses,
+                                ))
+                            except Exception:
+                                log.warning(
+                                    "tracker: failed to publish AgentBenched", exc_info=True,
+                                )
                 else:
                     rec.consecutive_losses = 0
                     if rec.is_benched:
@@ -164,7 +180,11 @@ class AgentStateTracker:
             # ── Equity recompute ──────────────────────────────────────────────
             realized = self._realized_pnl(agent_id)
             unrealized = self._unrealized_pnl(agent_id, mark_prices)
-            new_equity = self._starting_equity + realized + unrealized
+            # Use the per-agent starting equity (loaded from DB) rather than
+            # the global default, so a sleeve like Manager that was provisioned
+            # at a different baseline (e.g. $10k reserve vs $30k sleeves) keeps
+            # its baseline across reconciler ticks.
+            new_equity = rec.starting_equity + realized + unrealized
             rec.current_equity = new_equity
 
             # Update bench expiry
@@ -189,7 +209,7 @@ class AgentStateTracker:
                 drawdown = Decimal("0")
 
             raw_bucket = classify_drawdown(drawdown)
-            self._apply_bucket_with_recovery(rec, raw_bucket, today)
+            self._apply_bucket_with_recovery(rec, raw_bucket, today, agent_id=agent_id)
 
         self._maybe_persist()
 
@@ -237,14 +257,16 @@ class AgentStateTracker:
         mark_prices = mark_prices or {}
 
         for agent_id in AgentId:
+            existing = self._records.get(agent_id)
+            base = existing.starting_equity if existing is not None else self._starting_equity
             realized = self._realized_pnl(agent_id)
             unrealized = self._unrealized_pnl(agent_id, mark_prices)
-            current_equity = self._starting_equity + realized + unrealized
+            current_equity = base + realized + unrealized
 
             # Replay fills to recompute consecutive_losses
             consecutive = self._replay_consecutive_losses(agent_id)
 
-            peak_equity = max(current_equity, self._starting_equity)
+            peak_equity = max(current_equity, base)
 
             drawdown = Decimal("0")
             if peak_equity > Decimal("0"):
@@ -271,6 +293,8 @@ class AgentStateTracker:
         rec: _PerAgentRecord,
         raw_bucket: DrawdownBucket,
         today: date,
+        *,
+        agent_id: AgentId | None = None,
     ) -> None:
         """Apply the recovery rule: tighten immediately, loosen only after 5 days."""
         current = rec.sizing_bucket
@@ -293,6 +317,7 @@ class AgentStateTracker:
                 log.info(
                     "tracker: bucket tightened %s → %s", current, raw_bucket
                 )
+                self._publish_ladder_event(rec, raw_bucket, agent_id=agent_id)
             rec.sizing_bucket = raw_bucket
             # Clear any pending recovery.
             rec.recovery_target = None
@@ -325,6 +350,38 @@ class AgentStateTracker:
 
             rec.last_update_date = today
 
+    def _publish_ladder_event(
+        self,
+        rec: _PerAgentRecord,
+        new_bucket: DrawdownBucket,
+        *,
+        agent_id: AgentId | None = None,
+    ) -> None:
+        """Emit DrawdownLadderFiredEvent on tightening transitions.
+
+        Subscribers (Manager, dashboard, alerts) can react in real time.
+        Failures are swallowed — bucket transition state is more important
+        than event-bus delivery.
+        """
+        if self._bus is None:
+            return
+        try:
+            from core.events import DrawdownLadderFiredEvent
+            drawdown_pct = Decimal("0")
+            if rec.peak_equity > Decimal("0"):
+                drawdown_pct = (
+                    (rec.peak_equity - rec.current_equity) / rec.peak_equity
+                )
+            self._bus.publish(
+                DrawdownLadderFiredEvent(
+                    agent_id=agent_id,
+                    drawdown_pct=drawdown_pct,
+                    new_bucket=str(new_bucket).split(".")[-1].lower(),
+                )
+            )
+        except Exception:
+            log.warning("tracker: failed to publish DrawdownLadderFired", exc_info=True)
+
     # ── Internal: P&L helpers ─────────────────────────────────────────────────
 
     def _realized_pnl(self, agent_id: AgentId) -> Decimal:
@@ -338,11 +395,26 @@ class AgentStateTracker:
         self, agent_id: AgentId, mark_prices: dict[str, Decimal]
     ) -> Decimal:
         total = Decimal("0")
+        missing: list[str] = []
         for lot in self._ledger.all_lots():
             if lot.agent_id == agent_id and not lot.is_closed:
-                mark = mark_prices.get(lot.symbol)
+                # Lots may carry crypto symbols in either "BTC/USD" or "BTCUSD"
+                # form depending on which path persisted them. Normalize before
+                # lookup so a single canonical mark serves both.
+                key = normalize_symbol(lot.symbol)
+                mark = mark_prices.get(key)
+                if mark is None:
+                    mark = mark_prices.get(lot.symbol)
                 if mark is not None:
                     total += (mark - lot.entry_price) * lot.remaining_qty
+                else:
+                    missing.append(lot.symbol)
+        if missing:
+            log.warning(
+                "tracker: %s unrealized PnL missing marks for held lots: %s "
+                "(equity will under-report)",
+                agent_id, sorted(set(missing)),
+            )
         return total
 
     def _update_avg_cost(self, rec: _PerAgentRecord, fill: Fill) -> None:
@@ -405,7 +477,8 @@ class AgentStateTracker:
                 sizing_bucket     TEXT NOT NULL,
                 recovery_target   TEXT,
                 recovery_since    TEXT,
-                recovery_days     INTEGER NOT NULL DEFAULT 0
+                recovery_days     INTEGER NOT NULL DEFAULT 0,
+                last_update_date  TEXT
             )
         """)
         conn.commit()
@@ -439,7 +512,7 @@ class AgentStateTracker:
         rows = conn.execute(
             "SELECT agent_id, starting_equity, current_equity, peak_equity, "
             "consecutive_losses, is_benched, bench_until, sizing_bucket, "
-            "recovery_target, recovery_since, recovery_days "
+            "recovery_target, recovery_since, recovery_days, last_update_date "
             "FROM agent_tracker_state"
         ).fetchall()
         conn.close()
@@ -458,6 +531,7 @@ class AgentStateTracker:
                 recovery_target_str,
                 recovery_since_str,
                 recovery_days,
+                last_update_date_str,
             ) = row
             try:
                 agent_id = AgentId(agent_id_str)
@@ -472,6 +546,9 @@ class AgentStateTracker:
             recovery_target = (
                 DrawdownBucket(recovery_target_str) if recovery_target_str else None
             )
+            last_update_date = (
+                date.fromisoformat(last_update_date_str) if last_update_date_str else None
+            )
             self._records[agent_id] = _PerAgentRecord(
                 starting_equity=Decimal(starting_equity),
                 current_equity=Decimal(current_equity),
@@ -483,7 +560,7 @@ class AgentStateTracker:
                 recovery_target=recovery_target,
                 recovery_since=recovery_since,
                 recovery_days=recovery_days,
-                last_update_date=None,
+                last_update_date=last_update_date,
             )
         # Fill any missing agents with defaults
         for agent_id in AgentId:
@@ -522,14 +599,15 @@ class AgentStateTracker:
                     rec.recovery_target,
                     rec.recovery_since.isoformat() if rec.recovery_since else None,
                     rec.recovery_days,
+                    rec.last_update_date.isoformat() if rec.last_update_date else None,
                 ))
         conn = sqlite3.connect(self._db_path)
         conn.executemany(
             "INSERT OR REPLACE INTO agent_tracker_state "
             "(agent_id, starting_equity, current_equity, peak_equity, "
             "consecutive_losses, is_benched, bench_until, sizing_bucket, "
-            "recovery_target, recovery_since, recovery_days) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "recovery_target, recovery_since, recovery_days, last_update_date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         conn.commit()

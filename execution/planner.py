@@ -32,6 +32,7 @@ from core.types import (
     OrderType,
     TimeInForce,
     new_id,
+    normalize_symbol,
 )
 from execution.lots import LotLedger
 from execution.oms import OMS
@@ -50,15 +51,18 @@ _OPTIONS_MULTIPLIER: Decimal = Decimal("100")   # 1 equity-options contract = 10
 # truncated by the broker, leaving the OMS unable to reconcile filled_qty.
 _FRACTIONAL_QTY_PRECISION: Decimal = Decimal("0.000000001")
 
+# Planner rejection reasons. Returned as outcome strings so callers
+# (and the dashboard) can distinguish "skipped sub-$1" from "agent
+# hallucinated ownership" from "no market data". Prefixed `unsized:` to
+# preserve compatibility with existing `unsized` outcome consumers.
+PLAN_REJECT_SUB_MIN: str = "unsized:sub_min"
+PLAN_REJECT_NO_POSITION: str = "unsized:no_position"
+PLAN_REJECT_NO_MARK: str = "unsized:no_mark"
+PLAN_REJECT_ZERO_QTY: str = "unsized:zero_qty"
+
 _CLOSING_ACTIONS: frozenset[Action] = frozenset({Action.SELL, Action.CLOSE})
 
-
-def _normalize_symbol(symbol: str) -> str:
-    """Strip slash from crypto pairs (BTC/USD → BTCUSD) so intents from agents
-    that use the slashed form resolve against the universe + broker form.
-    Equity tickers pass through unchanged.
-    """
-    return symbol.replace("/", "") if "/" in symbol else symbol
+_normalize_symbol = normalize_symbol  # legacy alias for in-module readability
 
 
 class ExecutionPlanner:
@@ -76,6 +80,12 @@ class ExecutionPlanner:
         self._oms = oms
         self._ledger = lot_ledger
         self._bus = bus
+        # Counters for visibility into intents dropped at planning. Read-only
+        # from outside; reset() clears them. Surfaced via /metrics or logs.
+        self.dropped_no_mark: int = 0
+        self.dropped_no_position: int = 0
+        self.dropped_sub_min: int = 0
+        self.dropped_zero_qty: int = 0
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -84,8 +94,10 @@ class ExecutionPlanner:
         intent: Intent,
         agent_state: AgentState,
         market_snapshot: MarketSnapshot,
-    ) -> Order | None:
-        """Size intent and return a PENDING Order, or None if below minimum.
+    ) -> Order | str:
+        """Size intent and return a PENDING Order, or a `PLAN_REJECT_*` reason
+        string when the intent is dropped for sub-min notional, missing market
+        data, or invalid state.
 
         Returns None when:
         - Current mark price is missing or ≤ 0.
@@ -110,7 +122,8 @@ class ExecutionPlanner:
                     "planner: SELL %s/%s rejected — agent has no open lots",
                     intent.agent_id, check_symbol,
                 )
-                return None
+                self.dropped_no_position += 1
+                return PLAN_REJECT_NO_POSITION
 
         # Read MC dynamically so dashboard-slider changes take effect immediately.
         mc = runtime_store.master_capability
@@ -152,13 +165,23 @@ class ExecutionPlanner:
                 intent.agent_id,
                 intent.symbol,
             )
-            return None
+            self.dropped_sub_min += 1
+            return PLAN_REJECT_SUB_MIN
 
         # ── Mark price + qty ──────────────────────────────────────────────────
         current_mark = market_snapshot.current_prices.get(symbol)
         if current_mark is None or current_mark <= Decimal("0"):
-            log.warning("planner: no mark for %s — cannot size", symbol)
-            return None
+            # ERROR (not WARNING): a missing mark for an intended symbol means
+            # the agent's universe and the data layer's fetched-symbols are out
+            # of sync — a config/data bug, not a normal rejection. This is the
+            # silent-drop path that hid intents in early runs.
+            self.dropped_no_mark += 1
+            log.error(
+                "planner: no mark for %s — cannot size (agent=%s action=%s); "
+                "dropped_no_mark_total=%d",
+                symbol, intent.agent_id, intent.action, self.dropped_no_mark,
+            )
+            return PLAN_REJECT_NO_MARK
 
         if is_options:
             # Whole contracts only; 1 contract = 100 underlying shares.
@@ -172,7 +195,8 @@ class ExecutionPlanner:
             )
 
         if qty <= Decimal("0"):
-            return None
+            self.dropped_zero_qty += 1
+            return PLAN_REJECT_ZERO_QTY
 
         side = OrderSide.SELL if intent.action in _CLOSING_ACTIONS else OrderSide.BUY
         order_class = OrderClass.MLEG if is_options else OrderClass.SIMPLE
@@ -181,7 +205,7 @@ class ExecutionPlanner:
             id=new_id(),
             intent_id=intent.id,
             agent_id=intent.agent_id,
-            symbol=intent.symbol,
+            symbol=symbol,
             side=side,
             qty=qty,
             order_type=OrderType.MARKET,
@@ -190,14 +214,14 @@ class ExecutionPlanner:
             state=OrderState.PENDING,
             created_at=datetime.now(UTC),
             legs=intent.legs,
-            is_letf=intent.symbol in LETF_WHITELIST,
+            is_letf=symbol in LETF_WHITELIST,
         )
 
         self._bus.publish(
             IntentSizedEvent(
                 intent_id=intent.id,
                 agent_id=intent.agent_id,
-                symbol=intent.symbol,
+                symbol=symbol,
                 target_weight=intent.target_weight,
                 position_value_usd=position_value,
                 qty=qty,
@@ -212,7 +236,7 @@ class ExecutionPlanner:
             "planner: %s %s %s qty=%.6f notional=$%.2f binding=%s",
             intent.agent_id,
             side,
-            intent.symbol,
+            symbol,
             qty,
             position_value,
             binding,
@@ -226,7 +250,7 @@ class ExecutionPlanner:
         intent: Intent,
         agent_state: AgentState,
         market_snapshot: MarketSnapshot,
-    ) -> Order | None:
+    ) -> Order | str:
         """Plan a CLOSE intent: sell exactly the current open lot qty."""
         symbol = _normalize_symbol(intent.symbol)
         open_qty = self._ledger.total_open_qty(intent.agent_id, symbol)
@@ -236,16 +260,23 @@ class ExecutionPlanner:
                 intent.agent_id,
                 symbol,
             )
-            return None
+            self.dropped_no_position += 1
+            return PLAN_REJECT_NO_POSITION
 
         current_mark = market_snapshot.current_prices.get(symbol)
         if current_mark is None or current_mark <= Decimal("0"):
-            log.warning("planner: no mark for %s — cannot size CLOSE", symbol)
-            return None
+            self.dropped_no_mark += 1
+            log.error(
+                "planner: no mark for %s — cannot size CLOSE (agent=%s); "
+                "dropped_no_mark_total=%d",
+                symbol, intent.agent_id, self.dropped_no_mark,
+            )
+            return PLAN_REJECT_NO_MARK
 
         notional = open_qty * current_mark
         if notional < _MIN_NOTIONAL:
-            return None
+            self.dropped_sub_min += 1
+            return PLAN_REJECT_SUB_MIN
 
         mc = runtime_store.master_capability
         emg = effective_max_gross(
