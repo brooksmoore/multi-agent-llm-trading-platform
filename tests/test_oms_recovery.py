@@ -259,6 +259,78 @@ class TestCrashThenBrokerFills:
 
 class TestTerminalStatesPreserved:
 
+    def test_stuck_partial_with_broker_filled_force_closes(self, tmp_path: Path) -> None:
+        """Reproduces the production reconcile-churn bug: local order is stuck
+        non-terminal but broker reports FILLED with matching filled_qty
+        (delta_qty <= 0). Pre-fix, _catch_up_from_broker emitted
+        RECONCILE_RECOVERED without advancing local state, so the same orders
+        re-replayed every restart (155 noise events/day in observed data).
+        Post-fix: force-close locally + emit a single RECOVERED event;
+        subsequent passes are true RECONCILE_NOOPs."""
+        from execution.broker import BrokerOrderState, BrokerOrderStatus
+
+        db = tmp_path / "oms.db"
+        clock = _new_clock()
+        broker = FakeBroker(clock=clock, fill_mode=FillMode.MANUAL)
+        broker.set_price("SPY", Decimal("450"))
+        store = OMSStore(db)
+        bus = EventBus()
+        oms = OMS(broker=broker, store=store, bus=bus, clock=clock)
+
+        # Use sub-1e-9 precision in order.qty so a clean 10-share fill leaves
+        # is_full=False (residual >= 1e-9), keeping FSM in PARTIAL with
+        # local.filled_qty == broker.filled_qty == 10. This is the same
+        # mechanism that produced 31 stuck orders in production.
+        order = make_market_order(
+            symbol="SPY", side=OrderSide.BUY,
+            qty=Decimal("10.00000001"), agent_id=AgentId.HAIKU,
+        )
+        oms.submit_order(order)
+        broker.force_partial_fill(order.id, qty=Decimal("10"), price=Decimal("450"))
+        assert oms.get_order(order.id).state == OrderState.PARTIAL
+        assert oms.get_order(order.id).filled_qty == Decimal("10")
+
+        broker_status = BrokerOrderStatus(
+            broker_order_id=oms._orders[order.id].broker_order_id or "stub",
+            client_order_id=order.id,
+            symbol=order.symbol,
+            side=order.side,
+            qty=order.qty,
+            filled_qty=Decimal("10"),
+            avg_fill_price=Decimal("450"),
+            state=BrokerOrderState.FILLED,
+            submitted_at=clock.now(),
+            updated_at=clock.now(),
+        )
+
+        # First call: should force-close + emit RECOVERED.
+        before_recovered = sum(
+            1 for e in store.iter_all()
+            if e.kind == EventKind.RECONCILE_RECOVERED and e.order_id == order.id
+        )
+        oms._catch_up_from_broker(order.id, broker_status)
+        assert oms.get_order(order.id).state == OrderState.FILLED
+        after_first = sum(
+            1 for e in store.iter_all()
+            if e.kind == EventKind.RECONCILE_RECOVERED and e.order_id == order.id
+        )
+        assert after_first == before_recovered + 1
+
+        # Second call: state is already terminal — _reconcile_open_orders skips.
+        # Calling _catch_up_from_broker directly is the worst case; verify it
+        # emits NOOP, not another RECOVERED.
+        oms._catch_up_from_broker(order.id, broker_status)
+        after_second_recovered = sum(
+            1 for e in store.iter_all()
+            if e.kind == EventKind.RECONCILE_RECOVERED and e.order_id == order.id
+        )
+        noop_events = sum(
+            1 for e in store.iter_all()
+            if e.kind == EventKind.RECONCILE_NOOP and e.order_id == order.id
+        )
+        assert after_second_recovered == after_first  # no new RECOVERED
+        assert noop_events >= 1                       # second pass was a NOOP
+
     def test_filled_order_stays_filled_after_recovery(self, tmp_path: Path) -> None:
         db = tmp_path / "oms.db"
         clock = _new_clock()

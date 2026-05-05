@@ -64,6 +64,14 @@ from execution.oms_store import EventKind, OMSStore
 logger = logging.getLogger(__name__)
 
 
+_TERMINAL_STATES: frozenset[OrderState] = frozenset({
+    OrderState.FILLED,
+    OrderState.CANCELLED,
+    OrderState.REJECTED,
+    OrderState.EXPIRED,
+})
+
+
 # ─── Result types ─────────────────────────────────────────────────────────────
 
 
@@ -627,13 +635,9 @@ class OMS:
         abandoned = 0
         already_terminal = 0
 
-        terminal = {
-            OrderState.FILLED, OrderState.CANCELLED,
-            OrderState.REJECTED, OrderState.EXPIRED,
-        }
         for order_id in list(self._orders.keys()):
             order = self._orders[order_id]
-            if order.state in terminal:
+            if order.state in _TERMINAL_STATES:
                 already_terminal += 1
                 continue
 
@@ -685,15 +689,27 @@ class OMS:
         return _broker_state_to_local(broker.state) == order.state
 
     def _catch_up_from_broker(self, order_id: OrderId, broker: BrokerOrderStatus) -> None:
-        """Apply broker-side progress that our log is missing."""
+        """Apply broker-side progress that our log is missing.
+
+        Emits RECONCILE_RECOVERED only when an actual catch-up happens (synthetic
+        fill, terminal-state transition, or accepted-id assignment). When the
+        broker confirms FILLED but our recorded qty already covers it (typical
+        precision-drift case), we force-close locally so the order doesn't
+        remain stuck non-terminal and re-trigger this branch on every restart.
+        Pure no-ops emit RECONCILE_NOOP, so dashboards don't see phantom
+        recoveries.
+        """
         local = self._orders[order_id]
         ts = self._clock.now()
+
+        advanced = False  # did we actually change anything?
 
         if local.broker_order_id is None:
             self._record_accepted(order_id, broker.broker_order_id, ts=ts)
             local = self._orders[order_id]
+            advanced = True
 
-        # Synthetic fill for the qty we're missing
+        # Synthetic fill for the qty we're missing.
         delta_qty = broker.filled_qty - local.filled_qty
         if delta_qty > Decimal("0"):
             synthetic_fill = Fill(
@@ -709,24 +725,38 @@ class OMS:
                 is_partial=broker.state != BrokerOrderState.FILLED,
             )
             self._handle_fill(order_id, synthetic_fill, ts=ts)
+            advanced = True
 
-        # Terminal-state catch-ups
+        # Terminal-state catch-ups.
         match broker.state:
             case BrokerOrderState.CANCELED:
                 self._handle_cancellation(order_id, ts=ts)
+                advanced = True
             case BrokerOrderState.REJECTED:
                 self._handle_rejection(
                     order_id,
                     reason=broker.rejection_reason or "broker rejected (recovered)",
                     ts=ts,
                 )
+                advanced = True
             case BrokerOrderState.EXPIRED:
                 self._handle_expiry(order_id, ts=ts)
+                advanced = True
+            case BrokerOrderState.FILLED:
+                # If delta_qty > 0, _handle_fill above already transitioned us.
+                # If delta_qty <= 0, the local state is stuck non-terminal but
+                # the broker says FILLED — force-close idempotently. Without
+                # this, the order replays every boot.
+                local_after = self._orders[order_id]
+                if local_after.state not in _TERMINAL_STATES:
+                    self.force_close_filled(order_id, ts=ts)
+                    advanced = True
             case _:
-                pass  # FILLED is handled by the fill above
+                pass
 
+        kind = EventKind.RECONCILE_RECOVERED if advanced else EventKind.RECONCILE_NOOP
         self._store.append(
-            kind=EventKind.RECONCILE_RECOVERED,
+            kind=kind,
             order_id=order_id,
             payload={"broker_state": str(broker.state), "delta_qty": str(delta_qty)},
             ts=ts,
