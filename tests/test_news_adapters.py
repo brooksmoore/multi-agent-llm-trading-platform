@@ -111,6 +111,46 @@ def test_edgar_empty_hits_returns_empty() -> None:
     assert items == []
 
 
+def test_edgar_parses_real_response_shape() -> None:
+    """Production EDGAR responses use `display_names` + `form` (not the
+    `entity_name`/`form_type` the adapter originally read). Verify the
+    parser handles the real shape and produces a usable headline + URL.
+    """
+    mock_session = MagicMock()
+    mock_session.get.return_value.json.return_value = {
+        "hits": {
+            "hits": [
+                {
+                    "_id": "0001045810-26-000026:nvda-20260424.htm",
+                    "_source": {
+                        "ciks": ["0001045810"],
+                        "adsh": "0001045810-26-000026",
+                        "display_names": ["NVIDIA CORP  (NVDA)  (CIK 0001045810)"],
+                        "form": "8-K",
+                        "file_date": "2026-04-27",
+                        "items": ["5.02"],
+                    },
+                }
+            ]
+        }
+    }
+    mock_session.get.return_value.raise_for_status = MagicMock()
+    adapter = EDGARAdapter(session=mock_session)
+    items = adapter.get_filings("NVDA", form_type="8-K")
+    assert len(items) == 1
+    n = items[0]
+    assert "8-K" in n.headline
+    assert "NVIDIA" in n.headline
+    assert "5.02" in n.headline
+    # URL must be a real archive path: cik (no leading zeros) / adsh-no-dashes / filename.
+    assert n.url == (
+        "https://www.sec.gov/Archives/edgar/data/"
+        "1045810/000104581026000026/nvda-20260424.htm"
+    )
+    assert n.source == NewsSource.EDGAR
+    assert n.symbols == ("NVDA",)
+
+
 def test_edgar_form_type_in_params() -> None:
     mock_session = MagicMock()
     mock_session.get.return_value.json.return_value = {"hits": {"hits": []}}

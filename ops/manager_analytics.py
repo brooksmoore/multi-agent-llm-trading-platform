@@ -310,11 +310,15 @@ def _build_macro_snapshot(state_vix: Decimal | None, news_store: NewsStore) -> s
     rss_items = [n for n in items if n.source == NewsSource.RSS][:8]
     if not rss_items:
         return f"{vix_str}\n(no macro RSS items in last 48h)"
-    headline_block = "\n".join(
-        f"  - [{n.published_at:%m-%d %H:%M}] {n.headline.strip()[:140]}"
-        for n in rss_items
-    )
-    return f"{vix_str}\nRecent macro headlines:\n{headline_block}"
+    blocks: list[str] = []
+    for n in rss_items:
+        when = f"{n.published_at:%m-%d %H:%M}"
+        head = n.headline.strip()[:140]
+        blocks.append(f"  - [{when}] {head}")
+        summary = (n.summary or "").strip().replace("\n", " ")
+        if summary:
+            blocks.append(f"      {summary[:280]}")
+    return f"{vix_str}\nRecent macro headlines:\n" + "\n".join(blocks)
 
 
 def _build_portfolio_beta(broker: Broker | None) -> str:

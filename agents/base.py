@@ -15,11 +15,16 @@ from execution.broker import BrokerAccount, BrokerPosition
 _PLACEHOLDER_RE = re.compile(r"\{\{([a-zA-Z_]+)\}\}")
 
 
-def format_news_block(state: "AgentState", limit: int = 12) -> str:
-    """Compact headline list for the agent's user-message context.
+_NEWS_HEADLINE_MAX = 140
+_NEWS_SUMMARY_MAX = 280
 
-    Returns a multi-line block with one bullet per item, or a single
-    "no recent items" line if state.news is empty. Newest first; capped.
+
+def format_news_block(state: "AgentState", limit: int = 12) -> str:
+    """Compact news block for the agent's user-message context.
+
+    One bullet per item: headline + summary (when available). Summary is the
+    lede paragraph from Finnhub/RSS — ~200 chars on average — and adds real
+    signal beyond the headline. Capped per-item so context stays bounded.
     """
     if not state.news:
         return "Recent news: (no items in last 24h)"
@@ -29,9 +34,14 @@ def format_news_block(state: "AgentState", limit: int = 12) -> str:
         when = n.published_at.strftime("%m-%d %H:%M")
         syms = ",".join(n.symbols) if n.symbols else "—"
         head = n.headline.strip().replace("\n", " ")
-        if len(head) > 140:
-            head = head[:137] + "..."
+        if len(head) > _NEWS_HEADLINE_MAX:
+            head = head[: _NEWS_HEADLINE_MAX - 3] + "..."
         lines.append(f"  [{when}] [{syms}] {head}")
+        summary = (n.summary or "").strip().replace("\n", " ")
+        if summary:
+            if len(summary) > _NEWS_SUMMARY_MAX:
+                summary = summary[: _NEWS_SUMMARY_MAX - 3] + "..."
+            lines.append(f"      {summary}")
     return "\n".join(lines)
 
 

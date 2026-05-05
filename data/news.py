@@ -90,10 +90,36 @@ class EDGARAdapter:
             try:
                 src = hit["_source"]
                 published_at = datetime.fromisoformat(src["file_date"]).replace(tzinfo=UTC)
-                headline = (
-                    f"{src.get('form_type', '')} — {src.get('entity_name', '')}"
+
+                # SEC's full-text search index uses `display_names` + `form`,
+                # not `entity_name`/`form_type`. The previous code read fields
+                # that don't exist, so every headline came back as " — ".
+                form = src.get("form") or src.get("file_type") or ""
+                display = (src.get("display_names") or [""])[0]
+                topic_items = src.get("items") or []
+                topic_str = (
+                    f" [Item {', '.join(topic_items)}]" if topic_items else ""
                 )
-                url = f"https://www.sec.gov/Archives/edgar/data/{hit['_id']}"
+                headline = f"{form} — {display}{topic_str}".strip(" —")
+
+                # Build a real archive URL: edgar/data/<cik-int>/<adsh-no-dashes>/<filename>.
+                # `_id` is shaped "<adsh>:<filename>"; `adsh` is also a top-level
+                # field but we use _id as the canonical filename source.
+                ciks = src.get("ciks") or []
+                adsh = src.get("adsh") or ""
+                hit_id = str(hit.get("_id") or "")
+                filename = hit_id.split(":", 1)[1] if ":" in hit_id else ""
+                if ciks and adsh and filename:
+                    cik_int = int(ciks[0])
+                    adsh_nodash = adsh.replace("-", "")
+                    url = (
+                        f"https://www.sec.gov/Archives/edgar/data/"
+                        f"{cik_int}/{adsh_nodash}/{filename}"
+                    )
+                else:
+                    # Fall back to the EDGAR file viewer for the accession number.
+                    url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ciks[0] if ciks else ''}"
+
                 items.append(
                     NewsItem(
                         source=NewsSource.EDGAR,
