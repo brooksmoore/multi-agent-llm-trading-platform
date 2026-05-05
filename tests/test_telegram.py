@@ -235,7 +235,11 @@ class TestAlertManagerTelegramIntegration:
         mock_client.post.assert_called_once()
         manager.stop()
 
-    def test_fill_received_sends_fill_notification(self) -> None:
+    def test_fill_received_does_not_send_notification(self) -> None:
+        # Per-fill Telegram notifications were disabled in favor of an
+        # hourly portfolio snapshot; AlertManager no longer subscribes to
+        # fill.received. The send_fill_notification helper still exists
+        # for callers who want to opt back in.
         bus, manager, mock_client = self._make_bus_and_manager()
         fill = Fill(
             id=new_id(),
@@ -248,9 +252,7 @@ class TestAlertManagerTelegramIntegration:
             timestamp=datetime.now(UTC),
         )
         bus.publish(FillReceivedEvent(fill=fill))
-        mock_client.post.assert_called_once()
-        payload = mock_client.post.call_args[1]["json"]
-        assert "FILL" in payload["text"]
+        mock_client.post.assert_not_called()
         manager.stop()
 
     def test_fill_not_subscribed_when_telegram_disabled(self) -> None:

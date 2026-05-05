@@ -15,8 +15,10 @@ from uuid import UUID, uuid4
 import pytest
 from alpaca.common.exceptions import APIError
 
-from core.types import AgentId, AssetClass, OrderSide, OrderType
-from execution.alpaca_broker import AlpacaBroker
+import alpaca.trading.enums as alpaca_enums
+
+from core.types import AgentId, AssetClass, OrderSide, OrderType, TimeInForce
+from execution.alpaca_broker import AlpacaBroker, _to_alpaca_tif
 from execution.broker import BrokerOrderState, BrokerRejection, BrokerUnavailable
 from execution.fake_broker import make_market_order
 
@@ -347,3 +349,37 @@ def test_register_callback_stored() -> None:
     cb = MagicMock()
     broker.register_event_callback(cb)
     assert broker._callback is cb
+
+
+# ── _to_alpaca_tif — crypto TIF override (regression: code 42210000) ──────────
+# Alpaca rejects DAY time-in-force for crypto orders with error code 42210000.
+# These tests guard the DAY→GTC override so it can never regress silently.
+
+
+@pytest.mark.parametrize("symbol", ["BTCUSD", "ETHUSD", "SOLUSD"])
+def test_crypto_day_tif_converted_to_gtc(symbol: str) -> None:
+    """Crypto symbols with TIF=DAY must be converted to GTC before submission."""
+    result = _to_alpaca_tif(TimeInForce.DAY.value, symbol)
+    assert result == alpaca_enums.TimeInForce.GTC, (
+        f"{symbol} with TIF=DAY must map to GTC (Alpaca rejects DAY for crypto)"
+    )
+
+
+@pytest.mark.parametrize("symbol", ["BTCUSD", "ETHUSD", "SOLUSD"])
+def test_crypto_gtc_tif_unchanged(symbol: str) -> None:
+    """Crypto orders already using GTC must not be double-converted."""
+    result = _to_alpaca_tif(TimeInForce.GTC.value, symbol)
+    assert result == alpaca_enums.TimeInForce.GTC
+
+
+@pytest.mark.parametrize("symbol", ["SPY", "QQQ", "AAPL", "IWM", "GLD"])
+def test_equity_day_tif_unchanged(symbol: str) -> None:
+    """Equity symbols must keep DAY as-is — the override must not bleed over."""
+    result = _to_alpaca_tif(TimeInForce.DAY.value, symbol)
+    assert result == alpaca_enums.TimeInForce.DAY
+
+
+def test_slash_notation_crypto_converted(symbol: str = "BTC/USD") -> None:
+    """Slash-notation crypto symbols (alternative Alpaca format) also get GTC."""
+    result = _to_alpaca_tif(TimeInForce.DAY.value, symbol)
+    assert result == alpaca_enums.TimeInForce.GTC

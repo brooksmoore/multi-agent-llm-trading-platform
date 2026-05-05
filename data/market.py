@@ -151,6 +151,178 @@ class AlpacaMarketData:
         )
 
 
+class YFinanceMarketData:
+    """Free daily bars via yfinance.
+
+    Notes:
+    - Daily bars only. Minute/hour timeframes fall through to daily.
+    - Crypto symbols are routed to Alpaca's CryptoHistoricalDataClient when
+      Alpaca creds are supplied — yfinance's BTC-USD / ETH-USD endpoints have
+      been intermittently unavailable. Crypto-symbol form coming in: BTCUSD,
+      ETHUSD, SOLUSD (no slash). Alpaca crypto API expects "BTC/USD" form.
+    - get_latest_quote returns a Quote with bid==ask==close (no live quote feed).
+    """
+
+    _CRYPTO_MAP = {
+        "BTCUSD": "BTC-USD",
+        "ETHUSD": "ETH-USD",
+        "SOLUSD": "SOL-USD",
+    }
+    _ALPACA_CRYPTO_MAP = {
+        "BTCUSD": "BTC/USD",
+        "ETHUSD": "ETH/USD",
+        "SOLUSD": "SOL/USD",
+    }
+
+    def __init__(
+        self,
+        alpaca_api_key: str | None = None,
+        alpaca_secret_key: str | None = None,
+    ) -> None:
+        self._alpaca_crypto: object | None = None
+        if alpaca_api_key and alpaca_secret_key:
+            try:
+                from alpaca.data.historical.crypto import (  # noqa: PLC0415
+                    CryptoHistoricalDataClient,
+                )
+                self._alpaca_crypto = CryptoHistoricalDataClient(
+                    alpaca_api_key, alpaca_secret_key
+                )
+            except Exception:
+                self._alpaca_crypto = None
+
+    @classmethod
+    def _yf_symbol(cls, symbol: str) -> str:
+        return cls._CRYPTO_MAP.get(symbol, symbol)
+
+    @classmethod
+    def _is_crypto(cls, symbol: str) -> bool:
+        return symbol in cls._ALPACA_CRYPTO_MAP
+
+    def _alpaca_crypto_bars(
+        self, symbol: str, start: datetime, end: datetime
+    ) -> list[Bar]:
+        """Fetch daily crypto bars from Alpaca; empty list if unavailable."""
+        if self._alpaca_crypto is None:
+            return []
+        try:
+            from alpaca.data.requests import CryptoBarsRequest  # noqa: PLC0415
+            from alpaca.data.timeframe import TimeFrame  # noqa: PLC0415
+            alpaca_sym = self._ALPACA_CRYPTO_MAP[symbol]
+            req = CryptoBarsRequest(
+                symbol_or_symbols=alpaca_sym,
+                timeframe=TimeFrame.Day,
+                start=start,
+                end=end,
+            )
+            result = self._alpaca_crypto.get_crypto_bars(req)  # type: ignore[attr-defined]
+            data = result.data.get(alpaca_sym, [])
+        except Exception:
+            return []
+        bars: list[Bar] = []
+        for ab in data:
+            try:
+                bars.append(Bar(
+                    symbol=symbol,
+                    timestamp=ab.timestamp,
+                    open=Decimal(str(ab.open)),
+                    high=Decimal(str(ab.high)),
+                    low=Decimal(str(ab.low)),
+                    close=Decimal(str(ab.close)),
+                    volume=int(ab.volume),
+                ))
+            except (AttributeError, ValueError, TypeError):
+                continue
+        return bars
+
+    def get_bars(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        timeframe: Timeframe = Timeframe.DAY,
+    ) -> list[Bar]:
+        if self._is_crypto(symbol):
+            bars = self._alpaca_crypto_bars(symbol, start, end)
+            if bars:
+                return bars
+            # If Alpaca crypto unavailable, fall through to yfinance.
+
+        import yfinance as yf  # noqa: PLC0415
+
+        ticker = yf.Ticker(self._yf_symbol(symbol))
+        df = ticker.history(start=start, end=end, interval="1d", auto_adjust=False)
+        if df is None or df.empty:
+            return []
+
+        bars: list[Bar] = []
+        for ts, row in df.iterrows():
+            ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+            try:
+                bars.append(
+                    Bar(
+                        symbol=symbol,
+                        timestamp=ts_dt,
+                        open=Decimal(str(row["Open"])),
+                        high=Decimal(str(row["High"])),
+                        low=Decimal(str(row["Low"])),
+                        close=Decimal(str(row["Close"])),
+                        volume=int(row["Volume"]) if row["Volume"] == row["Volume"] else 0,
+                    )
+                )
+            except (KeyError, ValueError, TypeError):
+                continue
+        return bars
+
+    def get_latest_bar(self, symbol: str) -> Bar | None:
+        if self._is_crypto(symbol):
+            from datetime import UTC, timedelta  # noqa: PLC0415
+            now = datetime.now(UTC)
+            bars = self._alpaca_crypto_bars(symbol, now - timedelta(days=5), now)
+            if bars:
+                return bars[-1]
+            # Fall through to yfinance if Alpaca didn't return data.
+
+        import yfinance as yf  # noqa: PLC0415
+
+        df = yf.Ticker(self._yf_symbol(symbol)).history(period="5d", interval="1d")
+        if df is None or df.empty:
+            return None
+        ts = df.index[-1]
+        ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+        row = df.iloc[-1]
+        return Bar(
+            symbol=symbol,
+            timestamp=ts_dt,
+            open=Decimal(str(row["Open"])),
+            high=Decimal(str(row["High"])),
+            low=Decimal(str(row["Low"])),
+            close=Decimal(str(row["Close"])),
+            volume=int(row["Volume"]) if row["Volume"] == row["Volume"] else 0,
+        )
+
+    def get_latest_quote(self, symbol: str) -> Quote | None:
+        bar = self.get_latest_bar(symbol)
+        if bar is None:
+            return None
+        return Quote(
+            symbol=symbol,
+            timestamp=bar.timestamp,
+            bid=bar.close,
+            ask=bar.close,
+            bid_size=0,
+            ask_size=0,
+        )
+
+    def get_snapshots(self, symbols: list[str]) -> dict[str, Bar]:
+        out: dict[str, Bar] = {}
+        for sym in symbols:
+            bar = self.get_latest_bar(sym)
+            if bar is not None:
+                out[sym] = bar
+        return out
+
+
 class ReplayMarketData:
     def __init__(
         self,

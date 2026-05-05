@@ -46,9 +46,9 @@ AGENT_BASE_MAX_GROSS: dict[AgentId, Decimal] = {
 # ── Per-agent base vol targets (at MASTER_CAPABILITY = 1.0) ──────────────────
 
 AGENT_BASE_VOL_TARGET: dict[AgentId, Decimal] = {
-    AgentId.HAIKU:   Decimal("0.14"),  # trend following — linear Sharpe with leverage
-    AgentId.SONNET:  Decimal("0.12"),  # multi-factor — moderate
-    AgentId.OPUS:    Decimal("0.11"),  # concentrated GARP — idiosyncratic risk
+    AgentId.HAIKU:   Decimal("0.30"),  # trend following — linear Sharpe with leverage
+    AgentId.SONNET:  Decimal("0.25"),  # multi-factor — moderate
+    AgentId.OPUS:    Decimal("0.20"),  # concentrated GARP — idiosyncratic risk
     AgentId.MANAGER: Decimal("0.10"),  # unused (Manager holds no positions)
 }
 
@@ -100,7 +100,12 @@ def effective_max_gross(
 ) -> Decimal:
     """Compute the effective gross leverage cap for one agent.
 
-    formula: base × MASTER_CAPABILITY × vix_scalar × drawdown_scalar
+    formula: base × MASTER_CAPABILITY × vix_scalar × drawdown_scalar × sleeve_weight
+
+    The `sleeve_weight` term is set by the Manager's monthly capital
+    reallocation call (default 1.0 — no change). Read from the JSON file
+    via `agents.manager_bridge.read_sleeve_weights()`. Bounded to [0.25, 2.0]
+    so a single Manager call cannot wipe out or 4× a sleeve in one go.
 
     Raises ValueError if master_capability > 1.5 (requires OVERRIDE_KEY).
     """
@@ -109,12 +114,19 @@ def effective_max_gross(
             f"MASTER_CAPABILITY {master_capability} exceeds {MAX_MASTER_CAPABILITY}: "
             "set OVERRIDE_KEY to allow values above 1.5"
         )
+    # Lazy import to avoid a circular dependency (manager_bridge → core.types).
+    from agents.manager_bridge import read_sleeve_weights
+    sleeve_weights = read_sleeve_weights()
+    sleeve_w = sleeve_weights.get(agent_id, Decimal("1.0"))
+    sleeve_w = max(Decimal("0.25"), min(Decimal("2.0"), sleeve_w))
+
     base = AGENT_BASE_MAX_GROSS[agent_id]
     result = (
         base
         * master_capability
         * VIX_SCALARS[vix_bucket]
         * DRAWDOWN_SCALARS[drawdown_bucket]
+        * sleeve_w
     )
     return max(result, Decimal("0"))
 

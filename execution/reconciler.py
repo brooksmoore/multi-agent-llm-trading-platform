@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from core.events import EventBus, KillSwitchResetEvent, KillSwitchTrippedEvent
-from core.types import Fill, KillSwitchState, Order, OrderSide, OrderState, new_id
+from core.types import AgentId, Fill, KillSwitchState, Order, OrderSide, OrderState, new_id
 from execution.broker import Broker, BrokerOrderEvent, BrokerOrderState, BrokerPosition
 from execution.kill_switch import KillSwitchEngine
 from execution.oms import OMS
@@ -67,6 +67,7 @@ class Reconciler:
         interval_secs: int = 60,
         qty_tolerance: Decimal = _QTY_TOLERANCE_DEFAULT,
         bus: EventBus | None = None,
+        orphan_agent_id: AgentId = AgentId.HAIKU,
     ) -> None:
         self._oms = oms
         self._broker = broker
@@ -77,14 +78,35 @@ class Reconciler:
         self._thread: threading.Thread | None = None
         self._bus = bus
         self._last_kill_state: KillSwitchState = kill.state
+        self._orphan_agent_id = orphan_agent_id
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def reconcile_once(self, ts: datetime) -> ReconcileResult:
         """Run one reconcile pass synchronously. Thread-safe; can be called from tests."""
+        # Heartbeat watchdog: KillSwitchEngine.check_heartbeat() flips the
+        # state to HEARTBEAT_MISSED if the writer thread is overdue. Nobody
+        # else calls it on a schedule, so we piggyback on the reconciler tick
+        # (every 60s) to keep heartbeat detection alive. The state-transition
+        # block below converts that into a KillSwitchTrippedEvent + a
+        # dedicated HeartbeatMissedEvent for subscribers that want one.
+        previously_ok = self._kill.state == KillSwitchState.OK
+        self._kill.check_heartbeat(ts)
+        if (
+            self._bus is not None
+            and previously_ok
+            and self._kill.state == KillSwitchState.HEARTBEAT_MISSED
+        ):
+            try:
+                from core.events import HeartbeatMissedEvent
+                self._bus.publish(HeartbeatMissedEvent())
+            except Exception:
+                logger.warning(
+                    "Reconciler: failed to publish HeartbeatMissed", exc_info=True,
+                )
         open_orders = self._oms.list_open_orders()
         orders_updated = self._reconcile_orders(open_orders)
-        mismatches, tripped = self._reconcile_positions()
+        mismatches, tripped = self._reconcile_positions(ts)
         # Auto-clear a prior reconciliation break once books agree again.
         if mismatches == 0:
             self._kill.clear_reconciliation_break()
@@ -210,8 +232,14 @@ class Reconciler:
 
     # ── Position reconciliation ───────────────────────────────────────────────
 
-    def _reconcile_positions(self) -> tuple[int, bool]:
+    def _reconcile_positions(self, ts: datetime) -> tuple[int, bool]:
         """Compare expected positions (from OMS fills) vs broker positions.
+
+        When the broker holds a position the OMS has no record of (our_qty == 0,
+        broker_qty > 0), the fill was lost — typically a websocket outage during
+        a fill event. In that case we write the position back into the OMS as a
+        ghost fill so the books agree on the next pass instead of tripping the
+        kill switch forever.
 
         Returns (num_mismatches, kill_switch_tripped).
         """
@@ -234,18 +262,55 @@ class Reconciler:
             qty_drift = abs(our_qty - broker_qty)
             price = broker_pos.current_price if broker_pos is not None else Decimal("0")
             dollar_drift = qty_drift * price
-            if qty_drift >= self._qty_tolerance or dollar_drift > _DOLLAR_TOLERANCE:
-                logger.error(
-                    "Reconciler: position mismatch on %s — expected=%.4f broker=%.4f "
-                    "(qty_drift=%.4f dollar_drift=$%.2f)",
-                    sym, our_qty, broker_qty, qty_drift, dollar_drift,
+
+            if qty_drift < self._qty_tolerance and dollar_drift <= _DOLLAR_TOLERANCE:
+                continue
+
+            # Broker has a position we have zero record of — adopt it.
+            if our_qty == Decimal("0") and broker_qty > Decimal("0"):
+                logger.warning(
+                    "Reconciler: orphan position %s broker=%.6f @ $%.4f — "
+                    "adopting into OMS as agent=%s",
+                    sym, broker_qty, price, self._orphan_agent_id,
                 )
-                mismatches.append(sym)
+                try:
+                    self._oms.adopt_orphan_position(
+                        symbol=sym,
+                        qty=broker_qty,
+                        price=price,
+                        agent_id=self._orphan_agent_id,
+                        ts=ts,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Reconciler: adopt_orphan_position failed for %s", sym)
+                    mismatches.append(sym)
+                # Don't count this tick as a mismatch — books are now in sync.
+                continue
+
+            logger.error(
+                "Reconciler: position mismatch on %s — expected=%.4f broker=%.4f "
+                "(qty_drift=%.4f dollar_drift=$%.2f)",
+                sym, our_qty, broker_qty, qty_drift, dollar_drift,
+            )
+            mismatches.append(sym)
 
         tripped = False
         if mismatches:
             self._kill.trip_reconciliation_break()
             tripped = True
+            if self._bus is not None:
+                try:
+                    from core.events import ReconciliationBreakEvent
+                    # Publish per-symbol so each break is independently
+                    # actionable. Drop a single rolled-up event if the list
+                    # is large (defensive against position blowouts).
+                    for sym in mismatches[:5]:
+                        self._bus.publish(ReconciliationBreakEvent(symbol=sym))
+                except Exception:
+                    logger.warning(
+                        "Reconciler: failed to publish ReconciliationBreak", exc_info=True,
+                    )
 
         return len(mismatches), tripped
 

@@ -12,7 +12,7 @@ from agents.calibration import CalibrationTracker
 from agents.memory import AgentMemory
 from core.types import AgentId, OrderId, new_id
 from dashboard.data import DashboardData
-from dashboard.layout import render_full_dashboard
+from dashboard.server import build_app
 from execution.budget import BudgetLedger
 from execution.oms_store import EventKind, OMSStore
 
@@ -257,13 +257,26 @@ def test_spend_breakdown_handles_zero_elapsed(budget: BudgetLedger) -> None:
 # ── End-to-end render (catches layout/data-shape mismatches) ─────────────────
 
 
-def test_render_full_dashboard_with_empty_data_does_not_raise() -> None:
-    data = DashboardData()
-    component = render_full_dashboard(data)
-    assert component is not None
+_API_ROUTES = (
+    "/api/snapshot",
+    "/api/nav_curve",
+    "/api/sleeve_curves",
+    "/api/activity",
+    "/api/calibration",
+    "/api/spend_curve",
+)
 
 
-def test_render_full_dashboard_with_populated_data(
+def test_flask_routes_with_empty_data_return_200() -> None:
+    app = build_app(DashboardData(), spy=None)
+    client = app.test_client()
+    for route in _API_ROUTES:
+        r = client.get(route)
+        assert r.status_code == 200, f"{route} -> {r.status_code}"
+        r.get_json()  # raises if non-JSON
+
+
+def test_flask_routes_with_populated_data_return_200(
     memory_haiku: AgentMemory,
     calibration: CalibrationTracker,
     budget: BudgetLedger,
@@ -286,8 +299,12 @@ def test_render_full_dashboard_with_populated_data(
         master_capability=Decimal("1.0"),
         regime_label="risk_on",
     )
-    component = render_full_dashboard(data)
-    assert component is not None
+    app = build_app(data, spy=None)
+    client = app.test_client()
+    for route in _API_ROUTES:
+        r = client.get(route)
+        assert r.status_code == 200, f"{route} -> {r.status_code}"
+        r.get_json()
 
 
 def test_budget_reset_if_new_day_does_not_break_dashboard(budget: BudgetLedger) -> None:

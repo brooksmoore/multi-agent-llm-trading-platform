@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 import random
 import time
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import anthropic
@@ -48,6 +51,30 @@ OPUS_MODEL = "claude-opus-4-7"
 # Backoff schedule for Anthropic 529 (overloaded): [1s, 4s, 16s] + 0–1s jitter.
 # Applied per-attempt independently of the 429 retry counter.
 _BACKOFF_529_SECS: list[float] = [1.0, 4.0, 16.0]
+
+
+_RAW_RESPONSE_LOG = Path(
+    os.environ.get("LLM_RAW_RESPONSE_LOG", "logs/llm_responses.jsonl")
+)
+
+
+def _append_raw_response(
+    ts: datetime, agent_id: AgentId, call_type: str, model: str, text: str
+) -> None:
+    """Append every raw LLM response to a JSONL file for diagnostics. Best-effort."""
+    try:
+        _RAW_RESPONSE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": ts.isoformat(),
+            "agent_id": str(agent_id),
+            "call_type": call_type,
+            "model": model,
+            "response": text,
+        }
+        with _RAW_RESPONSE_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        log.warning("failed to append raw LLM response", exc_info=True)
 
 
 class BudgetExhausted(Exception):
@@ -159,6 +186,8 @@ class LLMClient:
             cache_hit,
             out_tok,
         )
+
+        _append_raw_response(ts, agent_id, call_type, self._model, text)
 
         return text, memo
 

@@ -7,7 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from agents.base import AgentState, BaseAgent
+from agents.base import AgentState, BaseAgent, format_news_block, render_system_prompt
 from agents.json_utils import parse_json_object
 from agents.llm import LLMClient
 from agents.memory import AgentMemory
@@ -47,6 +47,25 @@ class HaikuAgent(BaseAgent):
         self._memory = memory
         self._prompt = _PROMPT_PATH.read_text()
 
+    def signal_fingerprint(self, state: AgentState) -> str | None:
+        """Trend bits + holdings + EMG + rejection fingerprint.
+
+        A new broker rejection invalidates this fingerprint so the LLM is
+        re-invoked with the rejection context rather than silently skipping.
+        """
+        eq = self._compute_equity_trend(state.bars_by_symbol)
+        cr = self._compute_crypto_trend(state.bars_by_symbol)
+        eq_bits = "".join("1" if eq[s]["in_trend"] else "0" for s in _EQUITY_UNIVERSE)
+        cr_bits = "".join("1" if cr[s]["in_trend"] else "0" for s in _CRYPTO_UNIVERSE)
+        held = ",".join(sorted(f"{p.symbol}:{p.qty}" for p in state.positions))
+        emg_bp = int(state.effective_max_gross * Decimal("100"))  # cents of leverage
+        # Stable sort by ts so order doesn't matter; include symbol+reason so a
+        # new rejection on the same symbol with a different reason also invalidates.
+        rej_key = "|".join(
+            sorted(f"{r['ts']}:{r['symbol']}:{r['reason']}" for r in state.recent_rejections)
+        )
+        return f"eq={eq_bits}|cr={cr_bits}|held={held}|emg={emg_bp}|rej={rej_key}"
+
     def observe(self, state: AgentState) -> list[Intent]:
         """Process system state snapshot, return zero or more trade intents."""
         if state.kill_switch_state == KillSwitchState.DRAWDOWN_LIQUIDATE:
@@ -59,7 +78,7 @@ class HaikuAgent(BaseAgent):
 
         try:
             response_text, memo = self._llm.call(
-                system=self._prompt,
+                system=render_system_prompt(self._prompt, state),
                 user=context,
                 agent_id=AgentId.HAIKU,
                 call_type="trend_observe",
@@ -169,6 +188,20 @@ class HaikuAgent(BaseAgent):
         regime = state.manager_regime_text or "(none this week)"
         recent = self._memory.recent_intents_summary(3)
         critique = state.manager_critique or "(none)"
+        morning_brief = state.manager_morning_brief or "(no brief today)"
+        directive = state.manager_directive or "(no active directive)"
+
+        # Rejection block: show the LLM why prior orders didn't fill so it can
+        # decide whether to re-issue them (rather than assuming they executed).
+        if state.recent_rejections:
+            rej_lines = ["Recent broker rejections (last 48h — these orders did NOT fill):"]
+            for r in state.recent_rejections:
+                rej_lines.append(
+                    f"  [{r['ts']}] {r['side'].upper()} {r['symbol']} — {r['reason']}"
+                )
+            rejection_block = "\n".join(rej_lines)
+        else:
+            rejection_block = "Recent broker rejections: none"
 
         return "\n".join([
             f"=== HaikuAgent context @ {state.timestamp.isoformat()} ===",
@@ -187,13 +220,25 @@ class HaikuAgent(BaseAgent):
             "",
             f"Manager regime: {regime}",
             "",
+            f"Manager morning brief (today): {morning_brief}",
+            "",
+            f"Manager directive (active): {directive}",
+            "",
             f"Recent intents:\n{recent}",
             "",
             f"Manager critique: {critique}",
             "",
+            rejection_block,
+            "",
+            format_news_block(state, limit=10),
+            "",
             "Today's question: What trend signals are flipping today? "
             "Which ETFs just crossed above/below their 10-month SMA? "
             "Which crypto assets are confirming or losing trend? "
+            "If the rejection block above lists unfilled buys, treat that as "
+            "evidence that current holdings do NOT match prior intents — re-evaluate "
+            "from current trend data and decide independently whether to re-issue, "
+            "modify, or abandon the original thesis. Do not auto-retry. "
             "Respond with JSON only.",
         ])
 

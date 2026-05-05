@@ -172,8 +172,12 @@ class TestBucketLoosening:
     def test_loosens_after_required_days(self) -> None:
         t, _ = self._setup_in_yellow()
 
-        # Mark as recovered on 5 consecutive (simulated) days.
-        base_date = datetime(2026, 4, 27, 10, 0, tzinfo=UTC)
+        # Mark as recovered on 5 consecutive (simulated) days.  Base date
+        # is anchored well before any plausible wall-clock `today` so
+        # `is_new_day` is True on every iteration regardless of when the
+        # test runs.  (Without this, the test breaks once wall-clock catches
+        # up to base_date.)
+        base_date = datetime(2025, 1, 1, 10, 0, tzinfo=UTC)
         for day_offset in range(_RECOVERY_DAYS_REQUIRED):
             mock_date = base_date + timedelta(days=day_offset)
             # Monkey-patch the date so the tracker sees distinct days.
@@ -353,8 +357,10 @@ class TestForcedCash:
         t.update_on_mark(AgentId.SONNET, {"SPY": Decimal("74")})
         assert t.get_state(AgentId.SONNET).drawdown_bucket == DrawdownBucket.FORCED_CASH
 
-        # 5 simulated days at par
-        base = datetime(2026, 5, 1, 10, 0, tzinfo=UTC)
+        # 5 simulated days at par.  Base date is anchored well before any
+        # plausible wall-clock `today` so `is_new_day` is True on every
+        # iteration regardless of when the test runs.
+        base = datetime(2025, 1, 1, 10, 0, tzinfo=UTC)
         for day_offset in range(_RECOVERY_DAYS_REQUIRED):
             rec = t._records[AgentId.SONNET]
             rec.last_update_date = (base + timedelta(days=day_offset - 1)).date()

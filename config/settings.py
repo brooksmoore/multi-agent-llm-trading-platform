@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     alpaca_secret_key: str = ""
     alpaca_paper: bool = True
 
+    # ── Market data source ─────────────────────────────────────────────────────
+    # "alpaca" requires a paid SIP subscription; "yfinance" is free daily bars.
+    market_data_source: str = "yfinance"
+
     # ── Anthropic ──────────────────────────────────────────────────────────────
     anthropic_api_key: str = ""
 
@@ -55,7 +59,7 @@ class Settings(BaseSettings):
     reconciler_qty_tolerance: Decimal = Decimal("1")   # shares
 
     # ── Per-agent tracker ──────────────────────────────────────────────────────
-    starting_equity: Decimal = Decimal("100000")   # per-agent sleeve starting equity
+    starting_equity: Decimal = Decimal("30000")   # per-agent sleeve starting equity ($30k × 3 = $90k deployed, $10k Manager reserve)
 
 
 settings = Settings()

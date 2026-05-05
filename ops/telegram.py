@@ -162,15 +162,37 @@ class TelegramAdapter:
         qty: str,
         price: str,
     ) -> bool:
-        """Send a fill notification."""
+        """Send a fill notification.
+
+        Note: AlertManager no longer auto-subscribes to fill events; this
+        method is kept for callers that want to opt back in or trigger a
+        manual notification.
+        """
         text = (
             f"✅ *FILL* \\[{_escape(agent)}\\]\n"
             f"{_escape(side.upper())} {_escape(qty)} "
             f"{_escape(symbol)} @ {_escape(price)}"
         )
-        # Fills can be rapid — key includes symbol+side so partial fills dedup separately.
         key = f"fill:{agent}:{symbol}:{side.lower()}"
         return self.send(text, key=key)
+
+    def send_resume_alert(self, agent: str | None = None) -> bool:
+        """Send a resume notification when the kill switch clears."""
+        agent_part = f" \\[{_escape(agent)}\\]" if agent else ""
+        text = f"✅ *RESUMED*{agent_part}\nTrading active"
+        key = f"resume:{agent or 'global'}"
+        return self.send(text, key=key)
+
+    def send_portfolio_snapshot(self, body: str) -> bool:
+        """Send an hourly portfolio status update.
+
+        `body` is plain text — escaping is handled here. Deduped per-hour so
+        if the scheduler double-fires the same minute the second is suppressed.
+        """
+        from datetime import UTC, datetime  # noqa: PLC0415
+        hour_key = datetime.now(UTC).strftime("%Y-%m-%dT%H")
+        text = f"📊 *Portfolio update*\n{_escape(body)}"
+        return self.send(text, key=f"portfolio:{hour_key}")
 
     def send_weekly_report(self, report_md: str) -> bool:
         """Send the manager's weekly journal. Deduped once per calendar day."""

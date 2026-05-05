@@ -198,3 +198,31 @@ def test_total_open_qty_after_partial_close() -> None:
     ledger.close_lots(AgentId.HAIKU, "SPY", Decimal("6"), sell, LotMethod.FIFO)
 
     assert ledger.total_open_qty(AgentId.HAIKU, "SPY") == Decimal("9")
+
+
+# ── Persistence + idempotency ────────────────────────────────────────────────
+
+
+def test_persistence_round_trip(tmp_path):
+    db = str(tmp_path / "lots.db")
+    ledger = LotLedger(db_path=db)
+    buy = _fill(OrderSide.BUY, "10", "100", day=1)
+    ledger.book_fill(buy)
+
+    # Reload from disk
+    reloaded = LotLedger(db_path=db)
+    lots = reloaded.all_lots()
+    assert len(lots) == 1
+    assert lots[0].entry_fill_id == buy.id
+    assert lots[0].remaining_qty == Decimal("10")
+    assert reloaded.total_open_qty(AgentId.HAIKU, "SPY") == Decimal("10")
+
+
+def test_book_fill_is_idempotent(tmp_path):
+    db = str(tmp_path / "lots.db")
+    ledger = LotLedger(db_path=db)
+    buy = _fill(OrderSide.BUY, "5", "100", day=1)
+    ledger.book_fill(buy)
+    ledger.book_fill(buy)  # duplicate event — must no-op
+    ledger.book_fill(buy)
+    assert len(ledger.all_lots()) == 1

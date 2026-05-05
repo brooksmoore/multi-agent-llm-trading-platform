@@ -587,3 +587,109 @@ def test_manager_bad_json_returns_empty_dict() -> None:
     result = agent.regime_read(_minimal_state())
     assert result == {}
     mem.close()
+
+
+# ── Opus initiation mode + watchlist + deep-dive intent extraction ──────────
+
+
+_OPUS_INITIATION_RESPONSE = json.dumps({
+    "portfolio_observation": "Sleeve under-built; seeding with one starter.",
+    "intents": [
+        {
+            "symbol": "TSM",
+            "action": "buy",
+            "target_weight": 0.20,  # too large — must be clamped to 0.05
+            "thesis_id": "TSM-2026-01",
+            "trigger": "AI capex cycle accelerating.",
+            "conviction": 8,
+        },
+        {
+            "symbol": "AVGO",
+            "action": "buy",
+            "target_weight": 0.04,
+            "trigger": "Custom-silicon ramp.",
+            "conviction": 5,  # too low — must be filtered
+        },
+    ],
+    "watchlist_add": ["ASML", "MU", "AMAT"],
+    "calibration_note": "",
+})
+
+_OPUS_DEEP_DIVE_ADD_RESPONSE = json.dumps({
+    "deep_dive_for": "TSM",
+    "bull_case": "...",
+    "bear_case": "...",
+    "delta_since_last": "Margin expansion confirmed.",
+    "conviction_prior": 7,
+    "conviction_new": 9,
+    "conviction_move_reason": "...",
+    "kill_criteria": ["..."],
+    "catalyst_calendar": [],
+    "intent": {
+        "action": "add",
+        "target_weight": 0.13,
+        "rationale": "Deep-dive validated thesis at higher conviction.",
+    },
+})
+
+
+def test_opus_initiation_mode_clamps_starter_weight() -> None:
+    mock_llm = MagicMock(spec=LLMClient)
+    mock_llm.call.return_value = (_OPUS_INITIATION_RESPONSE, _mock_memo(AgentId.OPUS))
+    mem = AgentMemory(":memory:", AgentId.OPUS)
+    agent = OpusAgent(llm=mock_llm, memory=mem)
+    intents = agent.observe(_minimal_state())  # 0 holdings → initiation
+
+    # AVGO filtered (low conviction); TSM kept and clamped to ≤ 0.05.
+    assert len(intents) == 1
+    assert intents[0].symbol == "TSM"
+    assert intents[0].target_weight == Decimal("0.05")
+    mem.close()
+
+
+def test_opus_initiation_mode_persists_watchlist() -> None:
+    mock_llm = MagicMock(spec=LLMClient)
+    mock_llm.call.return_value = (_OPUS_INITIATION_RESPONSE, _mock_memo(AgentId.OPUS))
+    mem = AgentMemory(":memory:", AgentId.OPUS)
+    agent = OpusAgent(llm=mock_llm, memory=mem)
+    agent.observe(_minimal_state())
+
+    wl = agent.get_watchlist()
+    assert "ASML" in wl and "MU" in wl and "AMAT" in wl
+    mem.close()
+
+
+def test_opus_extracts_executable_intent_from_deep_dive() -> None:
+    mock_llm = MagicMock(spec=LLMClient)
+    mock_llm.call.return_value = (
+        _OPUS_DEEP_DIVE_ADD_RESPONSE,
+        _mock_memo(AgentId.OPUS, "deep_dive"),
+    )
+    mem = AgentMemory(":memory:", AgentId.OPUS)
+    agent = OpusAgent(llm=mock_llm, memory=mem)
+    state = _minimal_state()
+    data = agent.deep_dive(state, "TSM", "doc pack")
+    intent = agent.extract_deep_dive_intent(state, data, "TSM")
+
+    assert intent is not None
+    assert intent.symbol == "TSM"
+    assert intent.action.value == "buy"            # "add" → buy
+    assert intent.target_weight == Decimal("0.13")
+    assert intent.conviction == 9                   # from conviction_new
+    mem.close()
+
+
+def test_opus_extract_intent_returns_none_for_hold() -> None:
+    mock_llm = MagicMock(spec=LLMClient)
+    mock_llm.call.return_value = (
+        _OPUS_DEEP_DIVE_RESPONSE,  # action="hold"
+        _mock_memo(AgentId.OPUS, "deep_dive"),
+    )
+    mem = AgentMemory(":memory:", AgentId.OPUS)
+    agent = OpusAgent(llm=mock_llm, memory=mem)
+    state = _minimal_state()
+    data = agent.deep_dive(state, "TSM", "doc pack")
+    intent = agent.extract_deep_dive_intent(state, data, "TSM")
+
+    assert intent is None
+    mem.close()

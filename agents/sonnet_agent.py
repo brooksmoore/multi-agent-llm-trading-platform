@@ -8,7 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from agents.base import AgentState, BaseAgent
+from agents.base import AgentState, BaseAgent, format_news_block, render_system_prompt
 from agents.llm import LLMClient
 from agents.memory import AgentMemory
 from core.types import Action, AgentId, Intent, KillSwitchState, Sleeve, new_id
@@ -49,6 +49,24 @@ class SonnetAgent(BaseAgent):
         self._memory = memory
         self._prompt = _PROMPT_PATH.read_text()
 
+    def signal_fingerprint(self, state: AgentState) -> str | None:
+        """Top-10 momentum names + buckets + holdings.
+
+        Sonnet's decisions are driven by which names lead the cross-section.
+        If the top-10 ordering, leverage cap, and current holdings haven't
+        moved since the last look, there's nothing new to say.
+        """
+        signals = self._compute_factor_signals(state.bars_by_symbol)
+        ranked = sorted(
+            ((s, d["momentum_12_1"]) for s, d in signals.items() if d["momentum_12_1"] is not None),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        top10 = ",".join(s for s, _ in ranked[:10])
+        held = ",".join(sorted(f"{p.symbol}:{p.qty}" for p in state.positions))
+        emg_bp = int(state.effective_max_gross * Decimal("100"))
+        return f"top10={top10}|held={held}|emg={emg_bp}"
+
     def observe(self, state: AgentState) -> list[Intent]:
         """Evaluate factor signals, query LLM, return up to 5 intents."""
         if state.kill_switch_state == KillSwitchState.DRAWDOWN_LIQUIDATE:
@@ -60,7 +78,7 @@ class SonnetAgent(BaseAgent):
 
         try:
             response_text, _ = self._llm.call(
-                system=self._prompt,
+                system=render_system_prompt(self._prompt, state),
                 user=context,
                 agent_id=AgentId.SONNET,
                 call_type="factor_observe",
@@ -127,6 +145,8 @@ class SonnetAgent(BaseAgent):
         )
         regime = state.manager_regime_text or "(none this week)"
         critique = state.manager_critique or "(none)"
+        morning_brief = state.manager_morning_brief or "(no brief today)"
+        directive = state.manager_directive or "(no active directive)"
         recent = self._memory.recent_intents_summary(5)
 
         return "\n".join([
@@ -141,9 +161,13 @@ class SonnetAgent(BaseAgent):
             *(candidate_rows or ["  (insufficient history)"]),
             "",
             f"Manager regime: {regime}",
+            f"Manager morning brief (today): {morning_brief}",
+            f"Manager directive (active): {directive}",
             f"Manager critique: {critique}",
             "",
             f"Recent intents:\n{recent}",
+            "",
+            format_news_block(state, limit=15),
             "",
             "Today's question: Review the factor rankings. Are any top-25 names "
             "ready to add, trim, or exit based on factor strength and news? "

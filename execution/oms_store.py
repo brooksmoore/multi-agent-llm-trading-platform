@@ -206,6 +206,50 @@ class OMSStore:
                 payload=loads(payload),
             )
 
+    def recent_rejections_by_agent(
+        self,
+        agent_id: str,
+        since: datetime,
+        n: int = 20,
+    ) -> list[dict[str, str]]:
+        """Return the *n* most recent rejected orders for *agent_id* since *since*.
+
+        Each entry: {ts, symbol, side, reason}.  Joins rejection events with
+        their submit_intent to recover symbol/side (stored only in the intent).
+        """
+        with self._lock:
+            # Fetch rejections joined with their originating submit_intent.
+            rows = self._conn.execute(
+                """
+                SELECT r.ts, i.payload AS intent_payload, r.payload AS reject_payload
+                  FROM oms_events r
+                  JOIN oms_events i
+                    ON r.order_id = i.order_id
+                   AND i.kind = 'order.submit_intent'
+                 WHERE r.kind = 'order.rejected'
+                   AND r.ts >= ?
+                 ORDER BY r.ts DESC
+                 LIMIT ?
+                """,
+                (since.isoformat(), n * 5),  # over-fetch; filter by agent_id in Python
+            ).fetchall()
+
+        result: list[dict[str, str]] = []
+        for ts_str, intent_raw, reject_raw in rows:
+            intent = loads(intent_raw)
+            if str(intent.get("agent_id", "")) != agent_id:
+                continue
+            reject = loads(reject_raw)
+            result.append({
+                "ts": ts_str[:19],  # trim to seconds for readability
+                "symbol": str(intent.get("symbol", "?")),
+                "side": str(intent.get("side", "?")),
+                "reason": str(reject.get("reason", "?")),
+            })
+            if len(result) >= n:
+                break
+        return result
+
     def count(self) -> int:
         with self._lock:
             cursor = self._conn.execute("SELECT COUNT(*) FROM oms_events")

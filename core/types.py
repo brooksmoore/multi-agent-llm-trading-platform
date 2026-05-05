@@ -24,6 +24,20 @@ def new_id() -> uuid.UUID:
     return uuid.uuid4()
 
 
+def normalize_symbol(symbol: str) -> str:
+    """Canonical form for trading symbols.
+
+    Crypto pairs arrive in two forms ("BTC/USD" from Alpaca's positions/fills
+    API, "BTCUSD" from agent universes and submit endpoints). Without
+    canonicalization, the same logical position appears under two keys —
+    breaking dedup in the lots ledger and in agent `held` sets, which then
+    re-emits buy intents for already-held names.
+
+    Equity tickers contain no slash and pass through unchanged.
+    """
+    return symbol.replace("/", "") if "/" in symbol else symbol
+
+
 # ─── Enumerations ─────────────────────────────────────────────────────────────
 
 

@@ -41,9 +41,13 @@ from core.types import (
     AgentId,
     Fill,
     Order,
+    OrderClass,
     OrderEvent,
     OrderId,
+    OrderSide,
     OrderState,
+    OrderType,
+    TimeInForce,
     new_id,
 )
 from execution.broker import (
@@ -250,6 +254,83 @@ class OMS:
         """
         self._on_broker_event(event)
 
+    def adopt_orphan_position(
+        self,
+        symbol: str,
+        qty: Decimal,
+        price: Decimal,
+        agent_id: AgentId,
+        ts: datetime,
+    ) -> None:
+        """Inject a synthetic fill for a broker position the OMS missed.
+
+        Used by the reconciler when the broker holds a position that has no
+        matching OMS record (e.g. fills lost during a websocket outage). Creates
+        a ghost order + fill so _compute_expected_positions() agrees with the
+        broker on the next reconcile pass. Idempotent on restart: the persisted
+        events are replayed by recover().
+        """
+        ghost_order_id = new_id()
+        ghost_broker_id = f"ghost-{ghost_order_id}"
+
+        ghost_order = Order(
+            id=ghost_order_id,
+            intent_id=new_id(),
+            agent_id=agent_id,
+            symbol=symbol,
+            side=OrderSide.BUY,
+            qty=qty,
+            order_type=OrderType.MARKET,
+            order_class=OrderClass.SIMPLE,
+            time_in_force=TimeInForce.GTC,
+            state=OrderState.PENDING,
+            created_at=ts,
+        )
+        fill = Fill(
+            id=new_id(),
+            order_id=ghost_order_id,
+            agent_id=agent_id,
+            symbol=symbol,
+            side=OrderSide.BUY,
+            qty=qty,
+            price=price,
+            timestamp=ts,
+            commission=Decimal("0"),
+            is_partial=False,
+        )
+
+        with self._lock:
+            # Set up in-memory order state (PENDING → SUBMITTED → ACCEPTED)
+            self._orders[ghost_order_id] = ghost_order
+            self._fsms[ghost_order_id] = build_order_fsm(OrderState.PENDING)
+            self._fills_by_order[ghost_order_id] = []
+
+            self._store.append(EventKind.ORDER_SUBMIT_INTENT, ghost_order_id,
+                               _serialize_order(ghost_order), ts)
+            self._fsms[ghost_order_id].trigger(OrderEvent.SUBMIT)
+            self._orders[ghost_order_id] = replace(
+                self._orders[ghost_order_id], state=OrderState.SUBMITTED)
+
+            self._store.append(EventKind.ORDER_ACCEPTED, ghost_order_id,
+                               {"broker_order_id": ghost_broker_id}, ts)
+            self._broker_id_to_order[ghost_broker_id] = ghost_order_id
+            self._orders[ghost_order_id] = replace(
+                self._orders[ghost_order_id],
+                broker_order_id=ghost_broker_id,
+                submitted_at=ts,
+            )
+            self._fsms[ghost_order_id].trigger(OrderEvent.ACCEPT)
+            self._orders[ghost_order_id] = replace(
+                self._orders[ghost_order_id], state=OrderState.ACCEPTED)
+
+            # Apply fill — drives FSM to FILLED and publishes FillReceivedEvent
+            self._handle_fill(ghost_order_id, fill, ts=ts)
+
+        logger.info(
+            "OMS: adopted orphan position %s qty=%.6f @ %.4f for agent=%s",
+            symbol, qty, price, agent_id,
+        )
+
     # ─── Recovery ─────────────────────────────────────────────────────────────
 
     def recover(self) -> ReconcileSummary:
@@ -338,6 +419,11 @@ class OMS:
         order = self._orders[order_id]
         if fill.agent_id != order.agent_id:
             fill = replace(fill, agent_id=order.agent_id)
+        # Canonicalize symbol so the lots ledger and downstream consumers see
+        # one key per logical position even when the broker echoes the slashed
+        # crypto form (BTC/USD) for an order we submitted as BTCUSD.
+        if fill.symbol != order.symbol:
+            fill = replace(fill, symbol=order.symbol)
 
         self._store.append(
             kind=EventKind.FILL_RECEIVED,

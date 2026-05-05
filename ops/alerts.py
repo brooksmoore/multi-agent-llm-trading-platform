@@ -24,10 +24,12 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from core.events import (
+    AgentBenchedEvent,
     BudgetExhaustedEvent,
+    DrawdownLadderFiredEvent,
     Event,
     EventBus,
-    FillReceivedEvent,
+    KillSwitchResetEvent,
     KillSwitchTrippedEvent,
     LeverageRotationFlagEvent,
     ReconciliationBreakEvent,
@@ -85,11 +87,12 @@ class AlertManager:
     def start(self) -> None:
         """Subscribe to all alert channels."""
         self._bus.subscribe("kill_switch.tripped", self._on_kill_switch)
+        self._bus.subscribe("kill_switch.reset", self._on_kill_switch_reset)
         self._bus.subscribe("reconciliation.break", self._on_reconciliation_break)
         self._bus.subscribe("budget.exhausted", self._on_budget_exhausted)
         self._bus.subscribe("leverage.rotation_flag", self._on_leverage_rotation)
-        if self._telegram is not None and self._telegram.enabled:
-            self._bus.subscribe("fill.received", self._on_fill_received)
+        self._bus.subscribe("agent.benched", self._on_agent_benched)
+        self._bus.subscribe("drawdown.ladder_fired", self._on_drawdown_ladder)
         log.info(
             "AlertManager: started (topic=%s telegram=%s dedupe=%.0fs)",
             self._topic or "<disabled>",
@@ -100,11 +103,12 @@ class AlertManager:
     def stop(self) -> None:
         """Unsubscribe from all channels."""
         self._bus.unsubscribe("kill_switch.tripped", self._on_kill_switch)
+        self._bus.unsubscribe("kill_switch.reset", self._on_kill_switch_reset)
         self._bus.unsubscribe("reconciliation.break", self._on_reconciliation_break)
         self._bus.unsubscribe("budget.exhausted", self._on_budget_exhausted)
         self._bus.unsubscribe("leverage.rotation_flag", self._on_leverage_rotation)
-        if self._telegram is not None and self._telegram.enabled:
-            self._bus.unsubscribe("fill.received", self._on_fill_received)
+        self._bus.unsubscribe("agent.benched", self._on_agent_benched)
+        self._bus.unsubscribe("drawdown.ladder_fired", self._on_drawdown_ladder)
 
     # ── Stats (for dashboard / tests) ─────────────────────────────────────────
 
@@ -168,17 +172,45 @@ class AlertManager:
         )
         self._send(title=title, message=msg, key=f"rot:{event.agent_id}:{event.category}")
 
-    def _on_fill_received(self, event: Event) -> None:
-        if not isinstance(event, FillReceivedEvent) or self._telegram is None:
+    def _on_agent_benched(self, event: Event) -> None:
+        if not isinstance(event, AgentBenchedEvent):
             return
-        f = event.fill
-        self._telegram.send_fill_notification(
-            agent=str(f.agent_id),
-            symbol=f.symbol,
-            side=str(f.side),
-            qty=str(f.qty),
-            price=str(f.price),
+        title = "🪑 Agent benched"
+        msg = (
+            f"agent={event.agent_id} after {event.consecutive_losses} "
+            "consecutive losses (24h cooldown)"
         )
+        self._send(title=title, message=msg, key=f"bench:{event.agent_id}", priority="high")
+
+    def _on_drawdown_ladder(self, event: Event) -> None:
+        if not isinstance(event, DrawdownLadderFiredEvent):
+            return
+        # Only alert on tightening to ORANGE/RED/FORCED_CASH (the buckets
+        # that meaningfully throttle the agent). YELLOW is routine noise.
+        if event.new_bucket in ("normal", "yellow", ""):
+            return
+        emoji = "🟠" if event.new_bucket == "orange" else "🔴"
+        title = f"{emoji} Drawdown bucket {event.new_bucket}"
+        msg = (
+            f"agent={event.agent_id} drawdown={float(event.drawdown_pct) * 100:.1f}% "
+            f"(sizing now scaled by drawdown ladder)"
+        )
+        self._send(
+            title=title, message=msg,
+            key=f"dd:{event.agent_id}:{event.new_bucket}",
+            priority="urgent" if event.new_bucket in ("red", "forced_cash") else "high",
+        )
+
+    def _on_kill_switch_reset(self, event: Event) -> None:
+        if not isinstance(event, KillSwitchResetEvent):
+            return
+        title = "✅ Kill switch cleared"
+        msg = "Trading resumed"
+        self._send(title=title, message=msg, key="ks:reset", priority="default")
+        if self._telegram is not None:
+            self._telegram.send_resume_alert(
+                agent=str(event.agent_id) if event.agent_id else None,
+            )
 
     # ── Send + dedupe ─────────────────────────────────────────────────────────
 

@@ -178,6 +178,7 @@ class BudgetWatcher:
         ledger: BudgetLedger,
         kill: KillSwitchEngine,
         poll_interval_secs: float = 30.0,
+        bus: object | None = None,
     ) -> None:
         self._ledger = ledger
         self._kill = kill
@@ -185,6 +186,7 @@ class BudgetWatcher:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._tripped = False
+        self._bus = bus
 
     def start(self) -> None:
         """Start the background polling loop."""
@@ -217,8 +219,21 @@ class BudgetWatcher:
                 float(self._ledger.today_spent()),
                 float(self._ledger.daily_limit()),
             )
+            self._publish_exhausted()
             return True
         return False
+
+    def _publish_exhausted(self) -> None:
+        """Notify subscribers (AlertManager → Telegram/ntfy) that budget is gone."""
+        if self._bus is None:
+            return
+        try:
+            from core.events import BudgetExhaustedEvent
+            self._bus.publish(
+                BudgetExhaustedEvent(spent_today=self._ledger.today_spent())
+            )
+        except Exception:
+            log.warning("BudgetWatcher: failed to publish BudgetExhausted", exc_info=True)
 
     def reset(self) -> None:
         """Reset the tripped flag. Call alongside BudgetLedger.reset_if_new_day()."""

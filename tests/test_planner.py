@@ -191,7 +191,18 @@ class TestPlannerBasic:
         assert order.qty > Decimal("0")
 
     def test_sell_intent_returns_sell_order(self) -> None:
-        planner, *_ = _make_planner()
+        planner, _oms, ledger, *_ = _make_planner()
+        # Seed an open lot — the planner refuses SELL when the agent has none.
+        ledger.open_lot(Fill(
+            id=new_id(),
+            order_id=new_id(),
+            agent_id=AgentId.SONNET,
+            symbol="SPY",
+            side=OrderSide.BUY,
+            qty=Decimal("10"),
+            price=Decimal("100"),
+            timestamp=_TS,
+        ))
         with patch("execution.planner.runtime_store") as mock_rs:
             mock_rs.master_capability = Decimal("1.0")
             order = planner.plan(
@@ -199,6 +210,16 @@ class TestPlannerBasic:
             )
         assert order is not None
         assert order.side == OrderSide.SELL
+
+    def test_sell_intent_rejected_when_no_open_lots(self) -> None:
+        # Fail-safe against hallucinated sells.
+        planner, *_ = _make_planner()
+        with patch("execution.planner.runtime_store") as mock_rs:
+            mock_rs.master_capability = Decimal("1.0")
+            order = planner.plan(
+                _intent(action=Action.SELL), _agent_state(), _snapshot()
+            )
+        assert order == "unsized:no_position"
 
     def test_rebalance_to_returns_buy_order(self) -> None:
         planner, *_ = _make_planner()
@@ -214,13 +235,14 @@ class TestPlannerBasic:
         planner, *_ = _make_planner()
         with patch("execution.planner.runtime_store") as mock_rs:
             mock_rs.master_capability = Decimal("1.0")
-            # target_weight=0.10, equity=1000, vol=0.12, mark=100
-            # mult=1.0 → position_value=100 → qty=1.0 exactly
+            # target_weight=0.10, equity=1000, realized_vol=0.12, mark=100.
+            # Sonnet target_vol=0.175 → vol-target multiplier 1.458 →
+            # position_value ≈ $145.83 → qty ≈ 1.458 (fractional).
             order = planner.plan(_intent(), _agent_state(), _snapshot())
-        assert order is not None
-        # qty should be fractional-capable (not necessarily integer)
+        assert not isinstance(order, str)
         assert isinstance(order.qty, Decimal)
-        assert order.qty == Decimal("1.0")
+        assert order.qty > Decimal("0")
+        assert order.qty != order.qty.to_integral_value()  # confirm fractional
 
     def test_sub_dollar_notional_returns_none(self) -> None:
         planner, *_ = _make_planner()
@@ -231,7 +253,7 @@ class TestPlannerBasic:
                 _agent_state(equity=Decimal("10")),
                 _snapshot(price=Decimal("1000")),
             )
-        assert order is None
+        assert order == "unsized:sub_min"
 
     def test_missing_mark_price_returns_none(self) -> None:
         planner, *_ = _make_planner()
@@ -244,7 +266,7 @@ class TestPlannerBasic:
         with patch("execution.planner.runtime_store") as mock_rs:
             mock_rs.master_capability = Decimal("1.0")
             order = planner.plan(_intent(), _agent_state(), snap)
-        assert order is None
+        assert order == "unsized:no_mark"
 
     def test_letf_sets_is_letf_flag(self) -> None:
         planner, *_, broker = _make_planner()
@@ -279,7 +301,7 @@ class TestDrawdownBuckets:
                 _agent_state(drawdown_bucket=bucket),
                 _snapshot(),
             )
-        return order.qty if order is not None else None
+        return order.qty if not isinstance(order, str) else None
 
     def test_normal_bucket_full_size(self) -> None:
         planner, *_ = _make_planner()
@@ -367,7 +389,7 @@ class TestVixBuckets:
                 _agent_state(),
                 snap,
             )
-        return order.qty if order is not None else None
+        return order.qty if not isinstance(order, str) else None
 
     def test_all_five_vix_buckets_scale_monotonically(self) -> None:
         """Ordered: SWEET_SPOT > ELEVATED > VERY_LOW > STRESS > CRISIS (by scalar)."""
@@ -402,7 +424,7 @@ class TestMasterCapabilityRuntime:
         planner, *_ = _make_planner()
         snap = MarketSnapshot(
             current_prices={"SPY": _MARK},
-            realized_vol_30d={"SPY": Decimal("0.01")},  # max_gross binds
+            realized_vol_30d={"SPY": Decimal("0.20")},  # vol-target binds, no saturation
             vix_bucket=VixBucket.SWEET_SPOT,
             timestamp=_TS,
         )
@@ -417,16 +439,16 @@ class TestMasterCapabilityRuntime:
             mock_rs.master_capability = Decimal("0.5")  # halve MC
             order_2 = planner.plan(intent, state, snap)
 
-        assert order_1 is not None and order_2 is not None
+        assert not isinstance(order_1, str) and not isinstance(order_2, str)
         # MC=0.5 → half the effective_max_gross → half the qty
-        assert order_2.qty == pytest.approx(float(order_1.qty) * 0.5, rel=1e-6)
+        assert float(order_2.qty) == pytest.approx(float(order_1.qty) * 0.5, rel=1e-6)
 
     def test_mc_zero_returns_none(self) -> None:
         planner, *_ = _make_planner()
         with patch("execution.planner.runtime_store") as mock_rs:
             mock_rs.master_capability = Decimal("0")
             order = planner.plan(_intent(), _agent_state(), _snapshot())
-        assert order is None
+        assert isinstance(order, str)  # FORCED_CASH or sub-min
 
 
 # ── Options (MLEG) tests ──────────────────────────────────────────────────────
@@ -486,7 +508,7 @@ class TestOptionsPlanning:
                 _agent_state(equity=Decimal("10")),   # tiny sleeve
                 _snapshot(price=Decimal("500")),       # expensive option
             )
-        assert order is None
+        assert isinstance(order, str)  # tiny premium
 
 
 # ── IntentSizedEvent emission ─────────────────────────────────────────────────
@@ -527,7 +549,7 @@ class TestIntentSizedEvent:
                 _snapshot(),
             )
 
-        assert order is None
+        assert isinstance(order, str)  # sub-$1
         assert len(events) == 0
 
     def test_event_binding_constraint_field(self) -> None:
@@ -594,7 +616,7 @@ class TestCloseIntent:
                 _agent_state(),
                 _snapshot(),
             )
-        assert order is None
+        assert order == "unsized:no_position"
 
 
 # ── Integration: full chain ───────────────────────────────────────────────────
