@@ -20,6 +20,8 @@ data/.cache/
 *.db
 *.db-shm
 *.db-wal
+*.db.bak
+*.bak
 *.duckdb
 *.parquet
 

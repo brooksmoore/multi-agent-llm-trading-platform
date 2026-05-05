@@ -17,7 +17,17 @@ from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 
-from core.types import AgentId, Fill, FillId, Lot, LotId, LotMethod, OrderSide, new_id
+from core.types import (
+    AgentId,
+    Fill,
+    FillId,
+    Lot,
+    LotId,
+    LotMethod,
+    OrderSide,
+    new_id,
+    normalize_symbol,
+)
 
 
 def _to_uuid(v: object) -> uuid.UUID:
@@ -215,13 +225,19 @@ class LotLedger:
     # ── Write operations ──────────────────────────────────────────────────────
 
     def open_lot(self, fill: Fill) -> Lot:
-        """Create and register a new lot from a BUY fill."""
+        """Create and register a new lot from a BUY fill.
+
+        Symbol is normalized to canonical form (slash-stripped). Without this,
+        a single logical position can produce two lots when fills arrive via
+        different paths — e.g. broker stream emits "BTC/USD" while reconciler
+        synthetic fills carry the submitted "BTCUSD" form.
+        """
         if fill.side != OrderSide.BUY:
             raise ValueError(f"open_lot requires a BUY fill, got {fill.side}")
         lot = Lot(
             id=new_id(),
             agent_id=fill.agent_id,
-            symbol=fill.symbol,
+            symbol=normalize_symbol(fill.symbol),
             qty=fill.qty,
             entry_price=fill.price,
             entry_date=fill.timestamp.date(),
@@ -248,6 +264,10 @@ class LotLedger:
         """
         if exit_fill.side != OrderSide.SELL:
             raise ValueError(f"close_lots requires a SELL fill, got {exit_fill.side}")
+
+        # Match against canonical symbol so callers passing either crypto form
+        # (BTC/USD or BTCUSD) hit the same lots that open_lot persisted.
+        symbol = normalize_symbol(symbol)
 
         with self._lock:
             candidates = [
@@ -298,7 +318,12 @@ class LotLedger:
     # ── Read operations ───────────────────────────────────────────────────────
 
     def open_lots(self, agent_id: AgentId, symbol: str) -> list[Lot]:
-        """Return all open (not fully consumed) lots for agent+symbol."""
+        """Return all open (not fully consumed) lots for agent+symbol.
+
+        Accepts either canonical or slashed crypto form; lots are stored in
+        canonical form, so we normalize the lookup key.
+        """
+        symbol = normalize_symbol(symbol)
         with self._lock:
             return [
                 lot for lot in self._lots.values()

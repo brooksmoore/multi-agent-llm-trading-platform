@@ -226,3 +226,42 @@ def test_book_fill_is_idempotent(tmp_path):
     ledger.book_fill(buy)  # duplicate event — must no-op
     ledger.book_fill(buy)
     assert len(ledger.all_lots()) == 1
+
+
+# ── Symbol normalization ──────────────────────────────────────────────────────
+
+
+def test_open_lot_normalizes_crypto_symbol() -> None:
+    """Slashed crypto form ("BTC/USD") must be persisted as "BTCUSD" so it
+    matches the canonical form used by the broker positions API and
+    AgentStateTracker. Without this, a single position can produce two lots
+    when fills arrive via different paths."""
+    ledger = LotLedger()
+    ledger.open_lot(_fill(OrderSide.BUY, "0.01", "80000", symbol="BTC/USD"))
+    lots = ledger.all_lots()
+    assert len(lots) == 1
+    assert lots[0].symbol == "BTCUSD"
+
+
+def test_open_lot_idempotent_across_symbol_forms() -> None:
+    """Two fills on the same logical position arriving in different symbol
+    forms must collapse to one canonical-symbol view, not two distinct lots
+    that downstream lookups can miss."""
+    ledger = LotLedger()
+    ledger.open_lot(_fill(OrderSide.BUY, "0.01", "80000", symbol="BTC/USD"))
+    ledger.open_lot(_fill(OrderSide.BUY, "0.01", "80100", symbol="BTCUSD"))
+    # Two lots (distinct fill ids) but both under canonical symbol.
+    assert ledger.total_open_qty(AgentId.HAIKU, "BTCUSD") == Decimal("0.02")
+    assert ledger.total_open_qty(AgentId.HAIKU, "BTC/USD") == Decimal("0.02")  # also accepts slashed input
+
+
+def test_close_lots_accepts_either_symbol_form() -> None:
+    """SELL paths may pass either form; close_lots normalizes the lookup."""
+    ledger = LotLedger()
+    ledger.open_lot(_fill(OrderSide.BUY, "0.02", "80000", symbol="BTCUSD"))
+    sell = _fill(OrderSide.SELL, "0.01", "82000", day=2, symbol="BTC/USD")
+    affected = ledger.close_lots(
+        agent_id=AgentId.HAIKU, symbol="BTC/USD", qty=Decimal("0.01"), exit_fill=sell,
+    )
+    assert len(affected) == 1
+    assert affected[0].remaining_qty == Decimal("0.01")
