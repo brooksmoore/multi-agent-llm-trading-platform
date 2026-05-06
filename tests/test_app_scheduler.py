@@ -39,6 +39,15 @@ class _StubMD:
     ) -> list[Bar]:
         return []
 
+    def get_bars_batch(  # noqa: ARG002
+        self,
+        symbols: list[str],
+        start: datetime | None = None,
+        end: datetime | None = None,
+        timeframe: Timeframe = Timeframe.DAY,
+    ) -> dict[str, list[Bar]]:
+        return {sym: [] for sym in symbols}
+
     def get_latest_bar(self, symbol: str) -> Bar | None:  # noqa: ARG002
         return None
 

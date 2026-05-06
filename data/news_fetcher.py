@@ -8,6 +8,9 @@ got. The fetcher does not call the LLM; it is pure data plumbing.
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from collections import deque
 from datetime import UTC, datetime, timedelta
 
 from core.types import NewsItem
@@ -15,6 +18,36 @@ from data.news import EDGARAdapter, FinnhubAdapter, RSSAdapter, YFinanceAdapter
 from data.news_store import NewsStore
 
 log = logging.getLogger(__name__)
+
+
+class _RateLimiter:
+    """Token-bucket-ish limiter: at most N calls per `window_s` seconds.
+
+    `acquire()` blocks the caller (with a `sleep` fn the test can swap out)
+    until the next call is permitted, then records it.
+    """
+
+    def __init__(self, max_calls: int, window_s: float, *, sleep=time.sleep) -> None:
+        self._max = max_calls
+        self._window = window_s
+        self._calls: deque[float] = deque()
+        self._lock = threading.Lock()
+        self._sleep = sleep
+
+    def acquire(self) -> None:
+        if self._max <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                cutoff = now - self._window
+                while self._calls and self._calls[0] < cutoff:
+                    self._calls.popleft()
+                if len(self._calls) < self._max:
+                    self._calls.append(now)
+                    return
+                wait = self._window - (now - self._calls[0])
+            self._sleep(max(wait, 0.001))
 
 # Default RSS feeds — broad market coverage, free, no API key required.
 DEFAULT_RSS_FEEDS: list[str] = [
@@ -39,12 +72,19 @@ class NewsFetcher:
         edgar: EDGARAdapter | None = None,
         rss: RSSAdapter | None = None,
         yfinance: YFinanceAdapter | None = None,
+        *,
+        finnhub_rate_per_min: int = 50,
+        yfinance_rate_per_min: int = 90,
+        edgar_rate_per_min: int = 300,
     ) -> None:
         self._store = store
         self._finnhub = finnhub
         self._edgar = edgar
         self._rss = rss
         self._yfinance = yfinance
+        self._finnhub_limiter = _RateLimiter(finnhub_rate_per_min, 60.0)
+        self._yfinance_limiter = _RateLimiter(yfinance_rate_per_min, 60.0)
+        self._edgar_limiter = _RateLimiter(edgar_rate_per_min, 60.0)
 
     def fetch_for_universe(
         self, symbols: list[str], lookback_days: int = 2
@@ -75,11 +115,13 @@ class NewsFetcher:
         equity_symbols = [s for s in symbols if not s.endswith("USD")]
         for sym in equity_symbols:
             if self._finnhub is not None:
+                self._finnhub_limiter.acquire()
                 try:
                     all_items.extend(self._finnhub.get_news(sym, from_dt, now))
                 except Exception:
                     log.warning("Finnhub fetch failed for %s", sym, exc_info=True)
             if self._yfinance is not None:
+                self._yfinance_limiter.acquire()
                 try:
                     all_items.extend(self._yfinance.get_news(sym))
                 except Exception:
@@ -107,6 +149,7 @@ class NewsFetcher:
         all_items: list[NewsItem] = []
         for sym in symbols:
             for form in ("8-K", "10-Q"):
+                self._edgar_limiter.acquire()
                 try:
                     all_items.extend(
                         self._edgar.get_filings(

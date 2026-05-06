@@ -103,16 +103,12 @@ log = logging.getLogger(__name__)
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
-DEFAULT_UNIVERSE: list[str] = [
-    # Haiku equity sleeve (Faber GTAA)
-    "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "IEF", "GLD", "USO", "VNQ",
-    # Tactical leveraged ETF (haiku 1-5d momentum vehicle)
-    "TQQQ",
-    # Sonnet single-name momentum candidates (mega-cap tech)
-    "AAPL", "NVDA", "MSFT", "GOOGL", "AMZN", "META",
-    # Haiku crypto sleeve
-    "BTCUSD", "ETHUSD", "SOLUSD",
-]
+from config.universes import PLUMBING_UNIVERSE
+
+# Plumbing universe = union of every sleeve's tradable list. Each agent
+# applies its own strategy filter at the prompt/factor layer (see
+# config/universes.py and agents/*_agent.py).
+DEFAULT_UNIVERSE: list[str] = list(PLUMBING_UNIVERSE)
 
 # ─── Scheduler job IDs (used by tests and introspection) ─────────────────────
 
@@ -479,17 +475,15 @@ class App:
         symbols = symbols if symbols is not None else self.universe
         emg_agent = agent_id if agent_id is not None else AgentId.HAIKU
 
-        bars_by_symbol: dict[str, list[Bar]] = {}
+        try:
+            bars_by_symbol = self.market_data.get_bars_batch(
+                list(symbols), start=ts - timedelta(days=400), end=ts
+            )
+        except Exception:
+            log.warning("get_bars_batch failed", exc_info=True)
+            bars_by_symbol = {}
         for sym in symbols:
-            try:
-                bars_by_symbol[sym] = list(
-                    self.market_data.get_bars(
-                        sym, start=ts - timedelta(days=400), end=ts
-                    )
-                )
-            except Exception:
-                log.warning("get_bars failed for %s", sym, exc_info=True)
-                bars_by_symbol[sym] = []
+            bars_by_symbol.setdefault(sym, [])
 
         try:
             broker_positions = list(self.broker.list_positions())
@@ -558,7 +552,8 @@ class App:
         try:
             news_since = ts - timedelta(hours=24)
             news_items = self.news_store.recent_for_symbols(
-                symbols=symbols, since=news_since, limit=40,
+                symbols=symbols, since=news_since, limit=80,
+                per_symbol_limit=3,
             )
         except Exception:
             log.warning("news_store.recent_for_symbols failed", exc_info=True)
@@ -1050,6 +1045,18 @@ class App:
     # Manager --------------------------------------------------------------
     def _build_manager_ctx(self, state: AgentState):
         """Assemble the full Manager analytics context. Tolerant of partial data."""
+        # OBSERVATIONAL — SPYProvider feeds the growth_metrics_v2 block (daily
+        # hit-rate vs SPY). Manager v1 prompt does not act on it; we log it
+        # now so v2 has historical data when/if we promote it. Lazy import so
+        # offline/tests don't pull the dashboard module unless actually used.
+        spy_provider = None
+        try:
+            from dashboard.spy import SPYProvider  # noqa: PLC0415
+            if not hasattr(self, "_spy_provider_for_manager"):
+                self._spy_provider_for_manager = SPYProvider()
+            spy_provider = self._spy_provider_for_manager
+        except Exception:
+            log.debug("SPYProvider unavailable for manager v2 metrics", exc_info=True)
         try:
             return build_manager_context(
                 state_vix=state.vix_value,
@@ -1059,6 +1066,7 @@ class App:
                 broker=self.broker,
                 news_store=self.news_store,
                 memories=self._memories,
+                spy_provider=spy_provider,
             )
         except Exception:
             log.exception("build_manager_context failed; manager will run blind")
@@ -1354,17 +1362,22 @@ class App:
                 raise RuntimeError(
                     "AlpacaMarketData requires alpaca-py; pass market_data= for tests"
                 ) from exc
-            return AlpacaMarketData(
+            underlying: MarketData = AlpacaMarketData(
                 api_key=self.settings.alpaca_api_key,
                 secret_key=self.settings.alpaca_secret_key,
             )
-        if source == "yfinance":
+        elif source == "yfinance":
             from data.market import YFinanceMarketData  # noqa: PLC0415
-            return YFinanceMarketData(
+            underlying = YFinanceMarketData(
                 alpaca_api_key=self.settings.alpaca_api_key,
                 alpaca_secret_key=self.settings.alpaca_secret_key,
             )
-        raise ValueError(f"Unknown market_data_source: {source!r}")
+        else:
+            raise ValueError(f"Unknown market_data_source: {source!r}")
+
+        from data.bar_cache import BarCache, CachedMarketData  # noqa: PLC0415
+        cache = BarCache(Path(self.settings.data_dir) / "bars_cache.db")
+        return CachedMarketData(underlying, cache)
 
     def _load_macro_calendar(self) -> list[dict[str, Any]]:
         path = Path(__file__).parent / "config" / "macro_events.yaml"

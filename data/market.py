@@ -70,6 +70,14 @@ class MarketData(Protocol):
         timeframe: Timeframe = Timeframe.DAY,
     ) -> list[Bar]: ...
 
+    def get_bars_batch(
+        self,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+        timeframe: Timeframe = Timeframe.DAY,
+    ) -> dict[str, list[Bar]]: ...
+
     def get_latest_bar(self, symbol: str) -> Bar | None: ...
 
     def get_latest_quote(self, symbol: str) -> Quote | None: ...
@@ -100,6 +108,31 @@ class AlpacaMarketData:
             ),
         )
         return [self._to_bar(symbol, ab) for ab in result.data.get(symbol, [])]
+
+    def get_bars_batch(
+        self,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+        timeframe: Timeframe = Timeframe.DAY,
+    ) -> dict[str, list[Bar]]:
+        if not symbols:
+            return {}
+        result = cast(
+            "BarSet",
+            self._client.get_stock_bars(
+                StockBarsRequest(
+                    symbol_or_symbols=list(symbols),
+                    timeframe=_tf_map[timeframe],
+                    start=start,
+                    end=end,
+                )
+            ),
+        )
+        out: dict[str, list[Bar]] = {sym: [] for sym in symbols}
+        for sym in symbols:
+            out[sym] = [self._to_bar(sym, ab) for ab in result.data.get(sym, [])]
+        return out
 
     def get_latest_bar(self, symbol: str) -> Bar | None:
         result = cast(
@@ -274,6 +307,84 @@ class YFinanceMarketData:
                 continue
         return bars
 
+    def get_bars_batch(
+        self,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+        timeframe: Timeframe = Timeframe.DAY,
+    ) -> dict[str, list[Bar]]:
+        if not symbols:
+            return {}
+        out: dict[str, list[Bar]] = {sym: [] for sym in symbols}
+
+        # Crypto: still per-symbol via Alpaca crypto client (CryptoBarsRequest
+        # does accept a list, but the count is tiny so it's not worth a second
+        # code path here).
+        equity_syms: list[str] = []
+        for sym in symbols:
+            if self._is_crypto(sym):
+                bars = self._alpaca_crypto_bars(sym, start, end)
+                if bars:
+                    out[sym] = bars
+                else:
+                    equity_syms.append(sym)  # fall through to yfinance batch
+            else:
+                equity_syms.append(sym)
+
+        if not equity_syms:
+            return out
+
+        import yfinance as yf  # noqa: PLC0415
+
+        yf_to_orig = {self._yf_symbol(s): s for s in equity_syms}
+        df = yf.download(
+            tickers=list(yf_to_orig.keys()),
+            start=start,
+            end=end,
+            interval="1d",
+            auto_adjust=False,
+            group_by="ticker",
+            progress=False,
+            threads=True,
+        )
+        if df is None or df.empty:
+            return out
+
+        # yf.download returns a multi-index frame when given >1 ticker, or a
+        # flat OHLCV frame for a single ticker.
+        single_ticker = len(yf_to_orig) == 1
+        for yf_sym, orig_sym in yf_to_orig.items():
+            try:
+                sub = df if single_ticker else df[yf_sym]
+            except KeyError:
+                continue
+            if sub is None or sub.empty:
+                continue
+            bars: list[Bar] = []
+            for ts, row in sub.iterrows():
+                ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+                try:
+                    o, h, l, c, v = row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
+                    if o != o or c != c:  # NaN guard
+                        continue
+                    bars.append(
+                        Bar(
+                            symbol=orig_sym,
+                            timestamp=ts_dt,
+                            open=Decimal(str(o)),
+                            high=Decimal(str(h)),
+                            low=Decimal(str(l)),
+                            close=Decimal(str(c)),
+                            volume=int(v) if v == v else 0,
+                        )
+                    )
+                except (KeyError, ValueError, TypeError):
+                    continue
+            if bars:
+                out[orig_sym] = bars
+        return out
+
     def get_latest_bar(self, symbol: str) -> Bar | None:
         if self._is_crypto(symbol):
             from datetime import UTC, timedelta  # noqa: PLC0415
@@ -340,6 +451,18 @@ class ReplayMarketData:
         timeframe: Timeframe = Timeframe.DAY,
     ) -> list[Bar]:
         return [b for b in self._bars.get(symbol, []) if start <= b.timestamp <= end]
+
+    def get_bars_batch(
+        self,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+        timeframe: Timeframe = Timeframe.DAY,
+    ) -> dict[str, list[Bar]]:
+        return {
+            sym: [b for b in self._bars.get(sym, []) if start <= b.timestamp <= end]
+            for sym in symbols
+        }
 
     def get_latest_bar(self, symbol: str) -> Bar | None:
         bars = self._bars.get(symbol, [])

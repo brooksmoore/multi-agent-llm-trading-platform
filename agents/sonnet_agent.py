@@ -11,8 +11,13 @@ from typing import Any
 from agents.base import AgentState, BaseAgent, format_news_block, render_system_prompt
 from agents.llm import LLMClient
 from agents.memory import AgentMemory
+from config.universes import SONNET_EQUITY_UNIVERSE, GROWTH_SLICE_UNIVERSE
 from core.types import Action, AgentId, Intent, KillSwitchState, Sleeve, new_id
 from data.market import Bar
+
+_SONNET_TRADABLE: frozenset[str] = frozenset(
+    [*SONNET_EQUITY_UNIVERSE, *GROWTH_SLICE_UNIVERSE]
+)
 
 _log = logging.getLogger(__name__)
 
@@ -105,9 +110,16 @@ class SonnetAgent(BaseAgent):
     def _compute_factor_signals(
         self, bars_by_symbol: dict[str, list[Bar]]
     ) -> dict[str, dict[str, Any]]:
-        """Compute price momentum proxy for each symbol with sufficient history."""
+        """Compute price momentum proxy for each symbol with sufficient history.
+
+        Filters the input to Sonnet's tradable equity universe — ETFs and
+        crypto carried in the plumbing universe must not pollute the
+        cross-sectional momentum ranking.
+        """
         result: dict[str, dict[str, Any]] = {}
         for symbol, bars in bars_by_symbol.items():
+            if symbol not in _SONNET_TRADABLE:
+                continue
             sorted_bars = sorted(bars, key=lambda b: b.timestamp)
             closes = [b.close for b in sorted_bars]
             mom = _price_momentum(closes, _MOMENTUM_LOOKBACK, _MOMENTUM_SKIP)

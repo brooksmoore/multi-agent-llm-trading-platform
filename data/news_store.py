@@ -86,15 +86,25 @@ class NewsStore:
         symbols: list[str],
         since: datetime,
         limit: int = 50,
+        per_symbol_limit: int | None = None,
     ) -> list[NewsItem]:
         """Return items whose symbol overlap is in `symbols` and published since `since`.
 
         Sorted by published_at DESC. Each item appears once even if it matches
         multiple symbols.
+
+        When ``per_symbol_limit`` is set, no single symbol contributes more
+        than that many items — protects wide universes from a few hot names
+        starving everything else. ``limit`` is the final cap on the result.
         """
         if not symbols:
             return []
         placeholders = ",".join("?" * len(symbols))
+        # Fetch a generous global pool sorted by recency; we trim per-symbol
+        # in Python so multi-symbol items count correctly against quotas.
+        pool_size = limit if per_symbol_limit is None else max(
+            limit, per_symbol_limit * len(symbols) * 2
+        )
         sql = (
             f"SELECT DISTINCT n.url, n.source, n.headline, n.published_at, "
             f"  n.summary, n.sentiment, n.body "
@@ -103,27 +113,42 @@ class NewsStore:
             f"WHERE s.symbol IN ({placeholders}) AND n.published_at >= ? "
             f"ORDER BY n.published_at DESC LIMIT ?"
         )
-        params: list[object] = [*symbols, since.isoformat(), limit]
+        params: list[object] = [*symbols, since.isoformat(), pool_size]
         with self._lock, self._connect() as con:
             rows = con.execute(sql, params).fetchall()
+
+        requested = set(symbols)
+        per_symbol_count: dict[str, int] = {sym: 0 for sym in symbols}
         items: list[NewsItem] = []
         for url, source, headline, published_at, summary, sentiment, body in rows:
             with self._lock, self._connect() as con:
                 sym_rows = con.execute(
                     "SELECT symbol FROM news_symbols WHERE url = ?", (url,)
                 ).fetchall()
+            item_symbols = tuple(r[0] for r in sym_rows)
+            relevant = [s for s in item_symbols if s in requested]
+
+            if per_symbol_limit is not None:
+                # Accept only if at least one relevant symbol still has quota.
+                if not any(per_symbol_count[s] < per_symbol_limit for s in relevant):
+                    continue
+                for s in relevant:
+                    per_symbol_count[s] += 1
+
             items.append(
                 NewsItem(
                     source=NewsSource(source),
                     headline=headline,
                     url=url,
                     published_at=datetime.fromisoformat(published_at),
-                    symbols=tuple(r[0] for r in sym_rows),
+                    symbols=item_symbols,
                     summary=summary,
                     sentiment=sentiment,
                     body=body,
                 )
             )
+            if len(items) >= limit:
+                break
         return items
 
     def prune_older_than(self, cutoff: datetime) -> int:

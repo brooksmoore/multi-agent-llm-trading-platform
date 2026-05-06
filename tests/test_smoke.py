@@ -54,6 +54,15 @@ class _StubMD:
     ) -> list[Bar]:
         return list(self._bars.get(symbol, []))
 
+    def get_bars_batch(
+        self,
+        symbols: list[str],
+        start: datetime | None = None,
+        end: datetime | None = None,
+        timeframe: Timeframe = Timeframe.DAY,
+    ) -> dict[str, list[Bar]]:
+        return {sym: list(self._bars.get(sym, [])) for sym in symbols}
+
     def get_latest_bar(self, symbol: str) -> Bar | None:
         bars = self._bars.get(symbol)
         return bars[-1] if bars else None
