@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
 
 from config.runtime_store import runtime_store
+from config.universes import estimated_slippage_bps
 from core.events import EventBus, IntentSizedEvent
 from core.types import (
     Action,
@@ -217,6 +218,8 @@ class ExecutionPlanner:
             is_letf=symbol in LETF_WHITELIST,
         )
 
+        slip_bps = estimated_slippage_bps(symbol)
+
         self._bus.publish(
             IntentSizedEvent(
                 intent_id=intent.id,
@@ -229,17 +232,19 @@ class ExecutionPlanner:
                 effective_max_gross_val=emg,
                 realized_vol_30d=realized_vol,
                 binding_constraint=binding,
+                estimated_slippage_bps=slip_bps,
             )
         )
 
         log.info(
-            "planner: %s %s %s qty=%.6f notional=$%.2f binding=%s",
+            "planner: %s %s %s qty=%.6f notional=$%.2f binding=%s est_slip=%sbps",
             intent.agent_id,
             side,
             symbol,
             qty,
             position_value,
             binding,
+            slip_bps,
         )
         return order
 
@@ -314,6 +319,7 @@ class ExecutionPlanner:
                 effective_max_gross_val=emg,
                 realized_vol_30d=Decimal("0.08"),
                 binding_constraint="close",
+                estimated_slippage_bps=estimated_slippage_bps(symbol),
             )
         )
         return order

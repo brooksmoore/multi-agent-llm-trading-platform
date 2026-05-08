@@ -164,6 +164,11 @@ class IntentSizedEvent(Event):
     effective_max_gross_val: Decimal = Decimal("0")
     realized_vol_30d: Decimal = Decimal("0")
     binding_constraint: str = ""  # "vol_target" | "max_gross" | "close"
+    # Estimated one-sided slippage for this fill, in basis points. Sourced
+    # from config.universes.estimated_slippage_bps. Currently observational
+    # only — not subtracted from position_value_usd until the bps numbers
+    # have been calibrated against live paper fills (see config/universes.py).
+    estimated_slippage_bps: Decimal = Decimal("0")
 
 
 # ─── Sentinel factories (only used as dataclass defaults) ─────────────────────

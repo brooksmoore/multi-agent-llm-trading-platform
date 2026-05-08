@@ -384,6 +384,31 @@ class App:
         self._started_at = datetime.now(UTC)
         log.info("App: started at %s (universe=%s)", self._started_at, self.universe)
 
+        # Surface the Manager's current sleeve-weight allocation at boot so
+        # silent staleness ({} = no reallocation has run yet) is visible in
+        # the log instead of inferred from the absence of writes. The first
+        # real reallocation only fires every 4th Friday (iso_week % 4 == 0).
+        from agents.manager_bridge import SLEEVE_WEIGHTS_FILE, read_sleeve_weights
+        weights = read_sleeve_weights()
+        if weights:
+            log.info(
+                "manager_bridge: active sleeve weights from %s: %s",
+                SLEEVE_WEIGHTS_FILE,
+                {str(k).split(".")[-1]: str(v) for k, v in weights.items()},
+            )
+        else:
+            mtime = (
+                SLEEVE_WEIGHTS_FILE.stat().st_mtime
+                if SLEEVE_WEIGHTS_FILE.exists() else None
+            )
+            log.warning(
+                "manager_bridge: no active sleeve weights (file=%s exists=%s mtime=%s)"
+                " — sleeves running at base 1.0× until next 4-week reallocation",
+                SLEEVE_WEIGHTS_FILE,
+                SLEEVE_WEIGHTS_FILE.exists(),
+                datetime.fromtimestamp(mtime, UTC).isoformat() if mtime else "n/a",
+            )
+
     def stop(self) -> None:
         """Shut everything down gracefully and write a shutdown summary."""
         with self._stop_lock:
