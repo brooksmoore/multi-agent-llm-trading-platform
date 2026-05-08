@@ -71,6 +71,16 @@ _TERMINAL_STATES: frozenset[OrderState] = frozenset({
     OrderState.EXPIRED,
 })
 
+# Brokers round fill qty (typically 9dp) while order qty may carry more
+# precision from sizing math. Treat as fully filled when residual is below
+# this tolerance so orders don't get stuck PARTIALLY_FILLED. Used on both
+# the live fill path and the log-replay path so recovery agrees with prod.
+_FILL_QTY_TOLERANCE: Decimal = Decimal("1e-9")
+
+
+def _is_fully_filled(order_qty: Decimal, filled_qty: Decimal) -> bool:
+    return (order_qty - filled_qty) < _FILL_QTY_TOLERANCE
+
 
 # ─── Result types ─────────────────────────────────────────────────────────────
 
@@ -339,6 +349,82 @@ class OMS:
             symbol, qty, price, agent_id,
         )
 
+    def book_fee_offset(
+        self,
+        symbol: str,
+        qty: Decimal,
+        price: Decimal,
+        agent_id: AgentId,
+        ts: datetime,
+    ) -> None:
+        """Inject a synthetic SELL fill to write a position down by `qty`.
+
+        Used to reconcile a previously-recorded gross fill with the net qty
+        the broker actually delivered (e.g. Alpaca's in-kind crypto fee). The
+        ghost SELL flows through the normal fill machinery, so the lot ledger
+        closes `qty` from the symbol's open lots via FIFO and OMS-computed
+        positions agree with the broker on the next reconcile pass. Persisted
+        to the event log so recover() replays the adjustment idempotently.
+        """
+        ghost_order_id = new_id()
+        ghost_broker_id = f"ghost-fee-{ghost_order_id}"
+
+        ghost_order = Order(
+            id=ghost_order_id,
+            intent_id=new_id(),
+            agent_id=agent_id,
+            symbol=symbol,
+            side=OrderSide.SELL,
+            qty=qty,
+            order_type=OrderType.MARKET,
+            order_class=OrderClass.SIMPLE,
+            time_in_force=TimeInForce.GTC,
+            state=OrderState.PENDING,
+            created_at=ts,
+        )
+        fill = Fill(
+            id=new_id(),
+            order_id=ghost_order_id,
+            agent_id=agent_id,
+            symbol=symbol,
+            side=OrderSide.SELL,
+            qty=qty,
+            price=price,
+            timestamp=ts,
+            commission=Decimal("0"),
+            is_partial=False,
+        )
+
+        with self._lock:
+            self._orders[ghost_order_id] = ghost_order
+            self._fsms[ghost_order_id] = build_order_fsm(OrderState.PENDING)
+            self._fills_by_order[ghost_order_id] = []
+
+            self._store.append(EventKind.ORDER_SUBMIT_INTENT, ghost_order_id,
+                               _serialize_order(ghost_order), ts)
+            self._fsms[ghost_order_id].trigger(OrderEvent.SUBMIT)
+            self._orders[ghost_order_id] = replace(
+                self._orders[ghost_order_id], state=OrderState.SUBMITTED)
+
+            self._store.append(EventKind.ORDER_ACCEPTED, ghost_order_id,
+                               {"broker_order_id": ghost_broker_id}, ts)
+            self._broker_id_to_order[ghost_broker_id] = ghost_order_id
+            self._orders[ghost_order_id] = replace(
+                self._orders[ghost_order_id],
+                broker_order_id=ghost_broker_id,
+                submitted_at=ts,
+            )
+            self._fsms[ghost_order_id].trigger(OrderEvent.ACCEPT)
+            self._orders[ghost_order_id] = replace(
+                self._orders[ghost_order_id], state=OrderState.ACCEPTED)
+
+            self._handle_fill(ghost_order_id, fill, ts=ts)
+
+        logger.info(
+            "OMS: booked fee offset %s qty=%.6f @ %.4f for agent=%s",
+            symbol, qty, price, agent_id,
+        )
+
     # ─── Recovery ─────────────────────────────────────────────────────────────
 
     def recover(self) -> ReconcileSummary:
@@ -443,10 +529,7 @@ class OMS:
 
         # Update aggregated Order snapshot
         new_filled_qty = order.filled_qty + fill.qty
-        # Tolerance: brokers round fill qty (typically 9dp) while the order qty
-        # may carry more precision from sizing math. Treat as fully filled when
-        # the residual is below 1e-9 to avoid orders stuck in PARTIALLY_FILLED.
-        is_full = (order.qty - new_filled_qty) < Decimal("1e-9")
+        is_full = _is_fully_filled(order.qty, new_filled_qty)
         if order.filled_avg_price is None:
             new_avg = fill.price
         else:
@@ -591,7 +674,7 @@ class OMS:
                 self._fills_by_order.setdefault(order_id, []).append(fill)
                 order = self._orders[order_id]
                 new_filled = order.filled_qty + fill.qty
-                is_full = new_filled >= order.qty
+                is_full = _is_fully_filled(order.qty, new_filled)
                 if order.filled_avg_price is None:
                     new_avg = fill.price
                 else:

@@ -12,7 +12,6 @@ from decimal import Decimal
 
 from agents.base import AgentState, format_news_block
 from core.types import (
-    AgentId,
     KillSwitchState,
     NewsItem,
     NewsSource,

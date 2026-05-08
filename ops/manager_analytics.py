@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from math import sqrt
@@ -83,6 +83,14 @@ class ManagerContext:
     # misinterpreting sparse-but-valid data (e.g. cold-start 0% returns, no
     # closed lots) as a data pipeline outage.
     data_health: str = ""
+    # OBSERVATIONAL — v2-prompt prep, not yet consumed by any manager logic.
+    # Logs the metrics a future "growth-tilted CIO" prompt would optimize for:
+    # daily hit-rate vs SPY, rolling 20d portfolio compound return, and the
+    # 21-day (~1mo) compound pace vs the aspirational 2x-monthly target. We
+    # render it into the prompt block so it shows up in journal/critique
+    # context for human eyes, but the v1 prompt does not act on it. When/if
+    # we promote a v2 prompt, these metrics already have history.
+    growth_metrics_v2: str = ""
 
     def as_prompt_block(self) -> str:
         """One-shot block suitable for prepending to any Manager user message."""
@@ -99,6 +107,8 @@ class ManagerContext:
             ("Top intents this week",  self.top_intents_this_week),
             ("Prior regime read",      self.prior_regime_read),
             ("Calibration summary",    self.calibration_summary_all),
+            # OBSERVATIONAL block — see field doc on growth_metrics_v2 above.
+            ("Growth metrics (v2 obs)", self.growth_metrics_v2),
         ]
         lines: list[str] = ["=== Manager portfolio context ==="]
         for label, body in sections:
@@ -321,15 +331,27 @@ def _build_macro_snapshot(state_vix: Decimal | None, news_store: NewsStore) -> s
     return f"{vix_str}\nRecent macro headlines:\n" + "\n".join(blocks)
 
 
-def _build_portfolio_beta(broker: Broker | None) -> str:
-    """Weighted-average beta of current holdings."""
-    if broker is None:
+def _build_portfolio_beta(
+    broker: Broker | None,
+    *,
+    snapshot: tuple[list, object] | None = None,
+) -> str:
+    """Weighted-average beta of current holdings.
+
+    `snapshot` lets the caller hoist a single broker fetch and share it across
+    builders (we'd otherwise hit list_positions() + get_account() twice per
+    manager context render — 4 broker round-trips for the same data).
+    """
+    if snapshot is not None:
+        positions, account = snapshot
+    elif broker is None:
         return "n/a (no broker)"
-    try:
-        positions = list(broker.list_positions())
-        account = broker.get_account()
-    except Exception:
-        return "n/a (broker unavailable)"
+    else:
+        try:
+            positions = list(broker.list_positions())
+            account = broker.get_account()
+        except Exception:
+            return "n/a (broker unavailable)"
     if not positions:
         return "0.00 (flat — all cash)"
     total_mv = sum(
@@ -352,15 +374,26 @@ def _build_portfolio_beta(broker: Broker | None) -> str:
     return f"{float(weighted_beta):+.2f}{note}"
 
 
-def _build_sector_exposures(broker: Broker | None) -> str:
-    """Dollar exposure by sector with portfolio-weight column."""
-    if broker is None:
+def _build_sector_exposures(
+    broker: Broker | None,
+    *,
+    snapshot: tuple[list, object] | None = None,
+) -> str:
+    """Dollar exposure by sector with portfolio-weight column.
+
+    See `_build_portfolio_beta` for the rationale behind the optional
+    `snapshot` (avoids re-fetching positions + account from the broker).
+    """
+    if snapshot is not None:
+        positions, account = snapshot
+    elif broker is None:
         return "n/a (no broker)"
-    try:
-        positions = list(broker.list_positions())
-        account = broker.get_account()
-    except Exception:
-        return "n/a (broker unavailable)"
+    else:
+        try:
+            positions = list(broker.list_positions())
+            account = broker.get_account()
+        except Exception:
+            return "n/a (broker unavailable)"
     if not positions:
         return "(flat — 100% cash)"
     equity = account.equity if account.equity > 0 else Decimal("1")
@@ -557,6 +590,116 @@ def _build_data_health(
     return "\n".join(lines)
 
 
+# ── Growth metrics v2 (observational) ─────────────────────────────────────────
+#
+# These metrics exist to start logging what a future "growth-tilted CIO" prompt
+# (v2) would optimize for, while the v1 risk-discipline prompt is still active.
+# Nothing in the manager's decision logic reads them today — they're rendered
+# into the prompt block purely so the human reviewer (and journal) sees them
+# accumulate over the next few weeks. When we're ready to promote v2, we'll
+# already have weeks of history instead of starting from zero.
+#
+# Two metrics computed here:
+#   1. daily_vs_spy_hit_rate — % of trading days where the portfolio's daily
+#      return exceeded SPY's daily return. v1 prompt does not see this; v2
+#      would weight it at 0.3 in the blended reallocation score.
+#   2. rolling_compound — last 20 trading days' total compound return, plus
+#      the trailing 21-day pace vs the aspirational 2x-monthly target
+#      (2x monthly ≈ +100% over 21 trading days). Lets us see how far off
+#      reality is from the gradient v2 would push toward.
+
+
+def _build_growth_metrics_v2(
+    history: list[dict[str, Decimal | None]],
+    spy_provider: object | None,
+) -> str:
+    """Observational v2-prompt metrics. Safe on cold-start / missing SPY feed."""
+    nav_rows = [
+        (r["ts"][:10], r["total_nav"])
+        for r in history
+        if r["total_nav"] is not None and r["total_nav"] > 0
+    ]
+    if len(nav_rows) < 2:
+        return (
+            "FEED_OK / insufficient history (<2 NAV rows). "
+            "Daily-vs-SPY hit-rate and rolling compound need ≥2 trading days."
+        )
+
+    # Portfolio daily returns keyed by date (calendar day, ISO).
+    port_daily: dict[str, float] = {}
+    for i in range(1, len(nav_rows)):
+        prev_date, prev_nav = nav_rows[i - 1]
+        curr_date, curr_nav = nav_rows[i]
+        if prev_date == curr_date:
+            continue  # multiple snapshots same day — keep last-vs-prior-day only
+        port_daily[curr_date] = (float(curr_nav) - float(prev_nav)) / float(prev_nav)
+
+    # Trailing 20 portfolio days for the compound metric (independent of SPY feed).
+    last_20 = list(port_daily.values())[-20:]
+    compound_20d = 1.0
+    for r in last_20:
+        compound_20d *= (1.0 + r)
+    compound_20d_pct = (compound_20d - 1.0) * 100.0
+
+    last_21 = list(port_daily.values())[-21:]
+    compound_21d = 1.0
+    for r in last_21:
+        compound_21d *= (1.0 + r)
+    compound_21d_pct = (compound_21d - 1.0) * 100.0
+    # 2x monthly = +100% over ~21 trading days. Pace is fraction of that.
+    monthly_pace = compound_21d_pct / 100.0  # 1.0 == on pace for 2x/month
+
+    lines = [
+        f"Portfolio compound (last {len(last_20)} trading days): "
+        f"{compound_20d_pct:+.2f}%",
+        f"Portfolio compound (trailing 21d ~ 1mo): {compound_21d_pct:+.2f}% "
+        f"(2x-monthly pace = {monthly_pace*100:+.1f}% of target)",
+    ]
+
+    # SPY hit-rate — only if SPYProvider is available and has data.
+    if spy_provider is None:
+        lines.append("Daily vs SPY hit-rate: n/a (SPYProvider not wired)")
+        return "\n".join(lines)
+    try:
+        spy_closes: list[tuple[str, Decimal]] = spy_provider.daily_closes(days=60)  # type: ignore[attr-defined]
+    except Exception as exc:
+        lines.append(f"Daily vs SPY hit-rate: FEED_ERROR ({exc})")
+        return "\n".join(lines)
+
+    if len(spy_closes) < 2:
+        lines.append("Daily vs SPY hit-rate: FEED_OK / SPY feed empty or cold-start")
+        return "\n".join(lines)
+
+    spy_daily: dict[str, float] = {}
+    for i in range(1, len(spy_closes)):
+        prev_d, prev_c = spy_closes[i - 1]
+        curr_d, curr_c = spy_closes[i]
+        if float(prev_c) > 0:
+            spy_daily[curr_d] = (float(curr_c) - float(prev_c)) / float(prev_c)
+
+    # Align by date — only count days where both feeds have a return.
+    paired = [
+        (port_daily[d], spy_daily[d])
+        for d in port_daily
+        if d in spy_daily
+    ]
+    if not paired:
+        lines.append(
+            "Daily vs SPY hit-rate: 0 overlapping trading days "
+            "(portfolio and SPY date-keys don't intersect yet)"
+        )
+        return "\n".join(lines)
+
+    wins = sum(1 for p, s in paired if p > s)
+    hit_rate = wins / len(paired) * 100.0
+    avg_excess = sum(p - s for p, s in paired) / len(paired) * 100.0
+    lines.append(
+        f"Daily vs SPY hit-rate: {hit_rate:.1f}% over {len(paired)} day(s) "
+        f"(avg daily excess return: {avg_excess:+.3f}%)"
+    )
+    return "\n".join(lines)
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 
@@ -570,12 +713,26 @@ def build_manager_context(
     news_store: NewsStore,
     memories: dict[AgentId, AgentMemory],
     lookback_days: int = 28,
+    # OBSERVATIONAL — pass a SPYProvider to populate growth_metrics_v2 with
+    # daily-vs-SPY hit-rate. Optional; if None, that line shows "n/a".
+    spy_provider: object | None = None,
 ) -> ManagerContext:
     """Assemble the full Manager context. Each section degrades gracefully on error."""
     since = datetime.now(UTC) - timedelta(days=lookback_days)
     history = _query_equity_history(snapshot_db, since)
 
     aggregate_nav, peak_nav, dd_pct = _build_nav_blocks(history, broker)
+
+    # Hoist broker positions+account once and share across builders.
+    # Without this, _build_portfolio_beta and _build_sector_exposures each
+    # round-trip to the broker independently (4 calls instead of 2).
+    broker_snapshot: tuple[list, object] | None = None
+    if broker is not None:
+        try:
+            broker_snapshot = (list(broker.list_positions()), broker.get_account())
+        except Exception:
+            broker_snapshot = None
+
     return ManagerContext(
         data_health=_build_data_health(history, snapshot_db, memories, broker, lots, since),
         aggregate_nav=aggregate_nav,
@@ -583,10 +740,11 @@ def build_manager_context(
         current_dd_pct=dd_pct,
         four_week_snapshot=_build_four_week_snapshot(history, tracker),
         macro_snapshot=_build_macro_snapshot(state_vix, news_store),
-        portfolio_beta=_build_portfolio_beta(broker),
-        sector_exposures=_build_sector_exposures(broker),
+        portfolio_beta=_build_portfolio_beta(broker, snapshot=broker_snapshot),
+        sector_exposures=_build_sector_exposures(broker, snapshot=broker_snapshot),
         tax_events_summary=_build_tax_events(lots),
         top_intents_this_week=_build_top_intents_week(memories),
         prior_regime_read=_build_prior_regime_read(memories[AgentId.MANAGER]),
         calibration_summary_all=_build_calibration_summary(memories),
+        growth_metrics_v2=_build_growth_metrics_v2(history, spy_provider),
     )

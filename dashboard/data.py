@@ -301,11 +301,31 @@ class DashboardData:
         if self._oms is None:
             return []
         events = self._oms.recent_by_kind(EventKind.FILL_RECEIVED, n)
+
+        # Build the intent_id → rationale lookup ONCE per call. The previous
+        # implementation re-fetched every agent's last 200 intent rows for
+        # every fill, which is N_fills × N_agents × 200 row scans per 3s
+        # dashboard poll. We need at most one fetch per agent regardless of
+        # how many fills are returned.
+        rationale_by_intent: dict[str, str] = {}
+        for aid, mem in self._memories.items():
+            try:
+                for row in mem.recent_intents_rows(200):
+                    iid = str(row.get("intent_id") or "")
+                    if iid:
+                        rationale_by_intent[iid] = (
+                            str(row.get("rationale") or "")[:200]
+                        )
+            except Exception:
+                continue
+
         rows: list[FillRow] = []
         for ev in events:
             qty = _as_decimal(ev.payload.get("qty", 0))
             price = _as_decimal(ev.payload.get("price", 0))
-            agent_id, rationale = self._lookup_intent_for_order(ev.order_id)
+            agent_id, rationale = self._lookup_intent_for_order(
+                ev.order_id, rationale_by_intent,
+            )
             rows.append(
                 FillRow(
                     timestamp=ev.ts.isoformat(),
@@ -321,9 +341,14 @@ class DashboardData:
             )
         return rows
 
-    def _lookup_intent_for_order(self, order_id: Any) -> tuple[str, str]:
+    def _lookup_intent_for_order(
+        self,
+        order_id: Any,
+        rationale_by_intent: dict[str, str] | None = None,
+    ) -> tuple[str, str]:
         """Walk the order's events for the submit_intent and pull agent_id +
-        rationale from the matching agent's memory by intent_id."""
+        rationale via the prebuilt map (or fall back to a per-agent scan
+        when callers don't provide one)."""
         if self._oms is None:
             return "", ""
         intent_id: str = ""
@@ -342,6 +367,8 @@ class DashboardData:
             return "", ""
         if not intent_id or not agent_id:
             return agent_id, ""
+        if rationale_by_intent is not None:
+            return agent_id, rationale_by_intent.get(intent_id, "")
         for aid, mem in self._memories.items():
             short = str(aid).split(".")[-1].lower()
             if short != agent_id.lower():

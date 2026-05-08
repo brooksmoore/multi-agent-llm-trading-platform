@@ -121,7 +121,7 @@ print(f"  per-combo avg: {t_sweep_total/len(combos)*1000:.1f} ms")
 
 # 5. Walk-forward CV projection
 N_WF = 24
-print(f"\n--- walk-forward window sweep (subset) ---")
+print("\n--- walk-forward window sweep (subset) ---")
 # Use a 36-month training window (~756 bars) for a realistic WF fold
 wf_bars = min(N_BARS - 60, 756)
 wf_close = close[:wf_bars]

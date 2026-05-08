@@ -23,7 +23,7 @@ from decimal import Decimal
 
 from core.events import EventBus, KillSwitchResetEvent, KillSwitchTrippedEvent
 from core.types import AgentId, Fill, KillSwitchState, Order, OrderSide, OrderState, new_id
-from execution.broker import Broker, BrokerOrderEvent, BrokerOrderState, BrokerPosition
+from execution.broker import Broker, BrokerOrderEvent, BrokerOrderState, BrokerPosition, BrokerUnavailable
 from execution.kill_switch import KillSwitchEngine
 from execution.oms import OMS
 
@@ -79,6 +79,10 @@ class Reconciler:
         self._bus = bus
         self._last_kill_state: KillSwitchState = kill.state
         self._orphan_agent_id = orphan_agent_id
+        # Symbols we've already published a ReconciliationBreakEvent for
+        # during the current outage. Cleared when the symbol's books agree
+        # again, so a re-break later still pages.
+        self._alerted_breaks: set[str] = set()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -177,6 +181,13 @@ class Reconciler:
                 continue
             try:
                 status = self._broker.get_order(order.broker_order_id)
+            except BrokerUnavailable as exc:
+                logger.info(
+                    "Reconciler: broker transiently unavailable for %s (%s); will retry next cycle",
+                    order.broker_order_id,
+                    exc,
+                )
+                continue
             except Exception:
                 logger.warning(
                     "Reconciler: could not fetch broker status for %s",
@@ -254,6 +265,7 @@ class Reconciler:
 
         all_symbols = set(expected.keys()) | set(broker_positions.keys())
         mismatches: list[str] = []
+        mismatch_details: dict[str, tuple[Decimal, Decimal, Decimal]] = {}
 
         for sym in all_symbols:
             our_qty = expected.get(sym, Decimal("0"))
@@ -294,6 +306,11 @@ class Reconciler:
                 sym, our_qty, broker_qty, qty_drift, dollar_drift,
             )
             mismatches.append(sym)
+            mismatch_details[sym] = (our_qty, broker_qty, dollar_drift)
+
+        # Clear "already alerted" entries for symbols that are no longer
+        # mismatched — so a new break on the same symbol pages again.
+        self._alerted_breaks &= set(mismatches)
 
         tripped = False
         if mismatches:
@@ -303,10 +320,21 @@ class Reconciler:
                 try:
                     from core.events import ReconciliationBreakEvent
                     # Publish per-symbol so each break is independently
-                    # actionable. Drop a single rolled-up event if the list
-                    # is large (defensive against position blowouts).
-                    for sym in mismatches[:5]:
-                        self._bus.publish(ReconciliationBreakEvent(symbol=sym))
+                    # actionable, but only the FIRST time we see this
+                    # symbol mismatch — otherwise we'd spam Telegram every
+                    # reconcile tick (60s) for the same persistent break.
+                    new_breaks = [
+                        s for s in mismatches[:5] if s not in self._alerted_breaks
+                    ]
+                    for sym in new_breaks:
+                        our_qty, broker_qty, dollar_drift = mismatch_details[sym]
+                        self._bus.publish(ReconciliationBreakEvent(
+                            symbol=sym,
+                            local_qty=our_qty,
+                            broker_qty=broker_qty,
+                            delta_usd=dollar_drift,
+                        ))
+                        self._alerted_breaks.add(sym)
                 except Exception:
                     logger.warning(
                         "Reconciler: failed to publish ReconciliationBreak", exc_info=True,

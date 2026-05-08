@@ -33,6 +33,7 @@ import os
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -43,6 +44,7 @@ import yaml
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from config.universes import PLUMBING_UNIVERSE
 from agents.base import AgentState, BaseAgent
 from agents.calibration import CalibrationTracker
 from agents.calibration_recorder import CalibrationRecorder
@@ -97,13 +99,11 @@ from ops.heartbeat import HeartbeatWriter
 from ops.telegram import TelegramAdapter
 
 if TYPE_CHECKING:
-    from data.market import Bar, MarketData
+    from data.market import MarketData
 
 log = logging.getLogger(__name__)
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
-
-from config.universes import PLUMBING_UNIVERSE
 
 # Plumbing universe = union of every sleeve's tradable list. Each agent
 # applies its own strategy filter at the prompt/factor layer (see
@@ -475,21 +475,43 @@ class App:
         symbols = symbols if symbols is not None else self.universe
         emg_agent = agent_id if agent_id is not None else AgentId.HAIKU
 
-        try:
-            bars_by_symbol = self.market_data.get_bars_batch(
-                list(symbols), start=ts - timedelta(days=400), end=ts
+        # Fan out the three independent I/O calls so a slow broker leg doesn't
+        # serialize the others on the agent hot path. Each future has its own
+        # try/except so a single failure degrades to the same fallback as the
+        # original sequential code.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="agent-state") as pool:
+            bars_fut = pool.submit(
+                self.market_data.get_bars_batch,
+                list(symbols), ts - timedelta(days=400), ts,
             )
-        except Exception:
-            log.warning("get_bars_batch failed", exc_info=True)
-            bars_by_symbol = {}
-        for sym in symbols:
-            bars_by_symbol.setdefault(sym, [])
+            positions_fut = pool.submit(self.broker.list_positions)
+            account_fut = pool.submit(self.broker.get_account)
 
-        try:
-            broker_positions = list(self.broker.list_positions())
-        except Exception:
-            log.warning("list_positions failed", exc_info=True)
-            broker_positions = []
+            try:
+                bars_by_symbol = bars_fut.result(timeout=30)
+            except Exception:
+                log.warning("get_bars_batch failed", exc_info=True)
+                bars_by_symbol = {}
+            for sym in symbols:
+                bars_by_symbol.setdefault(sym, [])
+
+            try:
+                broker_positions = list(positions_fut.result(timeout=10))
+            except Exception:
+                log.warning("list_positions failed", exc_info=True)
+                broker_positions = []
+
+            try:
+                account = account_fut.result(timeout=10)
+            except Exception:
+                log.warning("get_account failed", exc_info=True)
+                account = BrokerAccount(
+                    cash=Decimal("0"),
+                    equity=Decimal("0"),
+                    buying_power=Decimal("0"),
+                    pattern_day_trader=False,
+                    daytrade_count=0,
+                )
 
         # Sleeve-attributed view: each sleeve agent (Haiku/Sonnet/Opus) sees
         # only positions traceable to its own fills via the LotLedger. Without
@@ -514,18 +536,6 @@ class App:
                 for p in broker_positions
                 if normalize_symbol(p.symbol) in agent_qty
             ]
-
-        try:
-            account = self.broker.get_account()
-        except Exception:
-            log.warning("get_account failed", exc_info=True)
-            account = BrokerAccount(
-                cash=Decimal("0"),
-                equity=Decimal("0"),
-                buying_power=Decimal("0"),
-                pattern_day_trader=False,
-                daytrade_count=0,
-            )
 
         mc = runtime_store.master_capability
         vix_value, vix_bucket = self._live_vix()

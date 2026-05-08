@@ -47,8 +47,16 @@ HTTP_TIMEOUT_SECS: float = 5.0
 HttpPoster = Callable[[str, bytes, dict[str, str]], None]
 
 
+def _ascii_header(value: str) -> str:
+    # HTTP header values must be latin-1 encodable. ntfy Title/Tags often
+    # contain emoji — strip anything non-ASCII to avoid UnicodeEncodeError
+    # inside urllib.
+    return value.encode("ascii", "ignore").decode("ascii").strip() or "alert"
+
+
 def _default_poster(url: str, body: bytes, headers: dict[str, str]) -> None:
-    req = Request(url, data=body, headers=headers, method="POST")
+    safe_headers = {k: _ascii_header(v) for k, v in headers.items()}
+    req = Request(url, data=body, headers=safe_headers, method="POST")
     try:
         with urlopen(req, timeout=HTTP_TIMEOUT_SECS) as resp:  # noqa: S310
             resp.read()

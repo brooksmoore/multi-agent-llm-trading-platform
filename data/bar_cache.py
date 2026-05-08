@@ -68,14 +68,14 @@ class BarCache:
         )
         with self._lock, self._connect() as con:
             rows = con.execute(sql, [*symbols, start_d, end_d]).fetchall()
-        for sym, ts_iso, o, h, l, c, v, vw in rows:
+        for sym, ts_iso, o, h, lo, c, v, vw in rows:
             out[sym].append(
                 Bar(
                     symbol=sym,
                     timestamp=datetime.fromisoformat(ts_iso),
                     open=Decimal(o),
                     high=Decimal(h),
-                    low=Decimal(l),
+                    low=Decimal(lo),
                     close=Decimal(c),
                     volume=int(v),
                     vwap=Decimal(vw) if vw is not None else None,

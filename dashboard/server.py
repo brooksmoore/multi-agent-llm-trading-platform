@@ -83,12 +83,8 @@ def build_app(data: DashboardData, spy: SPYProvider | None = None) -> Flask:
 
         # Sleeve equity & drawdowns from snapshot DB rolled into agents_payload
         latest_eq: dict[str, float] = {}
-        latest_peak: dict[str, float] = {}
         for p in data.sleeve_curves():
             latest_eq[p.agent_id] = float(p.equity)
-        for dd in data.drawdown_status():
-            # agent peak is implicit in dd; recompute from cur+dd
-            pass
         # better: pull peaks directly
         for ap in agents_payload:
             short = ap["agent_id"].split(".")[-1].lower() if "." in ap["agent_id"] else ap["agent_id"].lower()
@@ -165,16 +161,46 @@ def build_app(data: DashboardData, spy: SPYProvider | None = None) -> Flask:
         ]
         spy_closes = spy.daily_closes(days=60) if spy is not None else []
         spy_series: list[dict[str, object]] = []
+        nav_today_return: float | None = None
+        spy_today_return: float | None = None
         if nav and spy_closes:
-            # Anchor SPY to first NAV point so the lines start equal
-            anchor_nav = nav[0]["nav"]
-            spy_anchor = float(spy_closes[0][1]) if spy_closes else None
-            if spy_anchor:
-                for date_iso, close in spy_closes:
-                    spy_series.append(
-                        {"ts": date_iso, "value": (float(close) / spy_anchor) * float(anchor_nav)}
-                    )
-        return jsonify({"nav": nav, "spy": spy_series})
+            # Trim SPY to dates >= the first NAV date so the chart begins on
+            # our first trading day (not weeks of SPY history before launch).
+            first_nav_date = str(nav[0]["ts"])[:10]
+            spy_in_range = [(d, c) for (d, c) in spy_closes if d >= first_nav_date]
+            if spy_in_range:
+                # Anchor first in-range SPY close to the first NAV value.
+                anchor_nav = nav[0]["nav"]
+                spy_anchor = float(spy_in_range[0][1])
+                if spy_anchor:
+                    for date_iso, close in spy_in_range:
+                        spy_series.append(
+                            {"ts": date_iso, "value": (float(close) / spy_anchor) * float(anchor_nav)}
+                        )
+            # SPY return today: last close vs prior close from the FULL series
+            # (so we always have a prior day, even if it predates first NAV).
+            if len(spy_closes) >= 2:
+                prev_close = float(spy_closes[-2][1])
+                last_close = float(spy_closes[-1][1])
+                if prev_close:
+                    spy_today_return = (last_close - prev_close) / prev_close
+        # NAV return today: first vs last NAV point sharing the latest date.
+        if nav:
+            today_date = str(nav[-1]["ts"])[:10]
+            today_pts = [p for p in nav if str(p["ts"])[:10] == today_date]
+            if len(today_pts) >= 2:
+                start = float(today_pts[0]["nav"])
+                end = float(today_pts[-1]["nav"])
+                if start:
+                    nav_today_return = (end - start) / start
+            elif len(today_pts) == 1:
+                nav_today_return = 0.0
+        return jsonify({
+            "nav": nav,
+            "spy": spy_series,
+            "nav_today_return": nav_today_return,
+            "spy_today_return": spy_today_return,
+        })
 
     @app.route("/api/sleeve_curves")
     def sleeve_curves() -> object:
@@ -471,7 +497,7 @@ _HTML = r"""<!doctype html>
     <div class="card">
       <div class="label">vs SPY (today)</div>
       <div class="big num" id="alpha">—</div>
-      <div class="sub" id="alpha-sub">benchmark anchored to first NAV point</div>
+      <div class="sub" id="alpha-sub">today’s portfolio return minus SPY return</div>
     </div>
     <div class="card">
       <div class="label">LLM Spend Today</div>
@@ -630,7 +656,7 @@ async function fetchNav() {
     const r = await fetch('/api/nav_curve');
     const j = await r.json();
     renderNav(j.nav, j.spy);
-    computeAlpha(j.nav, j.spy);
+    computeAlpha(j.nav_today_return, j.spy_today_return);
   } catch (e) { console.error(e); }
 }
 async function fetchSleeves() {
@@ -924,20 +950,21 @@ function renderNav(nav, spy) {
   });
 }
 
-function computeAlpha(nav, spy) {
-  if (!nav.length || !spy.length) {
-    document.getElementById('alpha').textContent = '—';
+function computeAlpha(navRet, spyRet) {
+  const el = document.getElementById('alpha');
+  const sub = document.getElementById('alpha-sub');
+  if (navRet == null || spyRet == null) {
+    el.textContent = '—';
+    if (sub) sub.textContent = 'today’s portfolio return minus SPY return';
     return;
   }
-  const navStart = nav[0].nav, navEnd = nav[nav.length - 1].nav;
-  const spyStart = spy[0].value, spyEnd = spy[spy.length - 1].value;
-  if (!navStart || !spyStart) return;
-  const navRet = (navEnd - navStart) / navStart;
-  const spyRet = (spyEnd - spyStart) / spyStart;
   const alpha = navRet - spyRet;
-  const el = document.getElementById('alpha');
   el.textContent = (alpha > 0 ? '+' : '') + (alpha * 100).toFixed(2) + '%';
   el.className = 'big num ' + classForPnl(alpha);
+  if (sub) {
+    const fmt = (r) => (r > 0 ? '+' : '') + (r * 100).toFixed(2) + '%';
+    sub.textContent = `port ${fmt(navRet)} · SPY ${fmt(spyRet)}`;
+  }
 }
 
 function renderSleeves(byAgent) {

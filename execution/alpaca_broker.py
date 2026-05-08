@@ -23,6 +23,7 @@ from uuid import UUID
 
 import alpaca.trading.enums as alpaca_enums
 from alpaca.common.exceptions import APIError
+from requests.exceptions import RequestException
 from alpaca.trading.client import TradingClient
 from alpaca.trading.models import Order as AlpacaOrder
 from alpaca.trading.models import Position as AlpacaPosition
@@ -89,6 +90,8 @@ _ALPACA_TRADE_EVENT_TO_STATE: dict[str, BrokerOrderState] = {
     "pending_replace": BrokerOrderState.ACCEPTED,
     "restated":        BrokerOrderState.ACCEPTED,
 }
+
+CRYPTO_TAKER_FEE: Decimal = Decimal("0.0025")
 
 _ALPACA_ASSET_CLASS_TO_OURS: dict[str, AssetClass] = {
     "us_equity":  AssetClass.EQUITY,
@@ -204,6 +207,8 @@ class AlpacaBroker:
             if exc.status_code in (400, 403, 404, 422):
                 raise BrokerRejection(str(exc)) from exc
             raise BrokerUnavailable(str(exc)) from exc
+        except RequestException as exc:
+            raise BrokerUnavailable(f"network error: {exc}") from exc
 
     def cancel_order(self, broker_order_id: str) -> None:
         try:
@@ -212,6 +217,8 @@ class AlpacaBroker:
             if exc.status_code in (400, 403, 404, 422):
                 raise BrokerRejection(str(exc)) from exc
             raise BrokerUnavailable(str(exc)) from exc
+        except RequestException as exc:
+            raise BrokerUnavailable(f"network error: {exc}") from exc
 
     def get_order(self, broker_order_id: str) -> BrokerOrderStatus:
         try:
@@ -221,6 +228,8 @@ class AlpacaBroker:
             if exc.status_code == 404:
                 raise BrokerRejection(f"Order {broker_order_id} not found") from exc
             raise BrokerUnavailable(str(exc)) from exc
+        except RequestException as exc:
+            raise BrokerUnavailable(f"network error: {exc}") from exc
 
     def find_order_by_client_id(self, client_order_id: OrderId) -> BrokerOrderStatus | None:
         try:
@@ -230,13 +239,25 @@ class AlpacaBroker:
             if exc.status_code == 404:
                 return None
             raise BrokerUnavailable(str(exc)) from exc
+        except RequestException as exc:
+            raise BrokerUnavailable(f"network error: {exc}") from exc
 
     def list_positions(self) -> list[BrokerPosition]:
-        positions = cast(list[AlpacaPosition], self._client.get_all_positions())
+        try:
+            positions = cast(list[AlpacaPosition], self._client.get_all_positions())
+        except APIError as exc:
+            raise BrokerUnavailable(str(exc)) from exc
+        except RequestException as exc:
+            raise BrokerUnavailable(f"network error: {exc}") from exc
         return [self._translate_position(p) for p in positions]
 
     def get_account(self) -> BrokerAccount:
-        acct = cast(TradeAccount, self._client.get_account())
+        try:
+            acct = cast(TradeAccount, self._client.get_account())
+        except APIError as exc:
+            raise BrokerUnavailable(str(exc)) from exc
+        except RequestException as exc:
+            raise BrokerUnavailable(f"network error: {exc}") from exc
         return BrokerAccount(
             cash=_decimal(acct.cash),
             equity=_decimal(acct.equity),
@@ -299,13 +320,24 @@ class AlpacaBroker:
 
         side = OrderSide(ao.side.value) if ao.side else OrderSide.BUY
 
+        # Mirror the in-kind crypto fee adjustment from the stream path so the
+        # reconciler's synthesized fills (when the stream missed an event) use
+        # the same net qty the position endpoint actually shows.
+        filled_qty = _decimal(ao.filled_qty)
+        ac_str = ao.asset_class.value if ao.asset_class else ""
+        if (
+            _ALPACA_ASSET_CLASS_TO_OURS.get(ac_str) == AssetClass.CRYPTO
+            and side == OrderSide.BUY
+        ):
+            filled_qty = filled_qty * (Decimal("1") - CRYPTO_TAKER_FEE)
+
         return BrokerOrderStatus(
             broker_order_id=str(ao.id),
             client_order_id=client_order_id,
             symbol=ao.symbol or "",
             side=side,
             qty=_decimal(ao.qty),
-            filled_qty=_decimal(ao.filled_qty),
+            filled_qty=filled_qty,
             avg_fill_price=_decimal(ao.filled_avg_price) if ao.filled_avg_price else None,
             state=state,
             submitted_at=ao.submitted_at or datetime.now(UTC),
@@ -353,13 +385,26 @@ class AlpacaBroker:
                     meta = self._order_meta.get(client_id_str)
                 agent_id = meta[0] if meta else AgentId.HAIKU
                 side = meta[3] if meta else OrderSide.BUY
+                fill_qty = _decimal(update.qty)
+                # Alpaca crypto fees are charged in-kind: a 0.25% taker fee is
+                # deducted from the BASE asset on buys (we receive less crypto
+                # than filled) and from the QUOTE asset on sells (we receive
+                # less USD). Record the net qty for buys so OMS books match
+                # the broker position. Sells need no qty adjustment — proceeds
+                # are reduced in USD, which the broker already reflects.
+                ac_str = ao.asset_class.value if ao.asset_class else ""
+                if (
+                    _ALPACA_ASSET_CLASS_TO_OURS.get(ac_str) == AssetClass.CRYPTO
+                    and side == OrderSide.BUY
+                ):
+                    fill_qty = fill_qty * (Decimal("1") - CRYPTO_TAKER_FEE)
                 fill = Fill(
                     id=new_id(),
                     order_id=client_order_id,
                     agent_id=agent_id,
                     symbol=ao.symbol or "",
                     side=side,
-                    qty=_decimal(update.qty),
+                    qty=fill_qty,
                     price=_decimal(update.price),
                     timestamp=ts,
                     is_partial=(event_str == "partial_fill"),
