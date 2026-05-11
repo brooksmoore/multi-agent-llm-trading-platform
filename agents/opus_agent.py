@@ -88,6 +88,7 @@ class OpusAgent(BaseAgent):
                 conviction=intent.conviction,
                 rationale=intent.rationale,
                 ts=intent.timestamp,
+                target_weight=intent.target_weight,
             )
 
         return intents

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import threading
 from datetime import UTC, date, datetime
@@ -34,17 +35,22 @@ class AgentMemory:
                 PRIMARY KEY (agent_id, date)
             );
             CREATE TABLE IF NOT EXISTS intent_log (
-                intent_id  TEXT PRIMARY KEY,
-                agent_id   TEXT NOT NULL,
-                symbol     TEXT NOT NULL,
-                action     TEXT NOT NULL,
-                conviction INTEGER NOT NULL,
-                rationale  TEXT NOT NULL,
-                outcome    TEXT,
-                logged_at  TEXT NOT NULL
+                intent_id     TEXT PRIMARY KEY,
+                agent_id      TEXT NOT NULL,
+                symbol        TEXT NOT NULL,
+                action        TEXT NOT NULL,
+                conviction    INTEGER NOT NULL,
+                rationale     TEXT NOT NULL,
+                outcome       TEXT,
+                logged_at     TEXT NOT NULL,
+                target_weight TEXT
             );
             """
         )
+        # Idempotent migration: add target_weight to pre-Plan-2c intent_log
+        # tables. T2.4 / Plan 2c.
+        with contextlib.suppress(sqlite3.OperationalError):
+            self._conn.execute("ALTER TABLE intent_log ADD COLUMN target_weight TEXT")
         self._conn.commit()
 
     def remember(self, key: str, value: str) -> None:
@@ -102,14 +108,22 @@ class AgentMemory:
         conviction: int,
         rationale: str,
         ts: datetime,
+        target_weight: object | None = None,
     ) -> None:
-        """Insert an intent into the log (ignored if the ID already exists)."""
+        """Insert an intent into the log (ignored if the ID already exists).
+
+        `target_weight` is stored as a string (Decimal or float, str-formatted)
+        so the Plan 2c adversarial critique pipeline can reconstruct it later.
+        Callers that omit it (back-compat) get NULL in the column.
+        """
+        weight_str = None if target_weight is None else str(target_weight)
         with self._lock:
             self._conn.execute(
                 """
                 INSERT OR IGNORE INTO intent_log
-                    (intent_id, agent_id, symbol, action, conviction, rationale, outcome, logged_at)
-                VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+                    (intent_id, agent_id, symbol, action, conviction, rationale,
+                     outcome, logged_at, target_weight)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
                 """,
                 (
                     str(intent_id),
@@ -119,6 +133,7 @@ class AgentMemory:
                     conviction,
                     rationale,
                     ts.isoformat(),
+                    weight_str,
                 ),
             )
             self._conn.commit()
@@ -131,6 +146,51 @@ class AgentMemory:
                 (outcome, str(intent_id)),
             )
             self._conn.commit()
+
+    def top_intents_since(
+        self,
+        since: datetime,
+        n: int = 3,
+    ) -> list[dict[str, str | int | float | None]]:
+        """Top-N intents this agent emitted since `since` by (conviction * target_weight).
+
+        Used by the Sunday adversarial critique job (T2.4). Returns dicts
+        ready for Intent reconstruction. Skips intents with no outcome
+        (never fired — vetoed pre-submission) and intents with NULL
+        target_weight (legacy rows pre-Plan-2c migration).
+        """
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    """
+                    SELECT intent_id, symbol, action, conviction, rationale,
+                           outcome, logged_at, target_weight
+                    FROM intent_log
+                    WHERE agent_id = ?
+                      AND logged_at >= ?
+                      AND outcome IS NOT NULL
+                      AND target_weight IS NOT NULL
+                    ORDER BY (CAST(conviction AS REAL) *
+                              CAST(target_weight AS REAL)) DESC
+                    LIMIT ?
+                    """,
+                    (self._agent_id, since.isoformat(), n),
+                ).fetchall()
+            except sqlite3.ProgrammingError:
+                return []
+        return [
+            {
+                "intent_id": row["intent_id"],
+                "symbol": row["symbol"],
+                "action": row["action"],
+                "conviction": row["conviction"],
+                "rationale": row["rationale"],
+                "outcome": row["outcome"],
+                "logged_at": row["logged_at"],
+                "target_weight": row["target_weight"],
+            }
+            for row in rows
+        ]
 
     def recent_intents_rows(self, n: int = 10) -> list[dict[str, str | int | None]]:
         """Return the *n* most recent intents as structured rows (for dashboard)."""

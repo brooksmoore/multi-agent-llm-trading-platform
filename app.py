@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import signal
+import uuid
 from dataclasses import replace
 import os
 import sys
@@ -51,6 +52,7 @@ from agents.calibration_recorder import CalibrationRecorder
 from agents.haiku_agent import HaikuAgent
 from agents.manager_bridge import (
     read_manager_context,
+    write_adversarial_critique,
     write_sleeve_weights,
 )
 from agents.llm import HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL, BudgetExhausted, LLMClient
@@ -66,11 +68,13 @@ from config.settings import Settings
 from core.clock import ET, Clock, WallClock
 from core.events import EventBus, FillReceivedEvent
 from core.types import (
+    Action,
     AgentId,
     DrawdownBucket,
     Intent,
     KillSwitchState,
     MarketSnapshot,
+    Sleeve,
     VixBucket,
     normalize_symbol,
 )
@@ -134,6 +138,7 @@ JOB_NEWS_NIGHTLY             = "news_nightly"             # 22:00 ET full pull +
 JOB_PORTFOLIO_SNAPSHOT       = "portfolio_snapshot"       # hourly RTH Mon-Fri Telegram
 JOB_PORTFOLIO_SNAPSHOT_WEEKEND = "portfolio_snapshot_weekend"  # 09:00 ET Sat/Sun
 JOB_AGENT_PNL_SNAPSHOT       = "agent_pnl_snapshot"       # 16:45 ET Mon-Fri (T1.5)
+JOB_MANAGER_SUNDAY_CRITIQUE  = "manager_sunday_critique"  # Sun 18:00 ET (T2.4)
 
 ALL_JOB_IDS: frozenset[str] = frozenset({
     JOB_HAIKU_NEWS_SCAN, JOB_HAIKU_CLOSE,
@@ -141,7 +146,7 @@ ALL_JOB_IDS: frozenset[str] = frozenset({
     JOB_MANAGER_FRIDAY, JOB_HAIKU_MORNING_SYNTHESIS, JOB_HAIKU_CRYPTO,
     JOB_BUDGET_RESET, JOB_NEWS_FETCH, JOB_NEWS_NIGHTLY,
     JOB_PORTFOLIO_SNAPSHOT, JOB_PORTFOLIO_SNAPSHOT_WEEKEND,
-    JOB_AGENT_PNL_SNAPSHOT,
+    JOB_AGENT_PNL_SNAPSHOT, JOB_MANAGER_SUNDAY_CRITIQUE,
 })
 
 
@@ -1041,6 +1046,14 @@ class App:
             self._job_agent_pnl_snapshot, weekday(16, 45),
             id=JOB_AGENT_PNL_SNAPSHOT, replace_existing=True,
         )
+        # T2.4 / Plan 2c: Sunday 18:00 ET adversarial critique. Manager
+        # reviews each sleeve's top-3 prior-week intents and persists a
+        # per-sleeve critique that the agent reads on its next observe().
+        sched.add_job(
+            self._job_manager_sunday_critique,
+            CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=et),
+            id=JOB_MANAGER_SUNDAY_CRITIQUE, replace_existing=True,
+        )
         # Portfolio snapshot to Telegram: hourly during US RTH Mon-Fri, plus
         # one daily 09:00 ET ping on Sat/Sun to surface weekend crypto drift
         # without flooding off-hours.
@@ -1349,6 +1362,113 @@ class App:
             if mapped:
                 write_sleeve_weights(mapped)
                 log.info("manager.capital_reallocation: persisted sleeve weights %s", mapped)
+
+    def _job_manager_sunday_critique(self) -> None:
+        """Weekly Sunday 18:00 ET adversarial critique (T2.4 / Plan 2c).
+
+        For each sleeve agent, pulls the top-3 prior-week intents (ranked
+        by conviction × target_weight as a proxy for "intents that mattered"
+        — see followups for the full P&L-ordered selection) and asks the
+        Manager to red-team them. The returned per-intent critiques are
+        grouped per sleeve and persisted via write_adversarial_critique,
+        so each affected agent sees its critique in `manager_critique` on
+        the next observe() cycle.
+
+        The plan handoff specified "3 worst-realized-P&L intents per
+        sleeve" but agent_pnl_daily aggregates per (date, agent) — not
+        per intent — and the lot ledger discards partial-exit prices,
+        so per-intent realized P&L would require walking OMS fill events
+        and reconstructing the BUY -> intent linkage. Filed for a future
+        Tier 3 enhancement; conviction × target_weight is the heuristic
+        used here and it picks the "high-stakes" intents the critique
+        prompt is calibrated for.
+        """
+        state = self.build_agent_state(agent_id=AgentId.MANAGER)
+        since = datetime.now(UTC) - timedelta(days=7)
+        manager_mem = self._memories[AgentId.MANAGER]
+
+        per_sleeve_picks: dict[AgentId, list[Intent]] = {}
+        for aid in (AgentId.HAIKU, AgentId.SONNET, AgentId.OPUS):
+            rows = self._memories[aid].top_intents_since(since=since, n=3)
+            picks: list[Intent] = []
+            for r in rows:
+                try:
+                    picks.append(Intent(
+                        id=uuid.UUID(str(r["intent_id"])),
+                        agent_id=aid,
+                        symbol=str(r["symbol"]),
+                        action=Action(str(r["action"])),
+                        target_weight=Decimal(str(r["target_weight"])),
+                        sleeve=Sleeve.EQUITY,  # placeholder; not used by critique
+                        signal="(historical)",  # placeholder
+                        conviction=int(r["conviction"] or 0),
+                        rationale=str(r["rationale"] or ""),
+                        timestamp=datetime.fromisoformat(str(r["logged_at"])),
+                    ))
+                except Exception:
+                    log.warning(
+                        "sunday_critique: skipping unreconstructable intent %r",
+                        r.get("intent_id"), exc_info=True,
+                    )
+            per_sleeve_picks[aid] = picks
+
+        all_intents: list[Intent] = [
+            i for picks in per_sleeve_picks.values() for i in picks
+        ]
+        if not all_intents:
+            log.info("manager_sunday_critique: no intents in last 7d; skipping")
+            return
+
+        try:
+            result = self.manager.adversarial_critique(state, all_intents, ctx=None)
+        except Exception:
+            log.exception("manager.adversarial_critique failed")
+            return
+
+        # Group critiques by sleeve and persist a per-sleeve text blob.
+        critiques = result.get("critiques") if isinstance(result, dict) else None
+        if not isinstance(critiques, list) or not critiques:
+            log.info("manager_sunday_critique: empty/invalid critique response")
+            return
+
+        by_sleeve: dict[AgentId, list[str]] = {
+            AgentId.HAIKU: [], AgentId.SONNET: [], AgentId.OPUS: [],
+        }
+        for c in critiques:
+            if not isinstance(c, dict):
+                continue
+            try:
+                aid = AgentId(str(c.get("agent", "")).lower())
+            except ValueError:
+                continue
+            if aid not in by_sleeve:
+                continue
+            objection = str(c.get("red_team_objection", "")).strip()
+            evidence = str(c.get("what_evidence_would_change_my_mind", "")).strip()
+            severity = str(c.get("severity", "minor"))
+            summary = str(c.get("summary_of_intent", "")).strip()
+            block = (
+                f"[{severity}] {summary}\n"
+                f"  objection: {objection}\n"
+                f"  flip evidence: {evidence}"
+            )
+            by_sleeve[aid].append(block)
+
+        for aid, blocks in by_sleeve.items():
+            if not blocks:
+                continue
+            critique_text = "\n\n".join(blocks)[:600]
+            try:
+                write_adversarial_critique(manager_mem, aid, critique_text)
+            except Exception:
+                log.warning(
+                    "sunday_critique: write_adversarial_critique failed for %s",
+                    aid, exc_info=True,
+                )
+        log.info(
+            "manager_sunday_critique: wrote critiques for %s",
+            sorted(aid.value for aid, blocks in by_sleeve.items() if blocks),
+        )
 
     def _job_haiku_morning_synthesis(self) -> None:
         """Daily 08:30 ET premarket brief (T2.3 / Plan 2c).
