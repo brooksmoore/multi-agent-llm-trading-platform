@@ -245,6 +245,9 @@ class TestPlannerBasic:
         assert order.qty != order.qty.to_integral_value()  # confirm fractional
 
     def test_sub_dollar_notional_returns_none(self) -> None:
+        """Tiny-target intents are skipped; planner-rebalance-delta returns
+        near_target (delta band fires before the sub-min check) on these
+        infinitesimal targets. Either rejection is semantically a no-op."""
         planner, *_ = _make_planner()
         with patch("execution.planner.runtime_store") as mock_rs:
             mock_rs.master_capability = Decimal("1.0")
@@ -253,7 +256,7 @@ class TestPlannerBasic:
                 _agent_state(equity=Decimal("10")),
                 _snapshot(price=Decimal("1000")),
             )
-        assert order == "unsized:sub_min"
+        assert order in ("unsized:sub_min", "unsized:near_target")
 
     def test_missing_mark_price_returns_none(self) -> None:
         planner, *_ = _make_planner()
@@ -659,3 +662,179 @@ class TestFullChainIntegration:
         open_qty = ledger.total_open_qty(AgentId.SONNET, "SPY")
         assert open_qty > Decimal("0")
         assert open_qty == order.qty
+
+
+# ── Delta-aware sizing (planner-rebalance-delta) ──────────────────────────────
+
+
+def _seed_position(ledger: LotLedger, *, symbol: str, qty: Decimal,
+                   price: Decimal, agent_id: AgentId = AgentId.SONNET) -> None:
+    """Open a lot in the ledger so the planner sees a current position."""
+    fill = Fill(
+        id=new_id(), order_id=new_id(), agent_id=agent_id,
+        symbol=symbol, side=OrderSide.BUY,
+        qty=qty, price=price, timestamp=_TS,
+    )
+    ledger.open_lot(fill)
+
+
+class TestPlannerDeltaAware:
+    """Verify the rebalance-delta fix (post-2026-05-11 over-leverage incident).
+
+    Pre-fix bugs being guarded against:
+      1. REBALANCE_TO sized as a fresh full-target position, ignoring current holdings.
+      2. SELL with target_weight=0 produced $0 notional → sub_min drop, not a real exit.
+      3. BUY on an already-held symbol re-added to the position every cycle.
+    """
+
+    def _plan(self, planner: ExecutionPlanner, intent: Intent,
+              state: AgentState | None = None,
+              snap: MarketSnapshot | None = None):  # noqa: ANN202
+        state = state or _agent_state()
+        # Sonnet vol_target=0.25; realized_vol=0.25 makes the sizing_mult
+        # exactly 1.0, so target_notional = target_weight × equity. Keeps
+        # the delta math human-readable in these tests.
+        snap = snap or _snapshot(vol=Decimal("0.25"))
+        with patch("execution.planner.runtime_store") as mock_rs:
+            mock_rs.master_capability = Decimal("1.0")
+            return planner.plan(intent, state, snap)
+
+    # ── BUY ──────────────────────────────────────────────────────────────────
+
+    def test_buy_on_empty_ledger_uses_full_target(self) -> None:
+        planner, _oms, _ledger, *_ = _make_planner()
+        order = self._plan(planner, _intent(action=Action.BUY,
+                                            target_weight=Decimal("0.10")))
+        assert not isinstance(order, str)
+        assert order.side == OrderSide.BUY
+        assert order.qty > Decimal("0")
+
+    def test_buy_with_existing_position_is_additive_delta(self) -> None:
+        """BUY of 10% target with 5% already held = order for the +5% delta only."""
+        planner, _oms, ledger, *_ = _make_planner()
+        # Seed 5% of sleeve in SPY (≈ $50 at $100/share, $1000 equity).
+        _seed_position(ledger, symbol="SPY", qty=Decimal("0.5"),
+                       price=Decimal("100"))
+
+        intent = _intent(action=Action.BUY, target_weight=Decimal("0.10"))
+        order = self._plan(planner, intent)
+
+        assert not isinstance(order, str)
+        assert order.side == OrderSide.BUY
+        # Roughly: ~0.5 share delta (5% of $1000 / $100), but vol-target may
+        # scale this further. We just assert the order is much smaller than
+        # the would-be fresh-target order (which would be ~1.0 share total).
+        assert order.qty < Decimal("1.0")
+
+    def test_buy_already_at_or_above_target_returns_already_at_target(self) -> None:
+        """BUY 10% when we already hold 15%: surfaced as ALREADY_AT_TARGET,
+        not silently turned into a SELL. LLM should have used REBALANCE_TO."""
+        planner, _oms, ledger, *_ = _make_planner()
+        # Seed 15% of sleeve in SPY (1.5 shares × $100 = $150 = 15% of $1000)
+        _seed_position(ledger, symbol="SPY", qty=Decimal("1.5"),
+                       price=Decimal("100"))
+
+        result = self._plan(planner, _intent(action=Action.BUY,
+                                              target_weight=Decimal("0.10")))
+        assert result == "unsized:already_at_target"
+
+    # ── REBALANCE_TO ─────────────────────────────────────────────────────────
+
+    def test_rebalance_to_with_positive_delta_emits_buy(self) -> None:
+        planner, _oms, ledger, *_ = _make_planner()
+        _seed_position(ledger, symbol="SPY", qty=Decimal("0.3"),
+                       price=Decimal("100"))  # 3% of $1000
+
+        order = self._plan(planner, _intent(action=Action.REBALANCE_TO,
+                                             target_weight=Decimal("0.10")))
+        assert not isinstance(order, str)
+        assert order.side == OrderSide.BUY
+
+    def test_rebalance_to_with_negative_delta_emits_sell(self) -> None:
+        """The bug that bit us: REBALANCE_TO meant to trim was silently
+        turning into ADD because the planner ignored existing position."""
+        planner, _oms, ledger, *_ = _make_planner()
+        # Seed 20% of sleeve in SPY; rebalance_to 10% should SELL the diff.
+        _seed_position(ledger, symbol="SPY", qty=Decimal("2.0"),
+                       price=Decimal("100"))
+
+        order = self._plan(planner, _intent(action=Action.REBALANCE_TO,
+                                             target_weight=Decimal("0.10")))
+        assert not isinstance(order, str)
+        assert order.side == OrderSide.SELL
+        # Should be sized to the delta, capped at current_qty.
+        assert order.qty > Decimal("0")
+        assert order.qty <= Decimal("2.0")
+
+    def test_rebalance_to_within_band_returns_near_target(self) -> None:
+        """REBALANCE_TO 10% when we're already at 9% (< 2pp band): no-op."""
+        planner, _oms, ledger, *_ = _make_planner()
+        _seed_position(ledger, symbol="SPY", qty=Decimal("0.9"),
+                       price=Decimal("100"))  # 9% of $1000
+
+        result = self._plan(planner, _intent(action=Action.REBALANCE_TO,
+                                              target_weight=Decimal("0.10")))
+        assert result == "unsized:near_target"
+
+    def test_rebalance_to_sell_qty_capped_at_open_qty(self) -> None:
+        """Mark-drift / rounding cannot produce a SELL order exceeding holdings."""
+        planner, _oms, ledger, *_ = _make_planner()
+        _seed_position(ledger, symbol="SPY", qty=Decimal("0.5"),
+                       price=Decimal("100"))  # 0.5 share held
+
+        # Rebalance_to 0 effectively asks for a full exit. SELL qty should
+        # be capped at current_qty even if vol-target math wants more.
+        order = self._plan(planner, _intent(action=Action.REBALANCE_TO,
+                                             target_weight=Decimal("0.001")))
+        if isinstance(order, str):
+            # Small target may collapse to near_target — that's fine.
+            assert order in ("unsized:near_target",)
+        else:
+            assert order.side == OrderSide.SELL
+            assert order.qty <= Decimal("0.5")
+
+    # ── SELL ─────────────────────────────────────────────────────────────────
+
+    def test_sell_with_target_zero_routes_to_close_path(self) -> None:
+        """The other half of today's bug: trend-flip exits at target_weight=0
+        were dropped as sub_min. They should fully close instead."""
+        planner, _oms, ledger, *_ = _make_planner()
+        _seed_position(ledger, symbol="SPY", qty=Decimal("1.2"),
+                       price=Decimal("100"))
+
+        order = self._plan(planner, _intent(action=Action.SELL,
+                                             target_weight=Decimal("0")))
+        assert not isinstance(order, str)
+        assert order.side == OrderSide.SELL
+        # Close-path uses actual open qty, not a weight calculation.
+        assert order.qty == Decimal("1.2")
+
+    def test_sell_with_target_zero_no_lots_returns_no_position(self) -> None:
+        """Sell-to-zero on a symbol we don't hold: NO_POSITION (close path)."""
+        planner, _oms, _ledger, *_ = _make_planner()
+        result = self._plan(planner, _intent(action=Action.SELL,
+                                              target_weight=Decimal("0")))
+        assert result == "unsized:no_position"
+
+    def test_sell_to_trim_with_positive_delta_returns_near_target(self) -> None:
+        """SELL 10% target when we're already at 5%: no trim needed."""
+        planner, _oms, ledger, *_ = _make_planner()
+        _seed_position(ledger, symbol="SPY", qty=Decimal("0.5"),
+                       price=Decimal("100"))  # 5% of $1000
+
+        result = self._plan(planner, _intent(action=Action.SELL,
+                                              target_weight=Decimal("0.10")))
+        assert result == "unsized:near_target"
+
+    def test_sell_to_trim_with_negative_delta_emits_sell(self) -> None:
+        """SELL 5% target when we hold 20%: emit a SELL for the ~15% delta."""
+        planner, _oms, ledger, *_ = _make_planner()
+        _seed_position(ledger, symbol="SPY", qty=Decimal("2.0"),
+                       price=Decimal("100"))  # 20% of $1000
+
+        order = self._plan(planner, _intent(action=Action.SELL,
+                                             target_weight=Decimal("0.05")))
+        assert not isinstance(order, str)
+        assert order.side == OrderSide.SELL
+        assert order.qty > Decimal("0")
+        assert order.qty < Decimal("2.0")  # not full close
