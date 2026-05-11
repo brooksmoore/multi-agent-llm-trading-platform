@@ -198,6 +198,41 @@ class NewsStore:
                 )
         return items
 
+    def top_impact_since(
+        self,
+        since: datetime,
+        min_impact: int = 3,
+        limit: int = 5,
+    ) -> list[tuple[NewsItem, int, str]]:
+        """Return (item, impact, surprise) for the highest-impact items since `since`.
+
+        Used by HaikuSynthesizer to populate the morning brief's news block.
+        Sorted by impact DESC then published_at DESC. Only includes items
+        that have been scored (impact IS NOT NULL).
+        """
+        sql = (
+            "SELECT url, source, headline, published_at, summary, sentiment, "
+            "body, impact, COALESCE(surprise, '?') "
+            "FROM news_items WHERE published_at >= ? "
+            "AND impact IS NOT NULL AND impact >= ? "
+            "ORDER BY impact DESC, published_at DESC LIMIT ?"
+        )
+        out: list[tuple[NewsItem, int, str]] = []
+        with self._lock, self._connect() as con:
+            rows = con.execute(sql, (since.isoformat(), min_impact, limit)).fetchall()
+            for url, source, headline, pub, summary, sentiment, body, impact, surprise in rows:
+                sym_rows = con.execute(
+                    "SELECT symbol FROM news_symbols WHERE url = ?", (url,)
+                ).fetchall()
+                item = NewsItem(
+                    source=NewsSource(source), headline=headline, url=url,
+                    published_at=datetime.fromisoformat(pub),
+                    symbols=tuple(r[0] for r in sym_rows),
+                    summary=summary, sentiment=sentiment, body=body,
+                )
+                out.append((item, int(impact), str(surprise)))
+        return out
+
     def update_score(
         self,
         url: str,

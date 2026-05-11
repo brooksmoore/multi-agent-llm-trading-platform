@@ -58,6 +58,8 @@ _PROMPTS: list[tuple[str, str]] = [
     ("agents/prompts/manager_agent.md", OPUS_MODEL),
     # T2.2: NewsScorer prompt; uses Haiku, threshold 4,096.
     ("agents/prompts/news_scorer.md", HAIKU_MODEL),
+    # T2.3: HaikuSynthesizer (morning brief) prompt; Haiku, 4,096.
+    ("agents/prompts/haiku_synthesizer.md", HAIKU_MODEL),
 ]
 
 

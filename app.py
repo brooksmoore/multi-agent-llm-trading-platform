@@ -51,12 +51,12 @@ from agents.calibration_recorder import CalibrationRecorder
 from agents.haiku_agent import HaikuAgent
 from agents.manager_bridge import (
     read_manager_context,
-    write_morning_brief,
     write_sleeve_weights,
 )
 from agents.llm import HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL, BudgetExhausted, LLMClient
 from agents.manager_agent import ManagerAgent, compute_manager_fingerprint
 from agents.news_scorer import NewsScorer
+from agents.haiku_synthesizer import HaikuSynthesizer, positions_from_lot_ledger
 from agents.memory import AgentMemory
 from agents.opus_agent import OpusAgent
 from agents.outcome_recorder import OutcomeRecorder
@@ -125,7 +125,8 @@ JOB_SONNET_EOD               = "sonnet_eod"               # 16:30 ET
 # event-driven on NewsHighImpactScoredEvent (T2.5), rate-limited.
 JOB_OPUS_THURSDAY_DEEPDIVE   = "opus_thursday_deepdive"   # Thu 16:30 ET
 JOB_MANAGER_FRIDAY           = "manager_friday"           # Fri 17:00 ET
-JOB_MANAGER_MORNING_BRIEF    = "manager_morning_brief"    # Mon-Fri 08:30 ET
+# T1.6 / T2.3: JOB_MANAGER_MORNING_BRIEF removed; replaced by JOB_HAIKU_MORNING_SYNTHESIS
+JOB_HAIKU_MORNING_SYNTHESIS  = "haiku_morning_synthesis"  # Mon-Fri 08:30 ET
 JOB_HAIKU_CRYPTO             = "haiku_crypto"             # 24/7, 60-min
 JOB_BUDGET_RESET             = "budget_reset"             # UTC midnight
 JOB_NEWS_FETCH               = "news_fetch"               # every 30 min during RTH
@@ -137,7 +138,7 @@ JOB_AGENT_PNL_SNAPSHOT       = "agent_pnl_snapshot"       # 16:45 ET Mon-Fri (T1
 ALL_JOB_IDS: frozenset[str] = frozenset({
     JOB_HAIKU_NEWS_SCAN, JOB_HAIKU_CLOSE,
     JOB_SONNET_EOD, JOB_OPUS_THURSDAY_DEEPDIVE,
-    JOB_MANAGER_FRIDAY, JOB_MANAGER_MORNING_BRIEF, JOB_HAIKU_CRYPTO,
+    JOB_MANAGER_FRIDAY, JOB_HAIKU_MORNING_SYNTHESIS, JOB_HAIKU_CRYPTO,
     JOB_BUDGET_RESET, JOB_NEWS_FETCH, JOB_NEWS_NIGHTLY,
     JOB_PORTFOLIO_SNAPSHOT, JOB_PORTFOLIO_SNAPSHOT_WEEKEND,
     JOB_AGENT_PNL_SNAPSHOT,
@@ -317,6 +318,16 @@ class App:
         # per scored item with cache hits) and pre-filtered by body+universe.
         self.news_scorer = NewsScorer(
             llm=self._llm_haiku, store=self.news_store, bus=self.bus,
+        )
+        # T2.3 / Plan 2c: HaikuSynthesizer composes the daily 08:30 ET
+        # morning brief; replaces the prior Manager-on-Opus brief at ~50×
+        # lower cost. Writes via manager_bridge.write_morning_brief so
+        # sleeve agents see it verbatim on the next observe() cycle.
+        self.haiku_synthesizer = HaikuSynthesizer(
+            llm=self._llm_haiku,
+            manager_memory=self._memories[AgentId.MANAGER],
+            news_store=self.news_store,
+            snapshot_db_path=self._snapshot_db_path,
         )
 
         # Ops
@@ -992,13 +1003,14 @@ class App:
             CronTrigger(day_of_week="fri", hour=17, minute=0, timezone=et),
             id=JOB_MANAGER_FRIDAY, replace_existing=True,
         )
-        # Daily 8:30 ET premarket brief (Mon-Fri). Bridges Manager macro
-        # context into all three sleeve agents' next observe() via
+        # Daily 8:30 ET premarket brief (Mon-Fri). T2.3 / Plan 2c replaces
+        # the prior Manager-on-Opus brief with HaikuSynthesizer at ~50× lower
+        # cost. Bridges into the three sleeve agents' next observe() via
         # AgentState.manager_morning_brief.
         sched.add_job(
-            self._job_manager_morning_brief,
+            self._job_haiku_morning_synthesis,
             CronTrigger(day_of_week="mon-fri", hour=8, minute=30, timezone=et),
-            id=JOB_MANAGER_MORNING_BRIEF, replace_existing=True,
+            id=JOB_HAIKU_MORNING_SYNTHESIS, replace_existing=True,
         )
         # 24/7 Haiku crypto monitor (every 60 min, UTC-anchored — crypto is global)
         sched.add_job(
@@ -1338,56 +1350,26 @@ class App:
                 write_sleeve_weights(mapped)
                 log.info("manager.capital_reallocation: persisted sleeve weights %s", mapped)
 
-    def _job_manager_morning_brief(self) -> None:
-        """Daily 8:30 ET premarket brief.
+    def _job_haiku_morning_synthesis(self) -> None:
+        """Daily 08:30 ET premarket brief (T2.3 / Plan 2c).
 
-        Manager runs a regime_read with fresh context, persists the result
-        so all three sleeve agents pick it up via `manager_morning_brief`
-        on their next observe(). Cheap (~$0.10) and gives sleeves daily
-        portfolio-level macro context they otherwise lack.
+        Replaces the prior Manager-on-Opus morning brief. HaikuSynthesizer
+        reads four input streams (positions, last-week per-sleeve P&L,
+        top-5 high-impact news, VIX bucket) and composes a 180-260 word
+        markdown brief that bridges into sleeve agents' next observe()
+        via AgentState.manager_morning_brief. ~$0.005 per call vs. the
+        prior ~$0.10.
         """
-        state = self.build_agent_state(agent_id=AgentId.MANAGER)
-        ctx = self._build_manager_ctx(state)
-        manager_mem = self._memories[AgentId.MANAGER]
-        prior_regime = manager_mem.recall("last_regime_read") or ""
         try:
-            regime = self.manager.regime_read(
-                state, prior_regime=prior_regime, ctx=ctx,
+            positions = positions_from_lot_ledger(self.lots)
+            vix_value, vix_bucket = self._live_vix()
+            self.haiku_synthesizer.synthesize(
+                positions_by_agent=positions,
+                vix_value=vix_value,
+                vix_bucket=vix_bucket,
             )
         except Exception:
-            log.exception("manager.morning_brief regime_read failed")
-            return
-        if not regime:
-            return
-        # Persist the JSON regime read for next call's prior_regime, AND
-        # extract a human-readable brief that sleeves see verbatim.
-        try:
-            manager_mem.remember("last_regime_read", json.dumps(regime))
-        except Exception:
-            log.warning("morning_brief: failed to persist regime_read", exc_info=True)
-        # Compose a short brief from the most relevant fields. Falls back
-        # to whatever the Manager produced if the schema is unexpected.
-        brief_lines: list[str] = []
-        for key in ("summary", "narrative", "headline"):
-            v = regime.get(key)
-            if isinstance(v, str) and v.strip():
-                brief_lines.append(v.strip())
-                break
-        for tag, key in (
-            ("regime", "regime"),
-            ("vix_view", "vix_view"),
-            ("rates", "rates"),
-            ("risks", "risks"),
-            ("note", "note"),
-        ):
-            v = regime.get(key)
-            if isinstance(v, str) and v.strip():
-                brief_lines.append(f"{tag}: {v.strip()[:200]}")
-            elif isinstance(v, list) and v:
-                brief_lines.append(f"{tag}: {', '.join(str(x) for x in v[:5])[:200]}")
-        brief = "\n".join(brief_lines)[:1500] or json.dumps(regime)[:1500]
-        write_morning_brief(manager_mem, brief)
-        log.info("manager.morning_brief written (%d chars)", len(brief))
+            log.exception("haiku_morning_synthesis failed")
 
     def _on_drawdown_ladder_fired(self, event: object) -> None:
         """Wake the Manager when an agent transitions to a worse drawdown bucket.
