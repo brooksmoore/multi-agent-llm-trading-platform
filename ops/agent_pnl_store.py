@@ -129,6 +129,6 @@ def _row_from_db(r: Iterable[object]) -> AgentPnLRow:
         realized=Decimal(str(real)),
         unrealized=Decimal(str(unreal)),
         total=Decimal(str(total)),
-        num_open=int(nopen),  # type: ignore[arg-type]
-        num_closed=int(nclosed),  # type: ignore[arg-type]
+        num_open=int(str(nopen)),
+        num_closed=int(str(nclosed)),
     )

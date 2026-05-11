@@ -155,7 +155,7 @@ def compute_daily_pnl(
             # Unknown agent (e.g. AgentId.MANAGER, which has no sleeve).
             continue
         bucket = accum[lot.agent_id]
-        bucket["unrealized"] = bucket["unrealized"] + _lot_unrealized(  # type: ignore[operator]
+        bucket["unrealized"] = bucket["unrealized"] + _lot_unrealized(
             lot, marks.get(lot.symbol)
         )
         if lot.is_closed:

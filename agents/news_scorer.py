@@ -59,7 +59,7 @@ def _coerce_score(parsed: dict[str, object]) -> tuple[int, tuple[str, ...], str]
     caller treats that as a failed score and skips persistence.
     """
     try:
-        impact = int(parsed.get("impact"))  # type: ignore[arg-type]
+        impact = int(str(parsed.get("impact")))
     except (TypeError, ValueError):
         return None
     if impact < 1 or impact > 5:
