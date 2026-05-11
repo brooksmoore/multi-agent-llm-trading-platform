@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from decimal import Decimal
@@ -90,6 +91,42 @@ class OpusAgent(BaseAgent):
             )
 
         return intents
+
+    def signal_fingerprint(self, state: AgentState) -> str | None:
+        """Return a deterministic hash of Opus's signal inputs, or None to disable.
+
+        Returns None during initiation mode (holdings under target_count) so
+        that book-building cycles always run — initiation needs to keep
+        emitting starter intents and watchlist adds even when no other input
+        has changed.
+
+        Otherwise hashes:
+          - sorted (symbol, qty) pairs from the sleeve's holdings
+          - sorted watchlist symbols
+          - effective_max_gross (cap changes invalidate the cycle)
+          - manager_directive (any new Manager guidance invalidates it)
+
+        Quantized to int qty + 4-decimal EMG so trivial mark-to-market noise
+        and Decimal precision artifacts do not invalidate the fingerprint.
+        """
+        if len(state.positions) < TARGET_HOLDINGS:
+            return None
+
+        # Quantize qty to 2 decimals (handles fractional shares from paper
+        # trading; blocks Decimal-arithmetic noise from invalidating the fp).
+        holdings = sorted(
+            (p.symbol.upper(), format(p.qty.quantize(Decimal("0.01")), "f"))
+            for p in state.positions
+        )
+        watchlist = sorted(self.get_watchlist())
+        emg_q = format(state.effective_max_gross.quantize(Decimal("0.0001")), "f")
+        directive = (state.manager_directive or "").strip()
+
+        payload = json.dumps(
+            {"h": holdings, "w": watchlist, "emg": emg_q, "md": directive},
+            sort_keys=True, separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     # ── Watchlist ─────────────────────────────────────────────────────────────
 

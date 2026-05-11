@@ -55,7 +55,7 @@ from agents.manager_bridge import (
     write_sleeve_weights,
 )
 from agents.llm import HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL, BudgetExhausted, LLMClient
-from agents.manager_agent import ManagerAgent
+from agents.manager_agent import ManagerAgent, compute_manager_fingerprint
 from agents.memory import AgentMemory
 from agents.opus_agent import OpusAgent
 from agents.outcome_recorder import OutcomeRecorder
@@ -233,6 +233,9 @@ class App:
         self.planner = ExecutionPlanner(self.oms, self.lots, self.bus)
         # Per-agent signal fingerprint for skip-when-unchanged gating.
         self._last_fingerprint: dict[AgentId, str] = {}
+        # Manager strategic-call fingerprint (regime_read + weekly_journal).
+        # Event-driven Manager calls are not gated by this; see T1.4 / Plan 2c.
+        self._last_manager_fingerprint: str | None = None
         self.bus.subscribe("fill.received", self._on_fill_received)
 
         self.reconciler = Reconciler(
@@ -1080,23 +1083,54 @@ class App:
 
     def _job_manager_friday(self) -> None:
         state = self.build_agent_state(agent_id=AgentId.MANAGER)
+
+        # Skip-when-unchanged: regime_read + weekly_journal are gated by a
+        # macro-input fingerprint (VIX bucket + aggregate equity + per-sleeve
+        # drawdown buckets). Capital reallocation below is NOT gated since
+        # it has its own 4-week cadence guard. Event-driven Manager calls
+        # (risk_check, drawdown_response, etc.) bypass this entirely.
+        _, vix_bucket = self._live_vix()
+        sleeve_dd: dict[AgentId, DrawdownBucket] = {}
+        for aid in (AgentId.HAIKU, AgentId.SONNET, AgentId.OPUS):
+            try:
+                sleeve_dd[aid] = self.tracker.get_state(aid).drawdown_bucket
+            except Exception:
+                sleeve_dd[aid] = DrawdownBucket.NORMAL
+        mgr_fp = compute_manager_fingerprint(
+            vix_bucket=vix_bucket,
+            aggregate_equity=state.account.equity,
+            sleeve_drawdown_buckets=sleeve_dd,
+        )
+        gated_strategic_call_ran = False
+
         ctx = self._build_manager_ctx(state)
         manager_mem = self._memories[AgentId.MANAGER]
         prior_regime = manager_mem.recall("last_regime_read") or ""
-        try:
-            regime = self.manager.regime_read(state, prior_regime=prior_regime, ctx=ctx)
-            if regime:
-                # Persist for next week's prior_regime_read.
-                manager_mem.remember("last_regime_read", json.dumps(regime))
-        except Exception:
-            log.exception("manager.regime_read failed")
-        try:
-            journal = self.manager.weekly_journal(state, ctx=ctx)
-            if journal:
-                manager_mem.write_journal(state.timestamp.date(), journal)
-                self.telegram.send_weekly_report(journal)
-        except Exception:
-            log.exception("manager.weekly_journal failed")
+
+        if mgr_fp == self._last_manager_fingerprint:
+            log.info(
+                "manager.friday: skipping regime_read+weekly_journal "
+                "(macro inputs unchanged; fp=%s)", mgr_fp[:16],
+            )
+        else:
+            try:
+                regime = self.manager.regime_read(state, prior_regime=prior_regime, ctx=ctx)
+                if regime:
+                    # Persist for next week's prior_regime_read.
+                    manager_mem.remember("last_regime_read", json.dumps(regime))
+                gated_strategic_call_ran = True
+            except Exception:
+                log.exception("manager.regime_read failed")
+            try:
+                journal = self.manager.weekly_journal(state, ctx=ctx)
+                if journal:
+                    manager_mem.write_journal(state.timestamp.date(), journal)
+                    self.telegram.send_weekly_report(journal)
+                gated_strategic_call_ran = True
+            except Exception:
+                log.exception("manager.weekly_journal failed")
+            if gated_strategic_call_ran:
+                self._last_manager_fingerprint = mgr_fp
 
         # Every 4th Friday: capital reallocation
         iso_week = state.timestamp.isocalendar().week

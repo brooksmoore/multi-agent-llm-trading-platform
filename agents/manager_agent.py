@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -11,12 +14,43 @@ from agents.base import AgentState
 from agents.json_utils import parse_json_object
 from agents.llm import BudgetExhausted, LLMClient
 from agents.memory import AgentMemory
-from core.types import AgentId, Intent
+from core.types import AgentId, DrawdownBucket, Intent, VixBucket
 from ops.manager_analytics import ManagerContext
 
 _log = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "manager_agent.md"
+
+
+def compute_manager_fingerprint(
+    vix_bucket: VixBucket | None,
+    aggregate_equity: Decimal,
+    sleeve_drawdown_buckets: Mapping[AgentId, DrawdownBucket],
+) -> str:
+    """Hash the inputs that drive Manager's strategic-call decisions.
+
+    Used by app.py to skip a `regime_read` + `weekly_journal` cycle when none
+    of the macro inputs have changed since the last successful call. Scope is
+    the periodic Friday strategic call only — event-driven calls
+    (`risk_check`, `drawdown_response`, `adversarial_critique`,
+    `master_capability_proposal`, `capital_reallocation`) always run when
+    their trigger fires; budget protection there is provided by their
+    own per-event gating, not by this fingerprint.
+
+    Inputs are quantized so trivial mark-to-market noise on equity does not
+    invalidate the fingerprint mid-week (equity rounded to whole dollars).
+    """
+    eq_q = format(aggregate_equity.quantize(Decimal("1")), "f")
+    vix = str(vix_bucket.value) if vix_bucket is not None else "unknown"
+    dd_pairs = sorted(
+        (str(aid.value), str(bucket.value))
+        for aid, bucket in sleeve_drawdown_buckets.items()
+    )
+    payload = json.dumps(
+        {"vix": vix, "eq": eq_q, "dd": dd_pairs},
+        sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class ManagerAgent:
