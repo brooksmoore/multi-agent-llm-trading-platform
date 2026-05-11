@@ -17,13 +17,18 @@ from core.types import NewsItem, NewsSource
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS news_items (
-    url           TEXT PRIMARY KEY,
-    source        TEXT NOT NULL,
-    headline      TEXT NOT NULL,
-    published_at  TEXT NOT NULL,
-    summary       TEXT,
-    sentiment     REAL,
-    body          TEXT
+    url               TEXT PRIMARY KEY,
+    source            TEXT NOT NULL,
+    headline          TEXT NOT NULL,
+    published_at      TEXT NOT NULL,
+    summary           TEXT,
+    sentiment         REAL,
+    body              TEXT,
+    -- Plan 2c T2.2: NewsScorer outputs (null until scored)
+    impact            INTEGER,
+    affected_symbols  TEXT,
+    surprise          TEXT,
+    scored_at         TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS news_symbols (
@@ -150,6 +155,65 @@ class NewsStore:
             if len(items) >= limit:
                 break
         return items
+
+    def unscored_recent(
+        self,
+        since: datetime,
+        limit: int = 50,
+        min_body_chars: int = 200,
+    ) -> list[NewsItem]:
+        """Return items published since `since` that have not been scored yet (T2.2).
+
+        Pre-filters at SQL: only rows with a non-null body AND scored_at NULL
+        AND a body length over the minimum get returned. Sorted oldest-first
+        so the scorer processes the queue in publication order (helps the
+        cache amortize within each fetch cycle).
+        """
+        sql = (
+            "SELECT url, source, headline, published_at, summary, sentiment, body "
+            "FROM news_items WHERE published_at >= ? AND scored_at IS NULL "
+            "AND body IS NOT NULL AND length(body) >= ? "
+            "ORDER BY published_at ASC LIMIT ?"
+        )
+        with self._lock, self._connect() as con:
+            rows = con.execute(
+                sql, (since.isoformat(), min_body_chars, limit),
+            ).fetchall()
+            items: list[NewsItem] = []
+            for url, source, headline, published_at, summary, sentiment, body in rows:
+                sym_rows = con.execute(
+                    "SELECT symbol FROM news_symbols WHERE url = ?", (url,)
+                ).fetchall()
+                items.append(
+                    NewsItem(
+                        source=NewsSource(source),
+                        headline=headline,
+                        url=url,
+                        published_at=datetime.fromisoformat(published_at),
+                        symbols=tuple(r[0] for r in sym_rows),
+                        summary=summary,
+                        sentiment=sentiment,
+                        body=body,
+                    )
+                )
+        return items
+
+    def update_score(
+        self,
+        url: str,
+        impact: int,
+        affected_symbols: tuple[str, ...] | list[str],
+        surprise: str,
+        scored_at: datetime,
+    ) -> None:
+        """Persist NewsScorer output onto an already-stored news_items row (T2.2)."""
+        affected_csv = ",".join(s.strip().upper() for s in affected_symbols if s)
+        with self._lock, self._connect() as con:
+            con.execute(
+                "UPDATE news_items SET impact = ?, affected_symbols = ?, "
+                "surprise = ?, scored_at = ? WHERE url = ?",
+                (int(impact), affected_csv, surprise, scored_at.isoformat(), url),
+            )
 
     def prune_older_than(self, cutoff: datetime) -> int:
         """Delete items published before `cutoff`. Returns rows deleted."""

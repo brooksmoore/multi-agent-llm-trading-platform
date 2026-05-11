@@ -56,6 +56,7 @@ from agents.manager_bridge import (
 )
 from agents.llm import HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL, BudgetExhausted, LLMClient
 from agents.manager_agent import ManagerAgent, compute_manager_fingerprint
+from agents.news_scorer import NewsScorer
 from agents.memory import AgentMemory
 from agents.opus_agent import OpusAgent
 from agents.outcome_recorder import OutcomeRecorder
@@ -310,6 +311,12 @@ class App:
             edgar=EDGARAdapter(),
             rss=RSSAdapter(DEFAULT_RSS_FEEDS),
             yfinance=YFinanceAdapter(),
+        )
+        # T2.2: Haiku-powered news-impact scoring. Runs after every news
+        # fetch over the items that don't yet have a score. Cheap (~$0.0001
+        # per scored item with cache hits) and pre-filtered by body+universe.
+        self.news_scorer = NewsScorer(
+            llm=self._llm_haiku, store=self.news_store, bus=self.bus,
         )
 
         # Ops
@@ -1154,11 +1161,27 @@ class App:
 
     # News -----------------------------------------------------------------
     def _job_news_fetch(self) -> None:
-        """Pull recent news for the active universe. Idempotent — dedup by URL."""
+        """Pull recent news for the active universe. Idempotent — dedup by URL.
+
+        Plan 2c T2.2: immediately after the fetch, score any unscored items
+        from the last 48h via the Haiku NewsScorer. Crash-safe: if the bot
+        died mid-scoring last cycle, the next fetch sweeps up whatever was
+        missed (items without scored_at).
+        """
         try:
             self.news_fetcher.fetch_for_universe(self.universe, lookback_days=2)
         except Exception:
             log.exception("news fetch failed")
+        try:
+            cutoff = datetime.now(UTC) - timedelta(hours=48)
+            items = self.news_store.unscored_recent(since=cutoff, limit=50)
+            if not items:
+                log.info("news_scorer: no items met pre-filter criteria today")
+            else:
+                scored = self.news_scorer.score_batch(items)
+                log.info("news_scorer: scored %d/%d items", scored, len(items))
+        except Exception:
+            log.exception("news_scorer batch failed")
 
     def _job_news_nightly(self) -> None:
         """Wider lookback + retention prune. Runs once per day."""

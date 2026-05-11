@@ -56,6 +56,8 @@ _PROMPTS: list[tuple[str, str]] = [
     ("agents/prompts/sonnet_agent.md", SONNET_MODEL),
     ("agents/prompts/opus_agent.md", OPUS_MODEL),
     ("agents/prompts/manager_agent.md", OPUS_MODEL),
+    # T2.2: NewsScorer prompt; uses Haiku, threshold 4,096.
+    ("agents/prompts/news_scorer.md", HAIKU_MODEL),
 ]
 
 

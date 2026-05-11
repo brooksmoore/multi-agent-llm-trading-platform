@@ -171,6 +171,36 @@ class IntentSizedEvent(Event):
     estimated_slippage_bps: Decimal = Decimal("0")
 
 
+# ─── Plan 2c (T2.2 / T2.5) news + position events ────────────────────────────
+
+
+@dataclass(frozen=True)
+class NewsHighImpactScoredEvent(Event):
+    """Fired when NewsScorer rates a fresh item impact >= 4 (T2.2 + T2.5).
+
+    Subscribers can use this to trigger off-schedule deep dives or
+    notifications. Rate-limiting is the subscriber's responsibility.
+    """
+
+    name: str = field(default="news.high_impact_scored", init=False)
+    symbol: str = ""
+    impact: int = 0
+    headline: str = ""
+    published_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True)
+class PositionIntradayShockEvent(Event):
+    """Fired when a held name moves >5% intraday vs. prior close (T2.5)."""
+
+    name: str = field(default="position.intraday_shock", init=False)
+    symbol: str = ""
+    prev_close: Decimal = Decimal("0")
+    current_price: Decimal = Decimal("0")
+    shock_pct: Decimal = Decimal("0")
+    agent_holders: tuple[AgentId, ...] = ()
+
+
 # ─── Sentinel factories (only used as dataclass defaults) ─────────────────────
 
 def _missing_intent() -> Intent:
