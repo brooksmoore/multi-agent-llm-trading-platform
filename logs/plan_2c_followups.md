@@ -24,6 +24,30 @@ The 4-week cadence is a conservative default chosen for noise tolerance;
 tighter cadence is justifiable once we have evidence the noise floor is
 lower than assumed.
 
+## 2b. Per-intent realized P&L attribution for the Sunday critique (T2.4 deviation)
+
+T2.4 (Sunday adversarial critique) was specified as "3 worst-realized-
+P&L intents per sleeve" but the bot's data model doesn't support that
+ordering today:
+
+- `agent_pnl_daily` (T1.5) aggregates per (date, agent), not per intent.
+- `LotLedger` discards the per-sale price on partial trims — only fully
+  closed lots record `exit_price`.
+
+To get true per-intent realized P&L would require:
+- Walk every FILL_RECEIVED event in the OMS log
+- For each SELL fill, look up its `exit_fill_id` in the lot ledger,
+  find the matching BUY's `entry_fill_id`, then the BUY's order, then
+  the originating intent_id from the order
+- FIFO-match SELL qty against the queue of BUY-side lots and tally
+  realized P&L per intent
+
+That linkage is doable but sizeable (~150 LOC, plus tests). T2.4 ships
+with a `conviction × target_weight` heuristic — picks the high-stakes
+intents the critique prompt is calibrated for. Once the per-intent
+P&L pipeline lands (Tier 3), swap `AgentMemory.top_intents_since` for
+a P&L-ordered variant.
+
 ## 3. Risk_check fallback monitoring
 
 Track the rate of `risk_check_lite` (Sonnet downgrade) fires per week.
