@@ -257,6 +257,11 @@ class App:
         self._llm_sonnet = LLMClient(self.budget, model=SONNET_MODEL, api_key=api_key)
         self._llm_opus = LLMClient(self.budget, model=OPUS_MODEL, api_key=api_key)
         self._llm_manager = LLMClient(self.budget, model=OPUS_MODEL, api_key=api_key)
+        # T2.1: Sonnet-bound LLMClient for the Manager's risk_check_lite path
+        # (budget-protective downgrade after the daily Opus risk_check ceiling).
+        self._llm_manager_lite = LLMClient(
+            self.budget, model=SONNET_MODEL, api_key=api_key,
+        )
 
         # Agent memories (one SQLite db each)
         self._memories = {
@@ -269,7 +274,11 @@ class App:
         self.haiku = HaikuAgent(self._llm_haiku, self._memories[AgentId.HAIKU])
         self.sonnet = SonnetAgent(self._llm_sonnet, self._memories[AgentId.SONNET])
         self.opus = OpusAgent(self._llm_opus, self._memories[AgentId.OPUS])
-        self.manager = ManagerAgent(self._llm_manager, self._memories[AgentId.MANAGER])
+        self.manager = ManagerAgent(
+            self._llm_manager,
+            self._memories[AgentId.MANAGER],
+            llm_lite=self._llm_manager_lite,
+        )
 
         # Routes terminal intent outcomes (filled / rejected / cancelled /
         # expired / vetoed / unsized) back to per-agent intent_log so the LLM
@@ -754,6 +763,14 @@ class App:
         except Exception:
             log.warning("failed to publish IntentApproved", exc_info=True)
 
+        # T2.1: Manager risk_check on high-conviction, large-weight intents.
+        # Never skips for budget reasons — falls back to Sonnet (risk_check_lite)
+        # after the daily Opus risk_check ceiling is hit. A skipped review on a
+        # bad intent costs orders of magnitude more than the saved compute.
+        intent = self._maybe_manager_risk_check(intent, state)
+        if intent is None:
+            return False  # vetoed by Manager
+
         plan_result = self.planner.plan(intent, core_state, snapshot)
         if isinstance(plan_result, str):
             log.debug(
@@ -773,6 +790,99 @@ class App:
                 intent.id, intent.agent_id, "submit_error",
             )
             return False
+
+    # T2.1: Manager risk_check call site -----------------------------------
+
+    # High-conviction trigger (≥9) and material sleeve weight (≥8%) are the
+    # plan-2c thresholds for warranting a Manager review. Lower-conviction
+    # or smaller-weight intents bypass the call to keep the spend bounded.
+    _RISK_CHECK_CONVICTION_MIN: int = 9
+    _RISK_CHECK_TARGET_WEIGHT_MIN: Decimal = Decimal("0.08")
+    # ~$0.015/day budget allows ~1-2 Opus-priced fires/day; subsequent fires
+    # in the same UTC day downgrade to Sonnet (risk_check_lite).
+    _RISK_CHECK_OPUS_DAILY_CEILING: int = 2
+
+    def _risk_check_opus_count_today(self) -> int:
+        """Count today's Opus-priced risk_check calls (excludes Sonnet downgrades)."""
+        try:
+            return sum(
+                1 for e in self.budget.entries()
+                if str(e.get("call_type", "")) == "risk_check"
+            )
+        except Exception:
+            log.warning("risk_check counter: BudgetLedger read failed", exc_info=True)
+            return 0
+
+    def _maybe_manager_risk_check(
+        self, intent: Intent, state: AgentState,
+    ) -> Intent | None:
+        """Run Manager review if intent meets conviction+size threshold.
+
+        Returns the (possibly resized) intent on approve/downsize, or None on
+        veto. Never skips for budget reasons — downgrades the model class
+        instead. See agents/prompts/manager_agent.md for the risk_check.json
+        schema (decision ∈ {approve, veto, downsize}, downsize_to_weight).
+        """
+        if (
+            intent.conviction < self._RISK_CHECK_CONVICTION_MIN
+            or intent.target_weight < self._RISK_CHECK_TARGET_WEIGHT_MIN
+        ):
+            return intent
+
+        try:
+            if self._risk_check_opus_count_today() < self._RISK_CHECK_OPUS_DAILY_CEILING:
+                review = self.manager.risk_check(state, intent, ctx=None)
+            else:
+                log.info(
+                    "risk_check.downgrade:sonnet for intent %s "
+                    "(daily Opus ceiling %d hit)",
+                    intent.id, self._RISK_CHECK_OPUS_DAILY_CEILING,
+                )
+                review = self.manager.risk_check_lite(state, intent, ctx=None)
+        except Exception:
+            log.exception(
+                "risk_check failed for intent %s; allowing through",
+                intent.id,
+            )
+            return intent
+
+        decision = str(review.get("decision", "")).lower()
+        if decision == "veto":
+            log.info(
+                "Manager VETO on conv=%d weight=%s intent %s/%s: %s",
+                intent.conviction, intent.target_weight,
+                intent.agent_id, intent.symbol,
+                str(review.get("reason", ""))[:200],
+            )
+            try:
+                from core.events import IntentRejectedEvent  # noqa: PLC0415
+                self.bus.publish(IntentRejectedEvent(
+                    intent_id=intent.id, reason="vetoed:manager_risk_check",
+                ))
+            except Exception:
+                log.warning("failed to publish IntentRejected (veto)", exc_info=True)
+            self.outcome_recorder.record(
+                intent.id, intent.agent_id, "vetoed:manager_risk_check",
+            )
+            return None
+        if decision == "downsize":
+            new_weight_raw = review.get("downsize_to_weight")
+            if new_weight_raw is not None:
+                try:
+                    new_weight = Decimal(str(new_weight_raw))
+                except Exception:
+                    log.warning(
+                        "Manager downsize weight unparseable (%r); allowing original",
+                        new_weight_raw,
+                    )
+                    return intent
+                log.info(
+                    "Manager DOWNSIZE intent %s/%s: %s -> %s",
+                    intent.agent_id, intent.symbol,
+                    intent.target_weight, new_weight,
+                )
+                return replace(intent, target_weight=new_weight)
+        return intent
 
     def _evaluate_with_risk_gate(
         self,

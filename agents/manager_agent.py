@@ -56,8 +56,17 @@ def compute_manager_fingerprint(
 class ManagerAgent:
     """CIO orchestrator with six distinct call types, each with its own output schema."""
 
-    def __init__(self, llm: LLMClient, memory: AgentMemory) -> None:
+    def __init__(
+        self,
+        llm: LLMClient,
+        memory: AgentMemory,
+        llm_lite: LLMClient | None = None,
+    ) -> None:
         self._llm = llm
+        # T2.1: budget-protective Sonnet client used by risk_check_lite when
+        # the daily Opus risk_check ceiling is hit. Optional so existing
+        # callers (tests, etc.) that don't need the downgrade path still work.
+        self._llm_lite = llm_lite or llm
         self._memory = memory
         self._prompt = _PROMPT_PATH.read_text()
 
@@ -116,13 +125,12 @@ class ManagerAgent:
         ])
         return self._call_and_parse("capital_reallocation", user_msg)
 
-    def risk_check(
+    def _risk_check_user_msg(
         self,
         state: AgentState,
         intent: Intent,
-        ctx: ManagerContext | None = None,
-    ) -> dict[str, Any]:
-        """Pre-trade risk approval for a single intent → risk_check.json."""
+        ctx: ManagerContext | None,
+    ) -> str:
         lines = [f"=== Risk check @ {state.timestamp.isoformat()} ===", ""]
         if ctx is not None:
             lines += [ctx.as_prompt_block(), ""]
@@ -138,7 +146,36 @@ class ManagerAgent:
             "",
             "Return risk_check.json only.",
         ]
-        return self._call_and_parse("risk_check", "\n".join(lines))
+        return "\n".join(lines)
+
+    def risk_check(
+        self,
+        state: AgentState,
+        intent: Intent,
+        ctx: ManagerContext | None = None,
+    ) -> dict[str, Any]:
+        """Pre-trade risk approval for a single intent → risk_check.json."""
+        return self._call_and_parse(
+            "risk_check", self._risk_check_user_msg(state, intent, ctx),
+        )
+
+    def risk_check_lite(
+        self,
+        state: AgentState,
+        intent: Intent,
+        ctx: ManagerContext | None = None,
+    ) -> dict[str, Any]:
+        """Sonnet-downgraded risk_check (T2.1), used when daily Opus ceiling hit.
+
+        Same prompt and schema as `risk_check`; only the model differs.
+        Logged with call_type='risk_check_lite' so the daily Opus counter
+        in app.py can ignore lite calls when checking the ceiling.
+        """
+        return self._call_and_parse(
+            "risk_check_lite",
+            self._risk_check_user_msg(state, intent, ctx),
+            llm=self._llm_lite,
+        )
 
     def drawdown_response(
         self,
@@ -239,9 +276,15 @@ class ManagerAgent:
         ]
         return "\n".join(lines)
 
-    def _call_and_parse(self, call_type: str, user_msg: str) -> dict[str, Any]:
+    def _call_and_parse(
+        self,
+        call_type: str,
+        user_msg: str,
+        llm: LLMClient | None = None,
+    ) -> dict[str, Any]:
+        client = llm or self._llm
         try:
-            response_text, _ = self._llm.call(
+            response_text, _ = client.call(
                 system=self._prompt,
                 user=user_msg,
                 agent_id=AgentId.MANAGER,
