@@ -305,6 +305,9 @@ class App:
         # call the Manager's drawdown_response and persist the directive so
         # the affected sleeve sees it on its next observe() cycle.
         self.bus.subscribe("drawdown.ladder_fired", self._on_drawdown_ladder_fired)
+        # T2.5: off-schedule Opus deep dives triggered by high-impact news
+        # on names Opus holds. Rate-limited to 1 extra dive per ISO week.
+        self.bus.subscribe("news.high_impact_scored", self._on_news_high_impact)
 
         # News pipeline: persistence + adapters + orchestrator. Adapters are
         # constructed regardless of credentials — adapters with empty keys
@@ -1146,10 +1149,13 @@ class App:
         ordered = sorted(candidates, key=_last_dive_for)
         if slot >= len(ordered):
             return
-        symbol = ordered[slot]
+        self._opus_run_deep_dive(ordered[slot])
 
-        # Pull fresh SEC filings before assembling the doc_pack so the deep-dive
-        # has up-to-date 8-Ks/10-Qs alongside the 90-day news window.
+    def _opus_run_deep_dive(self, symbol: str) -> None:
+        """Run one Opus deep-dive on a specific symbol. Shared by scheduled
+        rotation and the off-schedule event-driven trigger (T2.5)."""
+        symbol = symbol.upper()
+        opus_mem = self._memories[AgentId.OPUS]
         try:
             self.news_fetcher.fetch_filings([symbol])
         except Exception:
@@ -1491,6 +1497,53 @@ class App:
         except Exception:
             log.exception("haiku_morning_synthesis failed")
 
+    def _on_news_high_impact(self, event: object) -> None:
+        """T2.5: trigger an off-schedule Opus deep dive on a held name when a
+        high-impact news item lands. Rate-limited to one extra dive per ISO
+        week, tracked via an Opus memory key `extra_dives_iso_week_{YYYY-Www}`.
+        """
+        symbol = str(getattr(event, "symbol", "") or "").upper()
+        if not symbol:
+            return
+        try:
+            held = self.lots.open_qty_by_symbol(AgentId.OPUS)
+        except Exception:
+            log.warning("on_news_high_impact: lot ledger query failed", exc_info=True)
+            return
+        if symbol not in {s.upper() for s in held}:
+            log.debug(
+                "on_news_high_impact: %s not held by Opus; ignoring", symbol,
+            )
+            return
+
+        # Rate limit: at most one extra dive per ISO week.
+        now = datetime.now(UTC)
+        iso_year, iso_week, _ = now.isocalendar()
+        key = f"extra_dives_iso_week_{iso_year}-W{iso_week:02d}"
+        opus_mem = self._memories[AgentId.OPUS]
+        if opus_mem.recall(key):
+            log.info(
+                "on_news_high_impact: rate-limited (already fired extra dive "
+                "this ISO week %s); skipping %s", key, symbol,
+            )
+            return
+
+        log.info(
+            "on_news_high_impact: firing off-schedule Opus deep dive on %s "
+            "(impact=%s, headline=%s)",
+            symbol,
+            getattr(event, "impact", "?"),
+            str(getattr(event, "headline", ""))[:80],
+        )
+        try:
+            self._opus_run_deep_dive(symbol)
+        except Exception:
+            log.exception("on_news_high_impact: deep dive failed for %s", symbol)
+            return
+        # Mark the slot as used only after a successful dive — failed dives
+        # don't burn the quota.
+        opus_mem.remember(key, symbol)
+
     def _on_drawdown_ladder_fired(self, event: object) -> None:
         """Wake the Manager when an agent transitions to a worse drawdown bucket.
 
@@ -1577,7 +1630,9 @@ class App:
             self._volatility_stop.wait(60.0)
 
     def _scan_volatility_once(self, today: date) -> None:
-        """Fire a Haiku news-scan if a held name moves >2σ or a macro event lands today."""
+        """Fire on macro event today OR publish PositionIntradayShockEvent on
+        >5% intraday move on any held name (T2.5).
+        """
         # Macro-event trigger
         macro_today = [
             e for e in self._macro_calendar if str(e.get("date")) == today.isoformat()
@@ -1586,9 +1641,63 @@ class App:
             log.info("Macro event today (%d): triggering Haiku scan", len(macro_today))
             self.dispatch_observation(self.haiku)
             return
-        # >2σ price-move trigger (placeholder — full vol math lives in execution/sizing)
-        # Production: compute 30-day rolling realized vol per held name and compare
-        # the current 1-bar return. Skipped on first iteration (insufficient history).
+
+        # T2.5: per-held-symbol intraday shock detection.
+        # Compute current_price / prev_close - 1 for every name any agent holds.
+        # Publish PositionIntradayShockEvent on |move| > 5%. Tolerant of
+        # missing bars (skip those symbols silently).
+        from core.events import PositionIntradayShockEvent  # noqa: PLC0415
+        try:
+            broker_positions = list(self.broker.list_positions())
+        except Exception:
+            log.warning("_scan_volatility_once: broker positions unavailable", exc_info=True)
+            return
+        held_symbols = sorted({normalize_symbol(p.symbol) for p in broker_positions})
+        if not held_symbols:
+            return
+
+        shock_threshold = Decimal("0.05")
+        for symbol in held_symbols:
+            try:
+                bars = self.market_data.get_bars(
+                    symbol,
+                    start=datetime.combine(today, datetime.min.time(), tzinfo=UTC)
+                    - timedelta(days=5),
+                    end=datetime.combine(today, datetime.min.time(), tzinfo=UTC)
+                    + timedelta(days=1),
+                )
+            except Exception:
+                continue
+            if len(bars) < 2:
+                continue
+            prev_close = bars[-2].close
+            current_price = bars[-1].close
+            if prev_close <= Decimal("0"):
+                continue
+            shock_pct = (current_price - prev_close) / prev_close
+            if abs(shock_pct) < shock_threshold:
+                continue
+            # Find agents holding this symbol so subscribers can target by sleeve.
+            holders: list[AgentId] = []
+            for aid in (AgentId.HAIKU, AgentId.SONNET, AgentId.OPUS):
+                try:
+                    if symbol in self.lots.open_qty_by_symbol(aid):
+                        holders.append(aid)
+                except Exception:
+                    continue
+            try:
+                self.bus.publish(PositionIntradayShockEvent(
+                    symbol=symbol,
+                    prev_close=prev_close,
+                    current_price=current_price,
+                    shock_pct=shock_pct,
+                    agent_holders=tuple(holders),
+                ))
+            except Exception:
+                log.warning(
+                    "_scan_volatility_once: bus.publish shock for %s failed",
+                    symbol, exc_info=True,
+                )
 
     # ── Dashboard thread ─────────────────────────────────────────────────────
 

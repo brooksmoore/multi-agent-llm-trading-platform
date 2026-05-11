@@ -48,7 +48,11 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # ── Budget ─────────────────────────────────────────────────────────────────
-    daily_spend_cap: Decimal = Field(default=Decimal("0.95"))
+    # Plan 2c (T2.6): tightened from $0.95/day to $0.10/day after the
+    # cache-prefix fix (T1.1), schedule trims (T1.2/T1.3), and signal-
+    # fingerprint gating (T1.4) reshape the call profile. Full breakdown
+    # in CLAUDE_CODE_PLAN_2C_HANDOFF.md and logs/plan_2c_followups.md.
+    daily_spend_cap: Decimal = Field(default=Decimal("0.10"))
 
     # ── Storage paths ──────────────────────────────────────────────────────────
     data_dir: str = "data"
