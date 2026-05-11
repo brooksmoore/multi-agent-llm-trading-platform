@@ -18,10 +18,6 @@ from app import (
     JOB_OPUS_FRIDAY_DEEPDIVE,
     JOB_OPUS_THURSDAY_DEEPDIVE,
     JOB_SONNET_EOD,
-    JOB_SONNET_MID_MORNING,
-    JOB_SONNET_MIDDAY,
-    JOB_SONNET_POWER_HOUR,
-    JOB_SONNET_PRE_OPEN,
     App,
 )
 from config.settings import Settings
@@ -87,8 +83,7 @@ def test_market_hours_jobs_use_weekday_cron(tmp_path: Path) -> None:
     app = _make_app(tmp_path)
     app._register_jobs()
     market_jobs = {
-        JOB_SONNET_PRE_OPEN, JOB_SONNET_MID_MORNING, JOB_SONNET_MIDDAY,
-        JOB_HAIKU_NEWS_SCAN, JOB_SONNET_POWER_HOUR, JOB_HAIKU_CLOSE,
+        JOB_HAIKU_NEWS_SCAN, JOB_HAIKU_CLOSE,
         JOB_SONNET_EOD, JOB_OPUS_DAILY,
     }
     for jid in market_jobs:
@@ -122,11 +117,7 @@ def test_scheduled_times_match_blueprint(tmp_path: Path) -> None:
     app._register_jobs()
 
     expected = {
-        JOB_SONNET_PRE_OPEN:   ("9", "25"),
-        JOB_SONNET_MID_MORNING:("10", "30"),
-        JOB_SONNET_MIDDAY:     ("12", "0"),
         JOB_HAIKU_NEWS_SCAN:   ("13", "30"),
-        JOB_SONNET_POWER_HOUR: ("15", "0"),
         JOB_HAIKU_CLOSE:       ("15", "55"),
         JOB_SONNET_EOD:        ("16", "30"),
         JOB_OPUS_DAILY:        ("16", "30"),

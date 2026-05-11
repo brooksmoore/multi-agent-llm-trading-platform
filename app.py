@@ -112,12 +112,9 @@ DEFAULT_UNIVERSE: list[str] = list(PLUMBING_UNIVERSE)
 
 # ─── Scheduler job IDs (used by tests and introspection) ─────────────────────
 
-JOB_SONNET_PRE_OPEN          = "sonnet_pre_open"          # 09:25 ET
-JOB_SONNET_MID_MORNING       = "sonnet_mid_morning"       # 10:30 ET
-JOB_SONNET_MIDDAY            = "sonnet_midday"            # 12:00 ET
 JOB_HAIKU_NEWS_SCAN          = "haiku_news_scan"          # 13:30 ET
-JOB_SONNET_POWER_HOUR        = "sonnet_power_hour"        # 15:00 ET
 JOB_HAIKU_CLOSE              = "haiku_close"              # 15:55 ET
+# Plan 2c: only Sonnet job/day. 12-1 momentum on daily bars cannot change intraday.
 JOB_SONNET_EOD               = "sonnet_eod"               # 16:30 ET
 JOB_OPUS_DAILY               = "opus_daily"               # 16:30 ET
 JOB_OPUS_THURSDAY_DEEPDIVE   = "opus_thursday_deepdive"   # Thu 16:30 ET
@@ -132,8 +129,7 @@ JOB_PORTFOLIO_SNAPSHOT       = "portfolio_snapshot"       # hourly RTH Mon-Fri T
 JOB_PORTFOLIO_SNAPSHOT_WEEKEND = "portfolio_snapshot_weekend"  # 09:00 ET Sat/Sun
 
 ALL_JOB_IDS: frozenset[str] = frozenset({
-    JOB_SONNET_PRE_OPEN, JOB_SONNET_MID_MORNING, JOB_SONNET_MIDDAY,
-    JOB_HAIKU_NEWS_SCAN, JOB_SONNET_POWER_HOUR, JOB_HAIKU_CLOSE,
+    JOB_HAIKU_NEWS_SCAN, JOB_HAIKU_CLOSE,
     JOB_SONNET_EOD, JOB_OPUS_DAILY, JOB_OPUS_THURSDAY_DEEPDIVE,
     JOB_OPUS_FRIDAY_DEEPDIVE, JOB_MANAGER_FRIDAY, JOB_MANAGER_MORNING_BRIEF, JOB_HAIKU_CRYPTO,
     JOB_BUDGET_RESET, JOB_NEWS_FETCH, JOB_NEWS_NIGHTLY,
@@ -845,24 +841,8 @@ class App:
 
         # Market-hours weekday jobs (mon-fri)
         sched.add_job(
-            self._job_sonnet_pre_open, weekday(9, 25),
-            id=JOB_SONNET_PRE_OPEN, replace_existing=True,
-        )
-        sched.add_job(
-            self._job_sonnet_mid_morning, weekday(10, 30),
-            id=JOB_SONNET_MID_MORNING, replace_existing=True,
-        )
-        sched.add_job(
-            self._job_sonnet_midday, weekday(12, 0),
-            id=JOB_SONNET_MIDDAY, replace_existing=True,
-        )
-        sched.add_job(
             self._job_haiku_news_scan, weekday(13, 30),
             id=JOB_HAIKU_NEWS_SCAN, replace_existing=True,
-        )
-        sched.add_job(
-            self._job_sonnet_power_hour, weekday(15, 0),
-            id=JOB_SONNET_POWER_HOUR, replace_existing=True,
         )
         sched.add_job(
             self._job_haiku_close, weekday(15, 55),
@@ -937,10 +917,6 @@ class App:
         )
 
     # Sonnet ---------------------------------------------------------------
-    def _job_sonnet_pre_open(self) -> None:    self.dispatch_observation(self.sonnet)
-    def _job_sonnet_mid_morning(self) -> None: self.dispatch_observation(self.sonnet)
-    def _job_sonnet_midday(self) -> None:      self.dispatch_observation(self.sonnet)
-    def _job_sonnet_power_hour(self) -> None:  self.dispatch_observation(self.sonnet)
     def _job_sonnet_eod(self) -> None:         self.dispatch_observation(self.sonnet)
 
     # Haiku ----------------------------------------------------------------
