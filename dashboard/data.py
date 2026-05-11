@@ -478,6 +478,41 @@ class DashboardData:
         finally:
             conn.close()
 
+    def agent_pnl_recent(self, limit: int = 10) -> list[dict[str, object]]:
+        """Most recent N days of per-agent P&L attribution snapshots (T1.5).
+
+        Returns one dict per (date, agent) row, newest first. Returns []
+        when the snapshot DB or the agent_pnl_daily table is missing.
+        """
+        conn = self._open_snapshot_ro()
+        if conn is None:
+            return []
+        try:
+            rows = conn.execute(
+                "SELECT date, agent_id, realized, unrealized, total, "
+                "num_open, num_closed FROM agent_pnl_daily "
+                "ORDER BY date DESC, agent_id ASC LIMIT ?",
+                (limit * 4,),  # 4 agents * limit days
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+        out: list[dict[str, object]] = []
+        for d, aid, real, unreal, total, nopen, nclosed in rows:
+            out.append(
+                {
+                    "date": str(d),
+                    "agent_id": str(aid),
+                    "realized": float(_as_decimal(real)),
+                    "unrealized": float(_as_decimal(unreal)),
+                    "total": float(_as_decimal(total)),
+                    "num_open": int(nopen),
+                    "num_closed": int(nclosed),
+                }
+            )
+        return out
+
     def sleeve_curves(self) -> list[SleeveCurvePoint]:
         """Time-series of per-agent sleeve equity, melted into one point per row."""
         conn = self._open_snapshot_ro()

@@ -92,7 +92,9 @@ from data.doc_pack import build_doc_pack
 from data.news import EDGARAdapter, FinnhubAdapter, RSSAdapter, YFinanceAdapter
 from data.news_fetcher import DEFAULT_RSS_FEEDS, NewsFetcher
 from data.news_store import NewsStore, default_retention_cutoff
+from ops.agent_pnl_store import AgentPnLStore
 from ops.alerts import AlertManager
+from ops.attribution import compute_daily_pnl
 from ops.manager_analytics import build_manager_context
 from ops.equity_snapshotter import EquitySnapshotter
 from ops.heartbeat import HeartbeatWriter
@@ -129,6 +131,7 @@ JOB_NEWS_FETCH               = "news_fetch"               # every 30 min during 
 JOB_NEWS_NIGHTLY             = "news_nightly"             # 22:00 ET full pull + prune
 JOB_PORTFOLIO_SNAPSHOT       = "portfolio_snapshot"       # hourly RTH Mon-Fri Telegram
 JOB_PORTFOLIO_SNAPSHOT_WEEKEND = "portfolio_snapshot_weekend"  # 09:00 ET Sat/Sun
+JOB_AGENT_PNL_SNAPSHOT       = "agent_pnl_snapshot"       # 16:45 ET Mon-Fri (T1.5)
 
 ALL_JOB_IDS: frozenset[str] = frozenset({
     JOB_HAIKU_NEWS_SCAN, JOB_HAIKU_CLOSE,
@@ -136,6 +139,7 @@ ALL_JOB_IDS: frozenset[str] = frozenset({
     JOB_MANAGER_FRIDAY, JOB_MANAGER_MORNING_BRIEF, JOB_HAIKU_CRYPTO,
     JOB_BUDGET_RESET, JOB_NEWS_FETCH, JOB_NEWS_NIGHTLY,
     JOB_PORTFOLIO_SNAPSHOT, JOB_PORTFOLIO_SNAPSHOT_WEEKEND,
+    JOB_AGENT_PNL_SNAPSHOT,
 })
 
 
@@ -307,6 +311,9 @@ class App:
             broker=self.broker,
             lot_ledger=self.lots,
         )
+        # T1.5 / Plan 2c: per-sleeve P&L attribution snapshots written daily
+        # at 16:45 ET. Same DB file as equity_snapshots; new table.
+        self.agent_pnl_store = AgentPnLStore(db_path=self._snapshot_db_path)
         self.telegram = TelegramAdapter(
             settings.telegram_bot_token,
             settings.telegram_chat_id,
@@ -898,6 +905,13 @@ class App:
             CronTrigger(hour=22, minute=0, timezone=et),
             id=JOB_NEWS_NIGHTLY, replace_existing=True,
         )
+        # T1.5 / Plan 2c: per-sleeve P&L attribution snapshot, 16:45 ET Mon-Fri
+        # (15 minutes after the close, giving Alpaca's daily bars time to
+        # settle so unrealized marks reflect today's session).
+        sched.add_job(
+            self._job_agent_pnl_snapshot, weekday(16, 45),
+            id=JOB_AGENT_PNL_SNAPSHOT, replace_existing=True,
+        )
         # Portfolio snapshot to Telegram: hourly during US RTH Mon-Fri, plus
         # one daily 09:00 ET ping on Sat/Sun to surface weekend crypto drift
         # without flooding off-hours.
@@ -1050,6 +1064,34 @@ class App:
                          removed, cutoff.date())
         except Exception:
             log.exception("news retention prune failed")
+
+    def _job_agent_pnl_snapshot(self) -> None:
+        """Daily 16:45 ET per-sleeve P&L attribution snapshot (T1.5).
+
+        Computes realized + unrealized P&L per agent from the lot ledger
+        (open lots marked to latest bar close), writes one row per agent
+        to `agent_pnl_daily`, and logs a one-line summary. Same-day
+        re-runs (e.g. after crash recovery) update in place via the
+        (date, agent_id) primary key.
+        """
+        try:
+            breakdowns = compute_daily_pnl(self.lots, self.store, self.market_data)
+        except Exception:
+            log.exception("agent_pnl_snapshot: compute_daily_pnl failed")
+            return
+        snap_date = datetime.now(UTC).astimezone(ET).date()
+        try:
+            self.agent_pnl_store.write_all(snap_date, breakdowns)
+        except Exception:
+            log.exception("agent_pnl_snapshot: write_all failed")
+            return
+        for aid, br in breakdowns.items():
+            log.info(
+                "agent_pnl_snapshot: %s realized=$%s unrealized=$%s "
+                "total=$%s open=%d closed=%d",
+                aid.value, br.realized, br.unrealized, br.total,
+                br.num_open_lots, br.num_closed_lots,
+            )
 
     # Manager --------------------------------------------------------------
     def _build_manager_ctx(self, state: AgentState):

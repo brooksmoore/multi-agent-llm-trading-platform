@@ -262,6 +262,15 @@ def build_app(data: DashboardData, spy: SPYProvider | None = None) -> Flask:
             [{"ts": p.ts, "cumulative": float(p.cumulative_usd)} for p in data.spend_curve()]
         )
 
+    @app.route("/api/agent_pnl")
+    def agent_pnl() -> object:
+        """Per-sleeve P&L attribution snapshots, newest first (T1.5)."""
+        try:
+            limit = int(request.args.get("limit", "10"))
+        except ValueError:
+            limit = 10
+        return jsonify(data.agent_pnl_recent(limit=max(1, min(limit, 60))))
+
     @app.route("/api/master_capability", methods=["POST"])
     def set_mc() -> object:
         body = request.get_json(silent=True) or {}
@@ -523,6 +532,25 @@ _HTML = r"""<!doctype html>
     <div id="agents" class="grid agents"></div>
   </div>
 
+  <!-- T1.5: per-sleeve P&L attribution snapshots (daily 16:45 ET) -->
+  <div class="card" style="margin-bottom:14px;">
+    <div style="padding:0 0 8px;" class="label">
+      Per-Sleeve P&amp;L Attribution · last 10 days · realized + unrealized from lot ledger
+    </div>
+    <table class="tbl mono" style="width:100%;">
+      <thead><tr>
+        <th style="text-align:left;">Date</th>
+        <th style="text-align:left;">Agent</th>
+        <th style="text-align:right;">Realized</th>
+        <th style="text-align:right;">Unrealized</th>
+        <th style="text-align:right;">Total</th>
+        <th style="text-align:right;">Open lots</th>
+        <th style="text-align:right;">Closed lots</th>
+      </tr></thead>
+      <tbody id="agent-pnl-body"><tr><td colspan="7" class="dim">no data yet</td></tr></tbody>
+    </table>
+  </div>
+
   <!-- Charts row: NAV vs SPY + sleeve curves -->
   <div class="grid charts" style="margin-bottom:14px;">
     <div class="card chart-card">
@@ -679,6 +707,34 @@ async function fetchSpendCurve() {
     const j = await r.json();
     renderSpendCurve(j);
   } catch (e) { console.error(e); }
+}
+async function fetchAgentPnl() {
+  try {
+    const r = await fetch('/api/agent_pnl?limit=10');
+    const j = await r.json();
+    renderAgentPnl(j);
+  } catch (e) { console.error(e); }
+}
+function renderAgentPnl(rows) {
+  const body = document.getElementById('agent-pnl-body');
+  if (!body) return;
+  if (!rows || rows.length === 0) {
+    body.innerHTML = '<tr><td colspan="7" class="dim">no data yet</td></tr>';
+    return;
+  }
+  const html = rows.map((r) => {
+    const cls = (v) => classForPnl(v);
+    return `<tr>
+      <td>${r.date}</td>
+      <td>${r.agent_id}</td>
+      <td style="text-align:right;" class="${cls(r.realized)}">${fmtUsd(r.realized, true)}</td>
+      <td style="text-align:right;" class="${cls(r.unrealized)}">${fmtUsd(r.unrealized, true)}</td>
+      <td style="text-align:right;" class="${cls(r.total)}">${fmtUsd(r.total, true)}</td>
+      <td style="text-align:right;">${r.num_open}</td>
+      <td style="text-align:right;">${r.num_closed}</td>
+    </tr>`;
+  }).join('');
+  body.innerHTML = html;
 }
 
 // ─── Renderers ─────────────────────────────────────────────────────────
@@ -1028,6 +1084,7 @@ function refresh() {
   fetchSleeves();
   fetchCal();
   fetchSpendCurve();
+  fetchAgentPnl();
 }
 refresh();
 setInterval(refresh, 15000);
