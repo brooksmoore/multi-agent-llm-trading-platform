@@ -128,7 +128,8 @@ JOB_HAIKU_CRYPTO             = "haiku_crypto"             # 24/7, 60-min
 JOB_BUDGET_RESET             = "budget_reset"             # UTC midnight
 JOB_NEWS_FETCH               = "news_fetch"               # every 30 min during RTH
 JOB_NEWS_NIGHTLY             = "news_nightly"             # 22:00 ET full pull + prune
-JOB_PORTFOLIO_SNAPSHOT       = "portfolio_snapshot"       # hourly Telegram
+JOB_PORTFOLIO_SNAPSHOT       = "portfolio_snapshot"       # hourly RTH Mon-Fri Telegram
+JOB_PORTFOLIO_SNAPSHOT_WEEKEND = "portfolio_snapshot_weekend"  # 09:00 ET Sat/Sun
 
 ALL_JOB_IDS: frozenset[str] = frozenset({
     JOB_SONNET_PRE_OPEN, JOB_SONNET_MID_MORNING, JOB_SONNET_MIDDAY,
@@ -136,7 +137,7 @@ ALL_JOB_IDS: frozenset[str] = frozenset({
     JOB_SONNET_EOD, JOB_OPUS_DAILY, JOB_OPUS_THURSDAY_DEEPDIVE,
     JOB_OPUS_FRIDAY_DEEPDIVE, JOB_MANAGER_FRIDAY, JOB_MANAGER_MORNING_BRIEF, JOB_HAIKU_CRYPTO,
     JOB_BUDGET_RESET, JOB_NEWS_FETCH, JOB_NEWS_NIGHTLY,
-    JOB_PORTFOLIO_SNAPSHOT,
+    JOB_PORTFOLIO_SNAPSHOT, JOB_PORTFOLIO_SNAPSHOT_WEEKEND,
 })
 
 
@@ -899,9 +900,9 @@ class App:
             CronTrigger(day_of_week="mon-fri", hour=8, minute=30, timezone=et),
             id=JOB_MANAGER_MORNING_BRIEF, replace_existing=True,
         )
-        # 24/7 Haiku crypto monitor (every 60 min)
+        # 24/7 Haiku crypto monitor (every 60 min, UTC-anchored — crypto is global)
         sched.add_job(
-            self._job_haiku_crypto, CronTrigger(minute=0, timezone=et),
+            self._job_haiku_crypto, CronTrigger(minute=0, timezone="UTC"),
             id=JOB_HAIKU_CRYPTO, replace_existing=True,
         )
         # UTC midnight budget reset
@@ -921,11 +922,18 @@ class App:
             CronTrigger(hour=22, minute=0, timezone=et),
             id=JOB_NEWS_NIGHTLY, replace_existing=True,
         )
-        # Hourly portfolio snapshot to Telegram (top of every hour).
+        # Portfolio snapshot to Telegram: hourly during US RTH Mon-Fri, plus
+        # one daily 09:00 ET ping on Sat/Sun to surface weekend crypto drift
+        # without flooding off-hours.
         sched.add_job(
             self._job_portfolio_snapshot,
-            CronTrigger(minute=0, timezone="UTC"),
+            CronTrigger(day_of_week="mon-fri", hour="9-16", minute=0, timezone=et),
             id=JOB_PORTFOLIO_SNAPSHOT, replace_existing=True,
+        )
+        sched.add_job(
+            self._job_portfolio_snapshot,
+            CronTrigger(day_of_week="sat,sun", hour=9, minute=0, timezone=et),
+            id=JOB_PORTFOLIO_SNAPSHOT_WEEKEND, replace_existing=True,
         )
 
     # Sonnet ---------------------------------------------------------------
