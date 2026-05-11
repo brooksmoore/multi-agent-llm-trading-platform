@@ -48,6 +48,38 @@ intents the critique prompt is calibrated for. Once the per-intent
 P&L pipeline lands (Tier 3), swap `AgentMemory.top_intents_since` for
 a P&L-ordered variant.
 
+## 5. RiskGate gross-cap check should consider running holdings, not just the new order
+
+**Surfaced by the 2026-05-11 over-leverage incident** (see `planner-rebalance-delta`
+branch for the planner half of the fix).
+
+The RiskGate's gross-cap check evaluates each incoming order's notional
+against `effective_max_gross × sleeve_equity` *in isolation*. It does
+NOT add the agent's existing position notional. So a sequence of 6
+individually-cap-compliant orders can compound into a 4× cap breach if
+the planner sizes them without delta math (which it does pre-fix).
+
+The planner-rebalance-delta fix prevents the precipitating cause (the
+planner now sizes the delta, not the full target). But layered defense
+is the right design: even if a planner bug recurs in some other form,
+the RiskGate should refuse to approve an order that would push *total
+gross exposure* over the cap.
+
+Concrete change in `execution/risk.py`:
+
+```python
+current_gross = sum(
+    self._lots.total_open_qty(intent.agent_id, sym) * mark
+    for sym, mark in current_marks_for_agent.items()
+)
+projected_gross = current_gross + intended_order_notional
+if projected_gross > effective_max_gross * agent_state.sleeve_equity:
+    return Veto("exposure_cap_breach")
+```
+
+Small change but load-bearing. Worth landing alongside the planner fix
+before re-enabling live trading.
+
 ## 3. Risk_check fallback monitoring
 
 Track the rate of `risk_check_lite` (Sonnet downgrade) fires per week.

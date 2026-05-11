@@ -74,6 +74,8 @@ from core.types import (
     Intent,
     KillSwitchState,
     MarketSnapshot,
+    Order,
+    OrderSide,
     Sleeve,
     VixBucket,
     normalize_symbol,
@@ -807,6 +809,19 @@ class App:
             return False
         order = plan_result
 
+        # Account-level guards (planner-rebalance-delta backstops). Both
+        # checks are evaluated for adds only (BUY-side orders that increase
+        # gross). Trims pass through — the system needs to be able to
+        # de-leverage even from an over-cap state.
+        account_veto = self._account_level_pre_check(order, snapshot)
+        if account_veto is not None:
+            log.warning(
+                "account guard veto for %s/%s: %s",
+                intent.agent_id, intent.symbol, account_veto,
+            )
+            self.outcome_recorder.record(intent.id, intent.agent_id, account_veto)
+            return False
+
         try:
             self.oms.submit_order(order)
             return True
@@ -816,6 +831,72 @@ class App:
                 intent.id, intent.agent_id, "submit_error",
             )
             return False
+
+    # planner-rebalance-delta: account-level guards -------------------------
+
+    # Absolute account-leverage backstop. Per-sleeve caps sum to ~1.125× at
+    # full extension (Haiku 1.5 + Sonnet 1.25 + Opus 1.0 = 3.75× of $30k on
+    # $100k account). 1.5× is the hard wall — anything more requires a
+    # planner/risk bug to have produced it, and a stop is warranted.
+    _ACCOUNT_LEVERAGE_CAP: Decimal = Decimal("1.50")
+    # Buying-power utilization cap: refuse orders that would consume more
+    # than 90% of remaining buying power. Avoids Alpaca-side rejections and
+    # leaves headroom for crypto sleeve activity.
+    _BUYING_POWER_UTILIZATION_CAP: Decimal = Decimal("0.90")
+
+    def _account_level_pre_check(
+        self, order: Order, snapshot: MarketSnapshot,
+    ) -> str | None:
+        """Last-mile guards: account-leverage backstop + buying-power check.
+
+        Both apply to BUY orders only — SELL orders reduce leverage and free
+        buying power, so they always pass. Returns an outcome-string veto
+        reason, or None to allow.
+        """
+        if order.side != OrderSide.BUY:
+            return None
+        try:
+            account = self.broker.get_account()
+        except Exception:
+            log.warning("account_pre_check: broker.get_account failed; "
+                        "allowing through", exc_info=True)
+            return None
+
+        # Compute this order's notional from the latest mark.
+        mark = snapshot.current_prices.get(normalize_symbol(order.symbol))
+        if mark is None or mark <= Decimal("0"):
+            # Without a mark we can't reason about the dollar impact;
+            # let it through (risk gate already approved on a per-sleeve basis).
+            return None
+        intended_notional = order.qty * mark
+
+        # 1. Buying-power pre-check.
+        if account.buying_power > Decimal("0"):
+            if intended_notional > self._BUYING_POWER_UTILIZATION_CAP * account.buying_power:
+                return (
+                    f"account_guard:buying_power "
+                    f"(intended=${intended_notional:.0f} "
+                    f"> {float(self._BUYING_POWER_UTILIZATION_CAP):.0%} "
+                    f"of ${account.buying_power:.0f})"
+                )
+        elif intended_notional > Decimal("0"):
+            return "account_guard:buying_power_zero"
+
+        # 2. Account-leverage backstop. Long market value is derived from
+        # equity and cash (equity = cash + lmv), so lmv = equity - cash.
+        # Holds for both cash-positive and margin-debt states. Verified
+        # against Alpaca's reported long_market_value 2026-05-11.
+        if account.equity > Decimal("0"):
+            current_lmv = account.equity - account.cash
+            projected_lmv = current_lmv + intended_notional
+            projected_leverage = projected_lmv / account.equity
+            if projected_leverage > self._ACCOUNT_LEVERAGE_CAP:
+                return (
+                    f"account_guard:leverage_cap "
+                    f"(projected={float(projected_leverage):.2f}x "
+                    f"> {float(self._ACCOUNT_LEVERAGE_CAP):.2f}x)"
+                )
+        return None
 
     # T2.1: Manager risk_check call site -----------------------------------
 

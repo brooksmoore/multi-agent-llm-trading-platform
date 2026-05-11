@@ -689,7 +689,7 @@ class TestPlannerDeltaAware:
 
     def _plan(self, planner: ExecutionPlanner, intent: Intent,
               state: AgentState | None = None,
-              snap: MarketSnapshot | None = None):  # noqa: ANN202
+              snap: MarketSnapshot | None = None) -> object:
         state = state or _agent_state()
         # Sonnet vol_target=0.25; realized_vol=0.25 makes the sizing_mult
         # exactly 1.0, so target_notional = target_weight × equity. Keeps
@@ -838,3 +838,99 @@ class TestPlannerDeltaAware:
         assert order.side == OrderSide.SELL
         assert order.qty > Decimal("0")
         assert order.qty < Decimal("2.0")  # not full close
+
+
+# ── Sleeve-aggregate gross cap (followup #5 backstop) ─────────────────────────
+
+
+class TestPlannerSleeveGrossCap:
+    """Verify the aggregate-gross backstop catches what individual-order
+    checks miss. Even with the delta fix, a sequence of small deltas can
+    accumulate over many symbols past the cap — this layered guard refuses
+    any positive-delta add that would push total gross over the cap.
+    """
+
+    def _plan(self, planner: ExecutionPlanner, intent: Intent,
+              state: AgentState | None = None,
+              snap: MarketSnapshot | None = None) -> object:
+        state = state or _agent_state()
+        snap = snap or _snapshot(vol=Decimal("0.25"))
+        with patch("execution.planner.runtime_store") as mock_rs:
+            mock_rs.master_capability = Decimal("1.0")
+            return planner.plan(intent, state, snap)
+
+    def test_buy_blocked_when_existing_holdings_exceed_cap(self) -> None:
+        """If we already hold $1500 of OTHER names (= 1.5× cap on $1000
+        sleeve, Sonnet's 1.25× × MC=1.0), no positive-delta add is allowed."""
+        planner, _oms, ledger, *_ = _make_planner()
+        # Seed $1500 across two unrelated names — over Sonnet's 1.25× cap
+        _seed_position(ledger, symbol="QQQ", qty=Decimal("10"),
+                       price=Decimal("100"))  # $1000
+        _seed_position(ledger, symbol="IWM", qty=Decimal("5"),
+                       price=Decimal("100"))  # $500
+        # Provide marks for the held names too, so sleeve_gross is accurate.
+        snap = MarketSnapshot(
+            current_prices={"SPY": Decimal("100"), "QQQ": Decimal("100"),
+                            "IWM": Decimal("100")},
+            realized_vol_30d={"SPY": Decimal("0.25"), "QQQ": Decimal("0.25"),
+                              "IWM": Decimal("0.25")},
+            vix_bucket=VixBucket.SWEET_SPOT,
+            timestamp=_TS,
+        )
+
+        result = self._plan(planner, _intent(action=Action.BUY,
+                                              target_weight=Decimal("0.10")),
+                            snap=snap)
+        assert result == "unsized:sleeve_gross_breach"
+
+    def test_sell_passes_even_when_over_cap(self) -> None:
+        """Negative-delta orders (trims) ALWAYS pass the gross-cap check —
+        they reduce gross, never increase it. Required so we can dig out."""
+        planner, _oms, ledger, *_ = _make_planner()
+        # Seed way over cap
+        _seed_position(ledger, symbol="SPY", qty=Decimal("30"),
+                       price=Decimal("100"))  # $3000 = 3× cap
+
+        order = self._plan(planner,
+                           _intent(action=Action.REBALANCE_TO,
+                                    target_weight=Decimal("0.05")))
+        # Trim from $3000 down to $50 = SELL of ~$2950
+        assert not isinstance(order, str)
+        assert order.side == OrderSide.SELL
+
+    def test_close_path_passes_even_when_over_cap(self) -> None:
+        """SELL with target_weight=0 routes to _plan_close and exits the
+        entire position regardless of gross. Required so trend-flip exits
+        can flatten an over-leveraged book."""
+        planner, _oms, ledger, *_ = _make_planner()
+        _seed_position(ledger, symbol="SPY", qty=Decimal("30"),
+                       price=Decimal("100"))
+
+        order = self._plan(planner, _intent(action=Action.SELL,
+                                             target_weight=Decimal("0")))
+        assert not isinstance(order, str)
+        assert order.side == OrderSide.SELL
+        assert order.qty == Decimal("30")
+
+    def test_first_position_in_an_empty_sleeve_passes(self) -> None:
+        """Empty sleeve: zero existing gross. First BUY at target sizes
+        normally — gross is just this order's notional, well under cap."""
+        planner, _oms, _ledger, *_ = _make_planner()
+
+        order = self._plan(planner, _intent(action=Action.BUY,
+                                             target_weight=Decimal("0.10")))
+        assert not isinstance(order, str)
+        assert order.qty > Decimal("0")
+
+    def test_add_within_cap_passes(self) -> None:
+        """We hold $300 and want to add to $500. Cap is $1250 (Sonnet
+        1.25× × $1000). Projected gross $500 < cap → allowed."""
+        planner, _oms, ledger, *_ = _make_planner()
+        _seed_position(ledger, symbol="SPY", qty=Decimal("3"),
+                       price=Decimal("100"))
+
+        order = self._plan(planner, _intent(action=Action.REBALANCE_TO,
+                                             target_weight=Decimal("0.50")))
+        # Cap=$1250; target=$500; current=$300; projected=$500 → OK
+        assert not isinstance(order, str)
+        assert order.side == OrderSide.BUY

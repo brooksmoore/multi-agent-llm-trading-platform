@@ -23,6 +23,7 @@ from config.universes import estimated_slippage_bps
 from core.events import EventBus, IntentSizedEvent
 from core.types import (
     Action,
+    AgentId,
     AgentState,
     Intent,
     MarketSnapshot,
@@ -68,6 +69,11 @@ PLAN_REJECT_NEAR_TARGET: str = "unsized:near_target"
 # (or SELL) to trim. Surfaces LLM intent-vocabulary errors rather than
 # silently over-buying as the pre-fix planner did.
 PLAN_REJECT_ALREADY_AT_TARGET: str = "unsized:already_at_target"
+# New: aggregate sleeve gross would breach the effective_max_gross cap
+# after this order. Backstop against compounding bugs across multiple
+# symbols — even if each individual intent looks cap-compliant, summing
+# across the sleeve's existing positions should not exceed the cap.
+PLAN_REJECT_SLEEVE_GROSS_BREACH: str = "unsized:sleeve_gross_breach"
 
 _CLOSING_ACTIONS: frozenset[Action] = frozenset({Action.SELL, Action.CLOSE})
 
@@ -103,6 +109,7 @@ class ExecutionPlanner:
         # planner-rebalance-delta counters
         self.dropped_near_target: int = 0
         self.dropped_already_at_target: int = 0
+        self.dropped_sleeve_gross_breach: int = 0
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -247,6 +254,29 @@ class ExecutionPlanner:
             self.dropped_near_target += 1
             return PLAN_REJECT_NEAR_TARGET
 
+        # ── Sleeve-aggregate gross cap (followup #5 backstop) ────────────────
+        # The per-sleeve cap was previously checked only against the new
+        # order's notional in isolation. The 2026-05-11 incident showed that
+        # compounded across multiple symbols + cycles, individually-OK orders
+        # can breach the cap. Now we additionally check the sleeve's total
+        # gross AFTER this delta against the cap. Trim-direction orders
+        # (delta < 0) always pass this check since they reduce gross.
+        if not is_options and delta_notional > Decimal("0"):
+            current_sleeve_gross = self._sleeve_gross_notional(
+                intent.agent_id, market_snapshot,
+            )
+            projected_sleeve_gross = current_sleeve_gross + delta_notional
+            if projected_sleeve_gross > gross_cap:
+                log.warning(
+                    "planner: %s %s/%s rejected — sleeve gross cap breach "
+                    "(current=$%.2f delta=$%.2f projected=$%.2f cap=$%.2f)",
+                    intent.action, intent.agent_id, symbol,
+                    current_sleeve_gross, delta_notional,
+                    projected_sleeve_gross, gross_cap,
+                )
+                self.dropped_sleeve_gross_breach += 1
+                return PLAN_REJECT_SLEEVE_GROSS_BREACH
+
         # The "position_value" we'll size the actual order against is the
         # absolute delta (NOT the full target). For options legs this
         # falls back to the legacy fresh-position sizing because options
@@ -364,6 +394,31 @@ class ExecutionPlanner:
         return order
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _sleeve_gross_notional(
+        self,
+        agent_id: AgentId,
+        market_snapshot: MarketSnapshot,
+    ) -> Decimal:
+        """Total gross notional of the agent's open positions, marked to
+        current_prices. Symbols whose marks are missing fall back to the
+        lot's entry_price — a conservative estimate (recent moves on held
+        names tend to be small in absolute terms). Used by the sleeve-gross
+        cap backstop.
+        """
+        total = Decimal("0")
+        open_by_symbol = self._ledger.open_qty_by_symbol(agent_id)
+        for sym, qty in open_by_symbol.items():
+            if qty <= Decimal("0"):
+                continue
+            mark = market_snapshot.current_prices.get(_normalize_symbol(sym))
+            if mark is None or mark <= Decimal("0"):
+                # Fall back to a representative entry price from any open lot
+                # of this symbol. Cheaper than fetching fresh marks here.
+                lots = self._ledger.open_lots(agent_id, sym)
+                mark = lots[0].entry_price if lots else Decimal("0")
+            total += qty * mark
+        return total
 
     def _plan_close(
         self,
