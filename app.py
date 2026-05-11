@@ -116,9 +116,11 @@ JOB_HAIKU_NEWS_SCAN          = "haiku_news_scan"          # 13:30 ET
 JOB_HAIKU_CLOSE              = "haiku_close"              # 15:55 ET
 # Plan 2c: only Sonnet job/day. 12-1 momentum on daily bars cannot change intraday.
 JOB_SONNET_EOD               = "sonnet_eod"               # 16:30 ET
-JOB_OPUS_DAILY               = "opus_daily"               # 16:30 ET
+# Plan 2c: removed JOB_OPUS_DAILY and JOB_OPUS_FRIDAY_DEEPDIVE.
+# Opus runs once weekly as a deep dive on Thursday, giving Friday's
+# Manager journal fresh input. Off-schedule deep dives still fire
+# event-driven on NewsHighImpactScoredEvent (T2.5), rate-limited.
 JOB_OPUS_THURSDAY_DEEPDIVE   = "opus_thursday_deepdive"   # Thu 16:30 ET
-JOB_OPUS_FRIDAY_DEEPDIVE     = "opus_friday_deepdive"     # Fri 16:30 ET
 JOB_MANAGER_FRIDAY           = "manager_friday"           # Fri 17:00 ET
 JOB_MANAGER_MORNING_BRIEF    = "manager_morning_brief"    # Mon-Fri 08:30 ET
 JOB_HAIKU_CRYPTO             = "haiku_crypto"             # 24/7, 60-min
@@ -130,8 +132,8 @@ JOB_PORTFOLIO_SNAPSHOT_WEEKEND = "portfolio_snapshot_weekend"  # 09:00 ET Sat/Su
 
 ALL_JOB_IDS: frozenset[str] = frozenset({
     JOB_HAIKU_NEWS_SCAN, JOB_HAIKU_CLOSE,
-    JOB_SONNET_EOD, JOB_OPUS_DAILY, JOB_OPUS_THURSDAY_DEEPDIVE,
-    JOB_OPUS_FRIDAY_DEEPDIVE, JOB_MANAGER_FRIDAY, JOB_MANAGER_MORNING_BRIEF, JOB_HAIKU_CRYPTO,
+    JOB_SONNET_EOD, JOB_OPUS_THURSDAY_DEEPDIVE,
+    JOB_MANAGER_FRIDAY, JOB_MANAGER_MORNING_BRIEF, JOB_HAIKU_CRYPTO,
     JOB_BUDGET_RESET, JOB_NEWS_FETCH, JOB_NEWS_NIGHTLY,
     JOB_PORTFOLIO_SNAPSHOT, JOB_PORTFOLIO_SNAPSHOT_WEEKEND,
 })
@@ -852,20 +854,11 @@ class App:
             self._job_sonnet_eod, weekday(16, 30),
             id=JOB_SONNET_EOD, replace_existing=True,
         )
-        sched.add_job(
-            self._job_opus_daily, weekday(16, 30),
-            id=JOB_OPUS_DAILY, replace_existing=True,
-        )
-        # Weekly (Thu/Fri) deep dives + manager
+        # Weekly Thursday deep-dive + Friday manager
         sched.add_job(
             self._job_opus_thursday_deepdive,
             CronTrigger(day_of_week="thu", hour=16, minute=30, timezone=et),
             id=JOB_OPUS_THURSDAY_DEEPDIVE, replace_existing=True,
-        )
-        sched.add_job(
-            self._job_opus_friday_deepdive,
-            CronTrigger(day_of_week="fri", hour=16, minute=30, timezone=et),
-            id=JOB_OPUS_FRIDAY_DEEPDIVE, replace_existing=True,
         )
         sched.add_job(
             self._job_manager_friday,
@@ -957,14 +950,8 @@ class App:
             log.warning("portfolio_snapshot: telegram send failed", exc_info=True)
 
     # Opus -----------------------------------------------------------------
-    def _job_opus_daily(self) -> None:
-        self.dispatch_observation(self.opus)
-
     def _job_opus_thursday_deepdive(self) -> None:
         self._opus_deep_dive_rotation(slot=0)
-
-    def _job_opus_friday_deepdive(self) -> None:
-        self._opus_deep_dive_rotation(slot=1)
 
     def _opus_deep_dive_rotation(self, *, slot: int) -> None:
         """Pick the slot-th-oldest deep-dive candidate and run on it.

@@ -14,8 +14,6 @@ from app import (
     JOB_HAIKU_CRYPTO,
     JOB_HAIKU_NEWS_SCAN,
     JOB_MANAGER_FRIDAY,
-    JOB_OPUS_DAILY,
-    JOB_OPUS_FRIDAY_DEEPDIVE,
     JOB_OPUS_THURSDAY_DEEPDIVE,
     JOB_SONNET_EOD,
     App,
@@ -84,7 +82,7 @@ def test_market_hours_jobs_use_weekday_cron(tmp_path: Path) -> None:
     app._register_jobs()
     market_jobs = {
         JOB_HAIKU_NEWS_SCAN, JOB_HAIKU_CLOSE,
-        JOB_SONNET_EOD, JOB_OPUS_DAILY,
+        JOB_SONNET_EOD,
     }
     for jid in market_jobs:
         job = app.scheduler.get_job(jid)
@@ -100,11 +98,10 @@ def test_market_hours_jobs_use_weekday_cron(tmp_path: Path) -> None:
 def test_friday_only_jobs(tmp_path: Path) -> None:
     app = _make_app(tmp_path)
     app._register_jobs()
-    for jid in (JOB_OPUS_FRIDAY_DEEPDIVE, JOB_MANAGER_FRIDAY):
-        job = app.scheduler.get_job(jid)
-        fields = {f.name: str(f) for f in job.trigger.fields}
-        assert "fri" in fields["day_of_week"]
-    # Thursday-only deep dive
+    job = app.scheduler.get_job(JOB_MANAGER_FRIDAY)
+    fields = {f.name: str(f) for f in job.trigger.fields}
+    assert "fri" in fields["day_of_week"]
+    # Thursday-only deep dive (Plan 2c: Friday deep dive removed)
     job = app.scheduler.get_job(JOB_OPUS_THURSDAY_DEEPDIVE)
     fields = {f.name: str(f) for f in job.trigger.fields}
     assert "thu" in fields["day_of_week"]
@@ -120,7 +117,7 @@ def test_scheduled_times_match_blueprint(tmp_path: Path) -> None:
         JOB_HAIKU_NEWS_SCAN:   ("13", "30"),
         JOB_HAIKU_CLOSE:       ("15", "55"),
         JOB_SONNET_EOD:        ("16", "30"),
-        JOB_OPUS_DAILY:        ("16", "30"),
+        JOB_OPUS_THURSDAY_DEEPDIVE: ("16", "30"),
         JOB_MANAGER_FRIDAY:    ("17", "0"),
     }
     for jid, (h, m) in expected.items():
