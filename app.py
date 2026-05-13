@@ -369,6 +369,12 @@ class App:
         self._stopped = False
         self._stop_lock = threading.Lock()
         self._macro_calendar: list[dict[str, Any]] = self._load_macro_calendar()
+        # Track which (date, type) pairs we've already fired Haiku for today.
+        # Without this, the volatility scanner's 60s loop fires the SAME macro
+        # event every minute it's "today" — the fingerprint gate caught most
+        # but enough slipped through to drive ~30+ Haiku calls/day. Reset
+        # implicitly via tomorrow's date being absent from the set.
+        self._fired_macro_events: set[tuple[str, str]] = set()
 
         # VIX cache: (cached_at, vix_value, vix_bucket).  ^VIX is fetched lazily
         # via market_data; falls back to SWEET_SPOT on failure (warned once).
@@ -1714,14 +1720,27 @@ class App:
         """Fire on macro event today OR publish PositionIntradayShockEvent on
         >5% intraday move on any held name (T2.5).
         """
-        # Macro-event trigger
+        # Macro-event trigger — once per distinct (date, type), not every minute.
+        today_iso = today.isoformat()
         macro_today = [
-            e for e in self._macro_calendar if str(e.get("date")) == today.isoformat()
+            e for e in self._macro_calendar if str(e.get("date")) == today_iso
         ]
-        if macro_today:
-            log.info("Macro event today (%d): triggering Haiku scan", len(macro_today))
+        new_events = [
+            e for e in macro_today
+            if (today_iso, str(e.get("type", ""))) not in self._fired_macro_events
+        ]
+        if new_events:
+            log.info(
+                "Macro event today (%d new, %d total): triggering Haiku scan",
+                len(new_events), len(macro_today),
+            )
+            for e in new_events:
+                self._fired_macro_events.add((today_iso, str(e.get("type", ""))))
             self.dispatch_observation(self.haiku)
             return
+        # If macro events exist for today but all already fired, fall through
+        # to the intraday-shock scan. (Don't `return` here, otherwise shock
+        # detection is starved on macro-event days.)
 
         # T2.5: per-held-symbol intraday shock detection.
         # Compute current_price / prev_close - 1 for every name any agent holds.

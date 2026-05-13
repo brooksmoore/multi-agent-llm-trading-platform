@@ -241,3 +241,59 @@ def test_volatility_scan_publishes_negative_shock_too(app: App) -> None:
 
     assert len(received) == 1
     assert received[0].shock_pct < Decimal("0")
+
+
+# ── Macro-event Haiku trigger (churn-and-trigger-fixes) ──────────────────────
+
+
+def test_macro_event_triggers_haiku_once_then_dedupes(app: App) -> None:
+    """First scan with a macro event today fires Haiku; subsequent scans
+    same day do NOT re-fire (the 60s loop was repeatedly triggering the
+    same event, causing dozens of redundant LLM calls)."""
+    today = datetime.now(UTC).date()
+    app._macro_calendar = [
+        {"date": today.isoformat(), "type": "CPI",
+         "description": "CPI release", "impact": "high"},
+    ]
+    app.dispatch_observation = MagicMock()  # type: ignore[method-assign]
+
+    app._scan_volatility_once(today)
+    app._scan_volatility_once(today)
+    app._scan_volatility_once(today)
+
+    assert app.dispatch_observation.call_count == 1
+
+
+def test_macro_event_distinct_types_each_fire_once(app: App) -> None:
+    """Two distinct macro events on the same day each get one trigger."""
+    today = datetime.now(UTC).date()
+    app._macro_calendar = [
+        {"date": today.isoformat(), "type": "CPI", "impact": "high"},
+        {"date": today.isoformat(), "type": "FOMC", "impact": "high"},
+    ]
+    app.dispatch_observation = MagicMock()  # type: ignore[method-assign]
+
+    # Single pass: both new → one Haiku trigger (both event types marked fired)
+    app._scan_volatility_once(today)
+    assert app.dispatch_observation.call_count == 1
+    # Subsequent passes today: no further fires
+    app._scan_volatility_once(today)
+    app._scan_volatility_once(today)
+    assert app.dispatch_observation.call_count == 1
+
+
+def test_macro_event_resets_naturally_on_date_change(app: App) -> None:
+    """A new day's events are unfired even if yesterday's were already
+    handled — set keys are (date_iso, type)."""
+    yesterday = datetime.now(UTC).date() - timedelta(days=1)
+    today = datetime.now(UTC).date()
+    app._macro_calendar = [
+        {"date": yesterday.isoformat(), "type": "CPI", "impact": "high"},
+        {"date": today.isoformat(), "type": "CPI", "impact": "high"},
+    ]
+    app.dispatch_observation = MagicMock()  # type: ignore[method-assign]
+
+    app._scan_volatility_once(yesterday)
+    assert app.dispatch_observation.call_count == 1
+    app._scan_volatility_once(today)
+    assert app.dispatch_observation.call_count == 2

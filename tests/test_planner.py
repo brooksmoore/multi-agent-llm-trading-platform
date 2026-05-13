@@ -43,7 +43,7 @@ from core.types import (
     VixBucket,
     new_id,
 )
-from execution.fake_broker import FakeBroker
+from execution.fake_broker import FakeBroker, FillMode
 from execution.lots import LotLedger
 from execution.oms import OMS
 from execution.oms_store import OMSStore
@@ -934,3 +934,153 @@ class TestPlannerSleeveGrossCap:
         # Cap=$1250; target=$500; current=$300; projected=$500 → OK
         assert not isinstance(order, str)
         assert order.side == OrderSide.BUY
+
+
+# ── Pending unfilled BUYs counted as effective exposure (churn-and-trigger-fixes)
+#
+# Pre-market hourly Haiku ticks each saw a flat ledger (DAY orders don't fill
+# until 09:30) and re-bought the full target every cycle. At market open every
+# queued order filled simultaneously, blowing past the sleeve cap. The fix:
+# include unfilled qty from open BUY orders in `effective_current_qty` so the
+# delta math sees pending exposure and the next tick skips as already-at-target.
+
+
+class TestPlannerPendingOrders:
+    """Verify pending unfilled BUYs are treated as exposure-on-the-way."""
+
+    def _plan(self, planner: ExecutionPlanner, intent: Intent,
+              state: AgentState | None = None,
+              snap: MarketSnapshot | None = None) -> object:
+        state = state or _agent_state()
+        snap = snap or _snapshot(vol=Decimal("0.25"))
+        with patch("execution.planner.runtime_store") as mock_rs:
+            mock_rs.master_capability = Decimal("1.0")
+            return planner.plan(intent, state, snap)
+
+    def test_second_buy_blocked_when_pending_covers_target(
+        self, tmp_path: pytest.TempPathFactory,
+    ) -> None:
+        """First tick queues a BUY; broker holds it open (MANUAL fill mode,
+        simulating pre-market DAY order). Second tick for the same target
+        weight must NOT add another BUY — pending qty already covers it."""
+        broker = FakeBroker(fill_mode=FillMode.MANUAL)
+        broker.set_price("SPY", _MARK)
+        bus = EventBus()
+        ledger = LotLedger()
+        store = OMSStore(str(tmp_path / "oms.db"))
+        oms = OMS(broker=broker, store=store, bus=bus, clock=WallClock())
+        planner = ExecutionPlanner(oms=oms, lot_ledger=ledger, bus=bus)
+
+        # Tick 1: plan and submit a BUY. Order sits in ACCEPTED state.
+        intent1 = _intent(target_weight=Decimal("0.10"))
+        order1 = self._plan(planner, intent1)
+        assert not isinstance(order1, str)
+        result = oms.submit_order(order1)
+        assert result.accepted
+        # Verify the order is still open (unfilled) on the OMS.
+        assert len(oms.list_open_orders()) == 1
+
+        # Tick 2: same agent, same symbol, same target_weight. Pending
+        # unfilled qty fully covers the target → reject as already-at-target.
+        intent2 = _intent(target_weight=Decimal("0.10"))
+        outcome = self._plan(planner, intent2)
+        assert outcome == "unsized:already_at_target", (
+            f"expected already_at_target; got {outcome}"
+        )
+
+    def test_second_buy_sizes_only_incremental_when_target_raised(
+        self, tmp_path: pytest.TempPathFactory,
+    ) -> None:
+        """If the second tick raises the target weight, the new BUY should
+        size only the *incremental* delta over (filled + pending)."""
+        broker = FakeBroker(fill_mode=FillMode.MANUAL)
+        broker.set_price("SPY", _MARK)
+        bus = EventBus()
+        ledger = LotLedger()
+        store = OMSStore(str(tmp_path / "oms.db"))
+        oms = OMS(broker=broker, store=store, bus=bus, clock=WallClock())
+        planner = ExecutionPlanner(oms=oms, lot_ledger=ledger, bus=bus)
+
+        # Tick 1 — target 10%
+        order1 = self._plan(planner, _intent(target_weight=Decimal("0.10")))
+        assert not isinstance(order1, str)
+        oms.submit_order(order1)
+        first_qty = order1.qty
+
+        # Tick 2 — target 20%. The delta should be ~the same size as order1,
+        # NOT another full-target order.
+        order2 = self._plan(planner, _intent(target_weight=Decimal("0.20")))
+        assert not isinstance(order2, str)
+        # Roughly: order2.qty ≈ order1.qty (one full extra tranche, not two).
+        # Allow a generous band — exact sizing depends on vol-target math.
+        assert order2.qty < first_qty * Decimal("1.5"), (
+            f"order2={order2.qty} not bounded by ~one delta over order1={first_qty}"
+        )
+
+    def test_filled_order_does_not_count_as_pending(
+        self, tmp_path: pytest.TempPathFactory,
+    ) -> None:
+        """Once an order fills, its qty is in the ledger, not the pending
+        bucket. Don't double-count — the second tick should still skip
+        (because filled qty alone covers the target)."""
+        broker = FakeBroker(fill_mode=FillMode.INSTANT)
+        broker.set_price("SPY", _MARK)
+        bus = EventBus()
+        ledger = LotLedger()
+        clock = WallClock()
+        store = OMSStore(str(tmp_path / "oms.db"))
+        oms = OMS(broker=broker, store=store, bus=bus, clock=clock)
+
+        from core.events import FillReceivedEvent  # noqa: PLC0415
+
+        def _on_fill(event: FillReceivedEvent) -> None:  # type: ignore[misc]
+            if event.fill.side == OrderSide.BUY:
+                ledger.open_lot(event.fill)
+
+        bus.subscribe("fill.received", _on_fill)  # type: ignore[arg-type]
+        planner = ExecutionPlanner(oms=oms, lot_ledger=ledger, bus=bus)
+
+        # Tick 1: fills immediately under INSTANT mode.
+        order1 = self._plan(planner, _intent(target_weight=Decimal("0.10")))
+        assert not isinstance(order1, str)
+        oms.submit_order(order1)
+        # Ledger should now hold the filled qty.
+        assert ledger.total_open_qty(AgentId.SONNET, "SPY") > Decimal("0")
+        # And no orders should be in the "open" set.
+        assert oms.list_open_orders() == []
+
+        # Tick 2: filled qty alone already covers target → reject.
+        outcome = self._plan(planner, _intent(target_weight=Decimal("0.10")))
+        assert outcome == "unsized:already_at_target"
+
+    def test_pending_sell_does_not_count_against_pending_buy(
+        self, tmp_path: pytest.TempPathFactory,
+    ) -> None:
+        """Pending SELL orders should not affect the pending-BUY tally.
+        Only BUYs add to effective_current_qty here."""
+        broker = FakeBroker(fill_mode=FillMode.MANUAL)
+        broker.set_price("SPY", _MARK)
+        bus = EventBus()
+        ledger = LotLedger()
+        store = OMSStore(str(tmp_path / "oms.db"))
+        oms = OMS(broker=broker, store=store, bus=bus, clock=WallClock())
+        planner = ExecutionPlanner(oms=oms, lot_ledger=ledger, bus=bus)
+
+        # Seed a held position so SELL is allowed
+        _seed_position(ledger, symbol="SPY", qty=Decimal("2.0"),
+                       price=Decimal("100"))
+
+        # Queue a pending SELL
+        sell_intent = _intent(action=Action.REBALANCE_TO,
+                              target_weight=Decimal("0.05"))
+        sell_order = self._plan(planner, sell_intent)
+        assert not isinstance(sell_order, str)
+        assert sell_order.side == OrderSide.SELL
+        oms.submit_order(sell_order)
+
+        # The pending SELL must not inflate the "current" exposure that
+        # the BUY-side delta computation sees. A fresh BUY intent for a
+        # higher target should still go through. (Whether it gets sized
+        # to a positive qty depends on the math; we just verify the
+        # pending-BUY tally is unaffected.)
+        assert planner._pending_unfilled_buy_qty(AgentId.SONNET, "SPY") == Decimal("0")

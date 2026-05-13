@@ -74,6 +74,12 @@ PLAN_REJECT_ALREADY_AT_TARGET: str = "unsized:already_at_target"
 # symbols — even if each individual intent looks cap-compliant, summing
 # across the sleeve's existing positions should not exceed the cap.
 PLAN_REJECT_SLEEVE_GROSS_BREACH: str = "unsized:sleeve_gross_breach"
+# New (churn-and-trigger-fixes): pending unfilled BUY orders for the same
+# agent+symbol already cover the target. Pre-market hourly ticks each saw
+# qty=0 in the ledger (because DAY orders don't fill until market open) and
+# re-bought the full target every cycle; at 09:30 all of them filled at once
+# and blew past the sleeve cap. By treating an open BUY's unfilled qty as
+# "already on the way," later ticks see the pending exposure and skip.
 
 _CLOSING_ACTIONS: frozenset[Action] = frozenset({Action.SELL, Action.CLOSE})
 
@@ -202,15 +208,29 @@ class ExecutionPlanner:
             Decimal("0") if is_options
             else self._ledger.total_open_qty(intent.agent_id, symbol)
         )
+        # Pending BUYs not yet filled count as exposure-on-the-way. Without
+        # this, successive pre-market ticks each see a flat ledger and re-buy
+        # the full target. See PLAN_REJECT_PENDING_BUY comment above.
+        pending_buy_qty = (
+            Decimal("0") if is_options
+            else self._pending_unfilled_buy_qty(intent.agent_id, symbol)
+        )
+        effective_current_qty = current_qty + pending_buy_qty
         current_mark_for_delta = market_snapshot.current_prices.get(symbol)
         if (
             not is_options
             and current_mark_for_delta is not None
             and current_mark_for_delta > Decimal("0")
         ):
-            current_notional = current_qty * current_mark_for_delta
+            current_notional = effective_current_qty * current_mark_for_delta
         else:
             current_notional = Decimal("0")
+        if pending_buy_qty > Decimal("0"):
+            log.info(
+                "planner: %s/%s has pending unfilled BUY qty=%s — "
+                "counting toward current exposure",
+                intent.agent_id, symbol, pending_buy_qty,
+            )
 
         delta_notional = target_notional - current_notional
 
@@ -418,6 +438,32 @@ class ExecutionPlanner:
                 lots = self._ledger.open_lots(agent_id, sym)
                 mark = lots[0].entry_price if lots else Decimal("0")
             total += qty * mark
+        return total
+
+    def _pending_unfilled_buy_qty(
+        self, agent_id: AgentId, symbol: str,
+    ) -> Decimal:
+        """Sum of unfilled qty across open BUY orders for agent+symbol.
+
+        "Open" = PENDING/SUBMITTED/ACCEPTED/PARTIAL (per OMS.list_open_orders).
+        Unfilled = order.qty - order.filled_qty.
+
+        Folded into `effective_current_qty` in plan() so that successive
+        ticks don't queue redundant BUYs while a prior one is still waiting
+        to fill. The pre-market case is the worst: DAY orders sit until
+        09:30 and a flat ledger lets every hourly Haiku tick re-buy the
+        full target.
+        """
+        total = Decimal("0")
+        for o in self._oms.list_open_orders():
+            if (
+                o.agent_id == agent_id
+                and o.side == OrderSide.BUY
+                and _normalize_symbol(o.symbol) == symbol
+            ):
+                remaining = o.qty - o.filled_qty
+                if remaining > Decimal("0"):
+                    total += remaining
         return total
 
     def _plan_close(

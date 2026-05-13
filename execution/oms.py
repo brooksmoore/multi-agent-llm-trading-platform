@@ -465,7 +465,14 @@ class OMS:
                         self._record_accepted(order_id, event.broker_order_id, ts=ts)
                 case BrokerOrderState.PARTIALLY_FILLED | BrokerOrderState.FILLED:
                     if event.fill is None:
-                        logger.error("FILL event without fill payload: %s", event)
+                        # Alpaca emits multiple state-update events per order
+                        # lifecycle; some carry the new state without a fresh
+                        # fill payload (the fill itself arrives in a separate
+                        # event). Log at DEBUG for diagnosis but don't alarm.
+                        logger.debug(
+                            "broker state %s without fill payload (race, ignoring): %s",
+                            event.new_state, event,
+                        )
                         return
                     self._handle_fill(order_id, event.fill, ts=ts)
                 case BrokerOrderState.CANCELED:
