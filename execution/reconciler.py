@@ -278,8 +278,29 @@ class Reconciler:
             if qty_drift < self._qty_tolerance and dollar_drift <= _DOLLAR_TOLERANCE:
                 continue
 
-            # Broker has a position we have zero record of — adopt it.
+            # Broker has a position we have zero record of — adopt it…
+            # …UNLESS there's an open BUY order for the symbol that could
+            # plausibly account for the broker's position. In that case the
+            # right move is to let the polling fallback catch up the fill
+            # against the existing order, not synthesize a new ghost lot.
+            # See 2026-05-18 CAT incident: a missed-fill websocket dropped
+            # a sonnet BUY's fill event, reconciler adopted as a haiku ghost,
+            # then the polling fallback later booked the original fill too —
+            # net result: 2× the broker's position in local books, halting
+            # the bot for hours.
             if our_qty == Decimal("0") and broker_qty > Decimal("0"):
+                pending_buy_qty = self._pending_open_buy_qty_for_symbol(sym)
+                if pending_buy_qty > Decimal("0"):
+                    logger.warning(
+                        "Reconciler: broker has %s qty=%.6f but pending open "
+                        "BUY(s) total qty=%.6f exist — deferring orphan adoption "
+                        "(polling fallback will reconcile the fill against the "
+                        "existing order). Will retry next tick.",
+                        sym, broker_qty, pending_buy_qty,
+                    )
+                    # Don't count as a mismatch — books are expected to converge
+                    # when the missing fill arrives via the order-status poll.
+                    continue
                 logger.warning(
                     "Reconciler: orphan position %s broker=%.6f @ $%.4f — "
                     "adopting into OMS as agent=%s",
@@ -341,6 +362,28 @@ class Reconciler:
                     )
 
         return len(mismatches), tripped
+
+    def _pending_open_buy_qty_for_symbol(self, symbol: str) -> Decimal:
+        """Total qty of open (PENDING/SUBMITTED/ACCEPTED/PARTIAL) BUY orders
+        for `symbol`, net of any fills already booked against them.
+
+        Used by orphan-adoption guard: if there's an open BUY whose unfilled
+        portion could account for the broker's position, we don't synthesize
+        a ghost — the polling fallback will catch the missed fill against the
+        existing order instead.
+        """
+        total = Decimal("0")
+        for order in self._oms.list_open_orders():
+            if order.symbol != symbol or order.side != OrderSide.BUY:
+                continue
+            filled = sum(
+                (f.qty for f in self._oms.get_fills(order.id)),
+                start=Decimal("0"),
+            )
+            unfilled = order.qty - filled
+            if unfilled > Decimal("0"):
+                total += unfilled
+        return total
 
     def _compute_expected_positions(self) -> dict[str, Decimal]:
         """Sum all OMS fills into a net position per symbol."""

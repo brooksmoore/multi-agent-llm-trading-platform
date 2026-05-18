@@ -181,6 +181,83 @@ def test_reconcile_dollar_only_mismatch_trips_kill_switch() -> None:
     assert result.kill_switch_tripped is True
 
 
+# ── Orphan adoption guard (pending-BUY awareness) ────────────────────────────
+
+
+def test_orphan_adoption_deferred_when_pending_buy_exists() -> None:
+    """Regression for 2026-05-18 CAT incident.
+
+    Scenario: a BUY order is submitted but the websocket misses its fill
+    event. From the OMS's view the order is still open (no fill recorded)
+    so expected_positions[sym] = 0. The broker, meanwhile, has the
+    position. Without pending-BUY awareness the reconciler would adopt
+    this as an orphan ghost — and then when the polling fallback later
+    catches the missed fill, the books contain both the ghost AND the
+    original fill, doubling the local position.
+
+    Guard: if there's an open BUY order whose unfilled portion >= broker
+    qty, defer adoption and let the polling fallback reconcile the fill
+    against the existing order on a later tick.
+    """
+    from core.types import AssetClass  # noqa: PLC0415
+    from execution.broker import BrokerPosition
+
+    broker = FakeBroker(fill_mode=FillMode.MANUAL)  # don't auto-fill
+    store = OMSStore(":memory:")
+    bus = EventBus()
+    oms = OMS(broker, store, bus)
+    kill = KillSwitchEngine()
+    rec = Reconciler(oms, broker, kill, interval_secs=1)
+
+    # Submit a BUY but never fill it at the broker. OMS sees ACCEPTED, no fill.
+    order = make_market_order(
+        symbol="CAT", side=OrderSide.BUY, qty=Decimal("2.4346"),
+        agent_id=AgentId.SONNET,
+    )
+    oms.submit_order(order)
+
+    # Simulate the missed-fill scenario: broker actually filled it, but our
+    # websocket dropped the event. So broker now reports a CAT position
+    # the OMS knows nothing about.
+    broker._positions["CAT"] = BrokerPosition(  # noqa: SLF001
+        symbol="CAT", qty=Decimal("2.4346"),
+        avg_entry_price=Decimal("900"), current_price=Decimal("900"),
+        asset_class=AssetClass.EQUITY,
+    )
+
+    result = rec.reconcile_once(_TS)
+
+    # Books appear stale, but no ghost was synthesized and no kill switch
+    # tripped — we deferred to the order-status poll to catch up.
+    assert result.kill_switch_tripped is False
+    open_orders = oms.list_open_orders()
+    # Original order still open; no ghost order was injected.
+    assert len(open_orders) == 1
+    assert open_orders[0].id == order.id
+
+
+def test_orphan_adoption_still_runs_with_no_pending_buy() -> None:
+    """Counter-check: with no pending BUY for the symbol, the reconciler
+    still adopts orphan positions (existing behavior preserved)."""
+    from core.types import AssetClass  # noqa: PLC0415
+    from execution.broker import BrokerPosition
+
+    rec, oms, broker, kill = _setup()
+    broker._positions["MSFT"] = BrokerPosition(  # noqa: SLF001
+        symbol="MSFT", qty=Decimal("5"),
+        avg_entry_price=Decimal("400"), current_price=Decimal("400"),
+        asset_class=AssetClass.EQUITY,
+    )
+
+    result = rec.reconcile_once(_TS)
+
+    # Adopted as ghost — books now in sync, no mismatch.
+    assert result.kill_switch_tripped is False
+    # A ghost order should now exist for MSFT.
+    msft_orders = [o for o in oms.list_orders() if o.symbol == "MSFT"]
+    assert len(msft_orders) == 1
+
+
 def test_reconcile_sell_reduces_expected_position() -> None:
     rec, oms, broker, kill = _setup()
 
