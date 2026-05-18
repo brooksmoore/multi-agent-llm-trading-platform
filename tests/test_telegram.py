@@ -225,14 +225,16 @@ class TestAlertManagerTelegramIntegration:
         manager.start()
         return bus, manager, mock_client
 
-    def test_kill_switch_sends_halt_alert(self) -> None:
+    def test_kill_switch_does_not_immediately_send_halt_alert(self) -> None:
+        # Policy: Telegram is reserved for stuck halts (>30 min). Routine
+        # transient trips roll into the daily recap, not real-time push.
         bus, manager, mock_client = self._make_bus_and_manager()
         bus.publish(KillSwitchTrippedEvent(
             agent_id=AgentId.HAIKU,
             new_state=KillSwitchState.DRAWDOWN_PAUSED,
             reason="drawdown threshold breached",
         ))
-        mock_client.post.assert_called_once()
+        mock_client.post.assert_not_called()
         manager.stop()
 
     def test_fill_received_does_not_send_notification(self) -> None:
@@ -271,7 +273,9 @@ class TestAlertManagerTelegramIntegration:
         mock_client.post.assert_not_called()
         manager.stop()
 
-    def test_reconciliation_break_sends_halt_alert(self) -> None:
+    def test_reconciliation_break_does_not_send_telegram(self) -> None:
+        # Policy: recon breaks are auto-handled; they ntfy only and roll
+        # into the daily recap. No Telegram push regardless of delta.
         bus, manager, mock_client = self._make_bus_and_manager()
         bus.publish(ReconciliationBreakEvent(
             symbol="AAPL",
@@ -279,5 +283,48 @@ class TestAlertManagerTelegramIntegration:
             broker_qty=Decimal("11"),
             delta_usd=Decimal("200"),
         ))
-        mock_client.post.assert_called_once()
+        mock_client.post.assert_not_called()
         manager.stop()
+
+    def test_stuck_halt_telegrams_after_grace_window(self) -> None:
+        # With a tiny grace window the deferred timer should fire and Telegram
+        # should be invoked exactly once.
+        bus = EventBus()
+        adapter, mock_client = _make_adapter(enabled=True)
+        manager = AlertManager(
+            bus, topic="", telegram=adapter, halt_telegram_grace_secs=0.05,
+        )
+        manager.start()
+        try:
+            bus.publish(KillSwitchTrippedEvent(
+                agent_id=AgentId.HAIKU,
+                new_state=KillSwitchState.DRAWDOWN_PAUSED,
+                reason="stuck condition",
+            ))
+            import time as _t  # noqa: PLC0415
+            _t.sleep(0.20)
+            mock_client.post.assert_called_once()
+        finally:
+            manager.stop()
+
+    def test_stuck_halt_cancelled_when_kill_switch_resets(self) -> None:
+        bus = EventBus()
+        adapter, mock_client = _make_adapter(enabled=True)
+        manager = AlertManager(
+            bus, topic="", telegram=adapter, halt_telegram_grace_secs=0.20,
+        )
+        manager.start()
+        try:
+            from core.events import KillSwitchResetEvent  # noqa: PLC0415
+            bus.publish(KillSwitchTrippedEvent(
+                agent_id=AgentId.HAIKU,
+                new_state=KillSwitchState.DRAWDOWN_PAUSED,
+                reason="transient",
+            ))
+            bus.publish(KillSwitchResetEvent(agent_id=AgentId.HAIKU))
+            import time as _t  # noqa: PLC0415
+            _t.sleep(0.30)
+            mock_client.post.assert_not_called()
+            assert manager._halt_suppressed_count == 1
+        finally:
+            manager.stop()

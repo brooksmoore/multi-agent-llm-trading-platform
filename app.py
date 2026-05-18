@@ -27,14 +27,14 @@ from __future__ import annotations
 
 import json
 import logging
-import signal
-import uuid
-from dataclasses import replace
 import os
+import signal
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -45,26 +45,26 @@ import yaml
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config.universes import PLUMBING_UNIVERSE
 from agents.base import AgentState, BaseAgent
 from agents.calibration import CalibrationTracker
 from agents.calibration_recorder import CalibrationRecorder
 from agents.haiku_agent import HaikuAgent
+from agents.haiku_synthesizer import HaikuSynthesizer, positions_from_lot_ledger
+from agents.llm import HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL, BudgetExhausted, LLMClient
+from agents.manager_agent import ManagerAgent, compute_manager_fingerprint
 from agents.manager_bridge import (
     read_manager_context,
     write_adversarial_critique,
     write_sleeve_weights,
 )
-from agents.llm import HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL, BudgetExhausted, LLMClient
-from agents.manager_agent import ManagerAgent, compute_manager_fingerprint
-from agents.news_scorer import NewsScorer
-from agents.haiku_synthesizer import HaikuSynthesizer, positions_from_lot_ledger
 from agents.memory import AgentMemory
+from agents.news_scorer import NewsScorer
 from agents.opus_agent import OpusAgent
 from agents.outcome_recorder import OutcomeRecorder
 from agents.sonnet_agent import SonnetAgent
 from config.runtime_store import runtime_store
 from config.settings import Settings
+from config.universes import PLUMBING_UNIVERSE
 from core.clock import ET, Clock, WallClock
 from core.events import EventBus, FillReceivedEvent
 from core.types import (
@@ -83,6 +83,10 @@ from core.types import (
 from core.types import (
     AgentState as CoreAgentState,
 )
+from data.doc_pack import build_doc_pack
+from data.news import EDGARAdapter, FinnhubAdapter, RSSAdapter, YFinanceAdapter
+from data.news_fetcher import DEFAULT_RSS_FEEDS, NewsFetcher
+from data.news_store import NewsStore, default_retention_cutoff
 from execution.agent_state_tracker import AgentStateTracker
 from execution.broker import Broker, BrokerAccount
 from execution.budget import BudgetLedger, BudgetWatcher
@@ -95,16 +99,13 @@ from execution.reconciler import Reconciler
 from execution.risk import RiskGate
 from execution.sizing import classify_vix, effective_max_gross
 from execution.tax import WashSaleChecker
-from data.doc_pack import build_doc_pack
-from data.news import EDGARAdapter, FinnhubAdapter, RSSAdapter, YFinanceAdapter
-from data.news_fetcher import DEFAULT_RSS_FEEDS, NewsFetcher
-from data.news_store import NewsStore, default_retention_cutoff
 from ops.agent_pnl_store import AgentPnLStore
 from ops.alerts import AlertManager
 from ops.attribution import compute_daily_pnl
-from ops.manager_analytics import build_manager_context
+from ops.daily_recap import DailyRecap
 from ops.equity_snapshotter import EquitySnapshotter
 from ops.heartbeat import HeartbeatWriter
+from ops.manager_analytics import build_manager_context
 from ops.telegram import TelegramAdapter
 
 if TYPE_CHECKING:
@@ -137,8 +138,7 @@ JOB_HAIKU_CRYPTO             = "haiku_crypto"             # 24/7, 60-min
 JOB_BUDGET_RESET             = "budget_reset"             # UTC midnight
 JOB_NEWS_FETCH               = "news_fetch"               # every 30 min during RTH
 JOB_NEWS_NIGHTLY             = "news_nightly"             # 22:00 ET full pull + prune
-JOB_PORTFOLIO_SNAPSHOT       = "portfolio_snapshot"       # hourly RTH Mon-Fri Telegram
-JOB_PORTFOLIO_SNAPSHOT_WEEKEND = "portfolio_snapshot_weekend"  # 09:00 ET Sat/Sun
+JOB_DAILY_RECAP              = "daily_recap"              # 17:00 ET daily Telegram
 JOB_AGENT_PNL_SNAPSHOT       = "agent_pnl_snapshot"       # 16:45 ET Mon-Fri (T1.5)
 JOB_MANAGER_SUNDAY_CRITIQUE  = "manager_sunday_critique"  # Sun 18:00 ET (T2.4)
 
@@ -147,7 +147,7 @@ ALL_JOB_IDS: frozenset[str] = frozenset({
     JOB_SONNET_EOD, JOB_OPUS_THURSDAY_DEEPDIVE,
     JOB_MANAGER_FRIDAY, JOB_HAIKU_MORNING_SYNTHESIS, JOB_HAIKU_CRYPTO,
     JOB_BUDGET_RESET, JOB_NEWS_FETCH, JOB_NEWS_NIGHTLY,
-    JOB_PORTFOLIO_SNAPSHOT, JOB_PORTFOLIO_SNAPSHOT_WEEKEND,
+    JOB_DAILY_RECAP,
     JOB_AGENT_PNL_SNAPSHOT, JOB_MANAGER_SUNDAY_CRITIQUE,
 })
 
@@ -356,6 +356,7 @@ class App:
             settings.telegram_chat_id,
         )
         self.alerts = AlertManager(self.bus, settings.ntfy_topic, telegram=self.telegram)
+        self.daily_recap = DailyRecap(self.bus, telegram=self.telegram)
 
         # Scheduler (NYSE timezone for cron triggers)
         self.scheduler = BackgroundScheduler(timezone=ET)
@@ -404,6 +405,7 @@ class App:
 
         # 2. Subsystems (order matters: alerts subscribe before anything publishes)
         self.alerts.start()
+        self.daily_recap.start()
         self.heartbeat.start()
         self.equity_snapshotter.start()
         self.budget_watcher.start()
@@ -487,6 +489,7 @@ class App:
         self._safe_call(self.equity_snapshotter.stop)
         self._safe_call(self.heartbeat.stop)
         self._safe_call(self.alerts.stop)
+        self._safe_call(self.daily_recap.stop)
 
         # Snapshot agent memories then close
         for memory in self._memories.values():
@@ -1144,18 +1147,13 @@ class App:
             CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=et),
             id=JOB_MANAGER_SUNDAY_CRITIQUE, replace_existing=True,
         )
-        # Portfolio snapshot to Telegram: hourly during US RTH Mon-Fri, plus
-        # one daily 09:00 ET ping on Sat/Sun to surface weekend crypto drift
-        # without flooding off-hours.
+        # Daily recap to Telegram: one message at 17:00 ET, every day. Pulls
+        # NAV, day P&L, sleeve attribution, and aggregated ops events from
+        # the DailyRecap buffer (which subscribes to the EventBus all day).
         sched.add_job(
-            self._job_portfolio_snapshot,
-            CronTrigger(day_of_week="mon-fri", hour="9-16", minute=0, timezone=et),
-            id=JOB_PORTFOLIO_SNAPSHOT, replace_existing=True,
-        )
-        sched.add_job(
-            self._job_portfolio_snapshot,
-            CronTrigger(day_of_week="sat,sun", hour=9, minute=0, timezone=et),
-            id=JOB_PORTFOLIO_SNAPSHOT_WEEKEND, replace_existing=True,
+            self._job_daily_recap,
+            CronTrigger(hour=17, minute=0, timezone=et),
+            id=JOB_DAILY_RECAP, replace_existing=True,
         )
 
     # Sonnet ---------------------------------------------------------------
@@ -1167,36 +1165,59 @@ class App:
     def _job_haiku_crypto(self) -> None:       self.dispatch_observation(self.haiku)
 
     # Telegram -------------------------------------------------------------
-    def _job_portfolio_snapshot(self) -> None:
-        """Hourly portfolio status update to Telegram."""
+    def _job_daily_recap(self) -> None:
+        """End-of-day Telegram recap: NAV, P&L, sleeve attribution, ops events.
+
+        Replaces the prior hourly portfolio snapshot. Real-time Telegram is
+        reserved for stuck halts (>30 min); everything else funnels here.
+        """
         if not self.telegram.enabled:
+            # Still drain the buffer so events don't accumulate forever.
+            self.daily_recap.send()
             return
+
+        nav: Decimal | None = None
+        cash: Decimal | None = None
+        positions: list[Any] = []
         try:
             account = self.broker.get_account()
             positions = list(self.broker.list_positions())
+            nav = Decimal(str(account.equity))
+            cash = Decimal(str(account.cash))
         except Exception:
-            log.warning("portfolio_snapshot: broker fetch failed", exc_info=True)
-            return
+            log.warning("daily_recap: broker fetch failed", exc_info=True)
+
+        # Prior-NAV: best-effort lookup from the equity snapshotter's history.
+        prior_nav: Decimal | None = None
+        try:
+            history = self.equity_snapshotter.recent(days=2)
+            if len(history) >= 2:
+                prior_nav = Decimal(str(history[-2].equity))
+        except Exception:
+            log.debug("daily_recap: prior-NAV lookup failed", exc_info=True)
+
+        # Sleeve P&L — best-effort; OK to omit if unavailable.
+        sleeve_pnl: dict[str, Decimal] | None = None
+        try:
+            sleeve_pnl = self.attribution.today_pnl_by_sleeve()  # type: ignore[attr-defined]
+        except Exception:
+            log.debug("daily_recap: sleeve P&L lookup failed", exc_info=True)
+
+        budget_spent: Decimal | None = None
+        try:
+            budget_spent = Decimal(str(self.budget.spent_today()))  # type: ignore[attr-defined]
+        except Exception:
+            log.debug("daily_recap: budget lookup failed", exc_info=True)
 
         kill_state = self.kill.state
         status = "LIVE" if kill_state == KillSwitchState.OK else f"HALTED ({kill_state})"
-        lines = [
-            f"NAV: ${float(account.equity):,.2f}",
-            f"Cash: ${float(account.cash):,.2f}",
-            f"Status: {status}",
-        ]
-        if positions:
-            lines.append(f"Positions ({len(positions)}):")
-            for p in sorted(positions, key=lambda x: x.symbol):
-                mark = float(p.current_price)
-                qty = float(p.qty)
-                lines.append(f"  {p.symbol}: {qty:.4f} @ ${mark:.2f} (${qty*mark:,.2f})")
-        else:
-            lines.append("Positions: flat")
         try:
-            self.telegram.send_portfolio_snapshot("\n".join(lines))
+            self.daily_recap.send(
+                nav=nav, cash=cash, prior_nav=prior_nav, positions=positions,
+                sleeve_pnl=sleeve_pnl, kill_state=status, budget_spent=budget_spent,
+            )
         except Exception:
-            log.warning("portfolio_snapshot: telegram send failed", exc_info=True)
+            log.warning("daily_recap: send failed", exc_info=True)
 
     # Opus -----------------------------------------------------------------
     def _job_opus_thursday_deepdive(self) -> None:
@@ -1660,8 +1681,8 @@ class App:
             ctx = self._build_manager_ctx(state)
             # Build attribution dict — best-effort.
             attribution = {str(agent_id).split(".")[-1].lower(): drawdown_pct}
-            from agents.manager_bridge import write_drawdown_directive
             from agents.calibration import CalibrationTracker  # noqa: F401
+            from agents.manager_bridge import write_drawdown_directive
             response = self.manager.drawdown_response(
                 state,
                 drawdown_pct=drawdown_pct,
@@ -1801,7 +1822,7 @@ class App:
 
     # ── Dashboard thread ─────────────────────────────────────────────────────
 
-    def live_metrics(self) -> "LiveMetrics":
+    def live_metrics(self) -> LiveMetrics:
         """Snapshot runtime values for the dashboard top strip.
 
         Reflects current MC, the live VIX bucket, haiku's drawdown bucket, and

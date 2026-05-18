@@ -20,6 +20,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from decimal import Decimal
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -41,6 +42,19 @@ log = logging.getLogger(__name__)
 NTFY_BASE_URL = "https://ntfy.sh"
 DEDUPE_WINDOW_SECS: float = 60.0
 HTTP_TIMEOUT_SECS: float = 5.0
+
+# Reconciliation-break notification policy. The kill switch trips immediately
+# (trading halts), but Telegram/ntfy is deferred to filter out transient races
+# (broker-fill webhook lag, intra-tick OMS writes) that auto-clear within a few
+# reconcile cycles. A material dollar delta bypasses the grace period.
+RECON_GRACE_SECS: float = 180.0
+RECON_MATERIAL_DELTA_USD: Decimal = Decimal("25")
+
+# How long a kill switch must remain tripped before we page Telegram. Below
+# this threshold the trip is assumed to be a transient (recon race, broker
+# hiccup) and rolls into the daily recap instead. Set conservatively: most
+# auto-resolving halts clear in well under 5 min.
+HALT_TELEGRAM_GRACE_SECS: float = 30 * 60.0
 
 
 # Optional injection point for tests: a function (url, body, headers) -> None.
@@ -79,6 +93,9 @@ class AlertManager:
         poster: HttpPoster | None = None,
         dedupe_window_secs: float = DEDUPE_WINDOW_SECS,
         telegram: TelegramAdapter | None = None,
+        recon_grace_secs: float = RECON_GRACE_SECS,
+        recon_material_delta_usd: Decimal = RECON_MATERIAL_DELTA_USD,
+        halt_telegram_grace_secs: float = HALT_TELEGRAM_GRACE_SECS,
     ) -> None:
         self._bus = bus
         self._topic = topic
@@ -89,6 +106,18 @@ class AlertManager:
         self._sent_count: int = 0
         self._dedup_count: int = 0
         self._telegram = telegram
+        self._recon_grace = recon_grace_secs
+        self._recon_material = recon_material_delta_usd
+        # Per-symbol deferred-notify timers. Cancelled if a kill-switch reset
+        # arrives before the grace period expires (i.e. the break self-cleared).
+        self._pending_recon: dict[str, threading.Timer] = {}
+        self._recon_suppressed_count: int = 0
+        self._halt_grace = halt_telegram_grace_secs
+        # Single in-flight stuck-halt timer. We Telegram only if the kill
+        # switch stays tripped past the grace window; otherwise the trip is
+        # recorded in the daily recap and not paged.
+        self._pending_halt: threading.Timer | None = None
+        self._halt_suppressed_count: int = 0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -117,6 +146,16 @@ class AlertManager:
         self._bus.unsubscribe("leverage.rotation_flag", self._on_leverage_rotation)
         self._bus.unsubscribe("agent.benched", self._on_agent_benched)
         self._bus.unsubscribe("drawdown.ladder_fired", self._on_drawdown_ladder)
+        # Cancel any in-flight deferred timers.
+        with self._lock:
+            pending = list(self._pending_recon.values())
+            self._pending_recon.clear()
+            pending_halt = self._pending_halt
+            self._pending_halt = None
+        for timer in pending:
+            timer.cancel()
+        if pending_halt is not None:
+            pending_halt.cancel()
 
     # ── Stats (for dashboard / tests) ─────────────────────────────────────────
 
@@ -130,6 +169,13 @@ class AlertManager:
         with self._lock:
             return self._dedup_count
 
+    @property
+    def recon_suppressed_count(self) -> int:
+        """Reconciliation-break alerts that were deferred and then cancelled
+        because the break auto-cleared within the grace window."""
+        with self._lock:
+            return self._recon_suppressed_count
+
     # ── Event handlers ────────────────────────────────────────────────────────
 
     def _on_kill_switch(self, event: Event) -> None:
@@ -137,38 +183,94 @@ class AlertManager:
             return
         title = "🚨 Kill switch tripped"
         msg = f"state={event.new_state} reason={event.reason}"
+        # ntfy (the always-on, low-friction channel) fires immediately.
         self._send(title=title, message=msg, key=f"ks:{event.new_state}", priority="urgent")
-        if self._telegram is not None:
-            self._telegram.send_halt_alert(
-                reason=f"{event.new_state} — {event.reason}",
-                agent=str(event.agent_id) if event.agent_id else None,
+        # Telegram is reserved for *stuck* halts: defer by grace window; if a
+        # reset arrives first the timer is cancelled. Routine transient trips
+        # roll into the daily recap, not real-time push.
+        if self._telegram is None:
+            return
+        with self._lock:
+            if self._pending_halt is not None:
+                self._pending_halt.cancel()
+            agent_str = str(event.agent_id) if event.agent_id else None
+            timer = threading.Timer(
+                self._halt_grace,
+                self._fire_stuck_halt_alert,
+                args=(event.new_state, event.reason, agent_str),
             )
+            timer.daemon = True
+            self._pending_halt = timer
+        timer.start()
+        log.info(
+            "AlertManager: kill switch tripped (state=%s); Telegram deferred %.0fs",
+            event.new_state, self._halt_grace,
+        )
+
+    def _fire_stuck_halt_alert(
+        self, state: str, reason: str, agent: str | None,
+    ) -> None:
+        with self._lock:
+            self._pending_halt = None
+        if self._telegram is None:
+            return
+        self._telegram.send_halt_alert(
+            reason=f"Stuck halt (>{int(self._halt_grace / 60)}m): {state} — {reason}",
+            agent=agent,
+        )
 
     def _on_reconciliation_break(self, event: Event) -> None:
         if not isinstance(event, ReconciliationBreakEvent):
             return
+        # Material breaks (delta ≥ threshold) page immediately — they're large
+        # enough that even a transient race is worth knowing about.
+        material = abs(event.delta_usd) >= self._recon_material
+        if material:
+            self._fire_recon_alert(event)
+            return
+        # Otherwise, defer the notification by `grace` seconds. If the break
+        # auto-clears (KillSwitchResetEvent), we cancel the timer below and
+        # never page. Persistent breaks survive the grace period and page.
+        with self._lock:
+            existing = self._pending_recon.pop(event.symbol, None)
+        if existing is not None:
+            existing.cancel()
+        timer = threading.Timer(
+            self._recon_grace, self._fire_recon_alert, args=(event,)
+        )
+        timer.daemon = True
+        with self._lock:
+            self._pending_recon[event.symbol] = timer
+        timer.start()
+        log.info(
+            "AlertManager: reconciliation break on %s deferred %.0fs "
+            "(local=%s broker=%s delta=$%s)",
+            event.symbol, self._recon_grace,
+            event.local_qty, event.broker_qty, event.delta_usd,
+        )
+
+    def _fire_recon_alert(self, event: ReconciliationBreakEvent) -> None:
+        with self._lock:
+            # Drop our own pending entry if this is the deferred path.
+            self._pending_recon.pop(event.symbol, None)
         title = "⚠️ Reconciliation break"
         msg = (
             f"{event.symbol}: local={event.local_qty} broker={event.broker_qty} "
             f"delta=${event.delta_usd}"
         )
+        # ntfy only — Telegram intentionally not sent. Recon breaks are
+        # auto-handled (kill switch + reconciler retry); the count surfaces
+        # in the daily recap.
         self._send(title=title, message=msg, key=f"recon:{event.symbol}", priority="high")
-        if self._telegram is not None:
-            self._telegram.send_halt_alert(
-                reason=f"Reconciliation break {event.symbol}: delta=${event.delta_usd}",
-            )
 
     def _on_budget_exhausted(self, event: Event) -> None:
         if not isinstance(event, BudgetExhaustedEvent):
             return
         title = "💸 Daily LLM budget exhausted"
         msg = f"spent_today=${event.spent_today} (system → Haiku-only)"
+        # ntfy only — budget exhaustion is recurring and bounded (system falls
+        # back to Haiku-only); details surface in the daily recap.
         self._send(title=title, message=msg, key="budget", priority="high")
-        if self._telegram is not None:
-            self._telegram.send_halt_alert(
-                reason=f"Daily LLM budget exhausted — spent ${event.spent_today}",
-                agent=str(event.agent_id) if event.agent_id else None,
-            )
 
     def _on_leverage_rotation(self, event: Event) -> None:
         if not isinstance(event, LeverageRotationFlagEvent):
@@ -212,13 +314,29 @@ class AlertManager:
     def _on_kill_switch_reset(self, event: Event) -> None:
         if not isinstance(event, KillSwitchResetEvent):
             return
+        # Cancel any in-flight deferred timers — the halt resolved within
+        # the grace window, so by policy these never page Telegram.
+        with self._lock:
+            pending_recon = list(self._pending_recon.items())
+            self._pending_recon.clear()
+            self._recon_suppressed_count += len(pending_recon)
+            pending_halt = self._pending_halt
+            self._pending_halt = None
+            if pending_halt is not None:
+                self._halt_suppressed_count += 1
+        for symbol, timer in pending_recon:
+            timer.cancel()
+            log.debug(
+                "AlertManager: reconciliation break on %s auto-cleared", symbol,
+            )
+        if pending_halt is not None:
+            pending_halt.cancel()
+            log.info("AlertManager: stuck-halt timer cancelled (kill switch cleared)")
+        # ntfy still gets the resume (low-friction); Telegram does not — by
+        # design, no resume push. The daily recap reports halt counts.
         title = "✅ Kill switch cleared"
         msg = "Trading resumed"
         self._send(title=title, message=msg, key="ks:reset", priority="default")
-        if self._telegram is not None:
-            self._telegram.send_resume_alert(
-                agent=str(event.agent_id) if event.agent_id else None,
-            )
 
     # ── Send + dedupe ─────────────────────────────────────────────────────────
 

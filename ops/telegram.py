@@ -29,6 +29,7 @@ import logging
 import re
 import threading
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -182,6 +183,16 @@ class TelegramAdapter:
         text = f"✅ *RESUMED*{agent_part}\nTrading active"
         key = f"resume:{agent or 'global'}"
         return self.send(text, key=key)
+
+    def send_daily_recap(self, body: str) -> bool:
+        """Send the one-per-day operational recap.
+
+        `body` is plain text — escaping handled here. Deduped per calendar day
+        so a double-fire from the scheduler can't double-send the recap.
+        """
+        today = datetime.now(UTC).date().isoformat()
+        text = f"📅 *Daily recap*\n{_escape(body)}"
+        return self.send(text, key=f"daily_recap:{today}")
 
     def send_portfolio_snapshot(self, body: str) -> bool:
         """Send an hourly portfolio status update.
