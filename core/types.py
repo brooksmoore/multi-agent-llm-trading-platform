@@ -38,6 +38,16 @@ def normalize_symbol(symbol: str) -> str:
     return symbol.replace("/", "") if "/" in symbol else symbol
 
 
+# Crypto symbols traded on Alpaca. Kept here (not in execution/) so the
+# planner can detect crypto without depending on the broker layer.
+CRYPTO_SYMBOLS: frozenset[str] = frozenset({"BTCUSD", "ETHUSD", "SOLUSD"})
+
+
+def is_crypto_symbol(symbol: str) -> bool:
+    """True if `symbol` is a crypto trading pair (canonical or slashed form)."""
+    return symbol in CRYPTO_SYMBOLS or "/" in symbol
+
+
 # ─── Enumerations ─────────────────────────────────────────────────────────────
 
 

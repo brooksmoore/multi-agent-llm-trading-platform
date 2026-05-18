@@ -23,13 +23,13 @@ from uuid import UUID
 
 import alpaca.trading.enums as alpaca_enums
 from alpaca.common.exceptions import APIError
-from requests.exceptions import RequestException
 from alpaca.trading.client import TradingClient
 from alpaca.trading.models import Order as AlpacaOrder
 from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.models import TradeAccount
 from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 from alpaca.trading.stream import TradingStream
+from requests.exceptions import RequestException
 
 from core.types import (
     AgentId,
@@ -40,6 +40,9 @@ from core.types import (
     OrderSide,
     OrderType,
     new_id,
+)
+from core.types import (
+    is_crypto_symbol as _is_crypto_symbol,
 )
 from execution.broker import (
     BrokerAccount,
@@ -105,13 +108,8 @@ def _to_alpaca_side(side: OrderSide) -> alpaca_enums.OrderSide:
     return alpaca_enums.OrderSide(side.value)
 
 
-# Crypto symbols traded on Alpaca. TIF=DAY is rejected for crypto (only GTC/IOC
-# accepted), so we override DAY → GTC at submit time.
-_CRYPTO_SYMBOLS: frozenset[str] = frozenset({"BTCUSD", "ETHUSD", "SOLUSD"})
-
-
-def _is_crypto_symbol(symbol: str) -> bool:
-    return symbol in _CRYPTO_SYMBOLS or "/" in symbol
+# TIF=DAY is rejected for crypto (only GTC/IOC accepted), so we override
+# DAY → GTC at submit time. Crypto detection lives in core/types.py.
 
 
 def _to_alpaca_tif(tif: str, symbol: str) -> alpaca_enums.TimeInForce:
@@ -194,7 +192,7 @@ class AlpacaBroker:
                     f"AlpacaBroker: order_type {order.order_type!r} not yet supported"
                 )
 
-            result = cast(AlpacaOrder, self._client.submit_order(req))
+            result = cast("AlpacaOrder", self._client.submit_order(req))
             return str(result.id)
 
         except APIError as exc:
@@ -222,7 +220,7 @@ class AlpacaBroker:
 
     def get_order(self, broker_order_id: str) -> BrokerOrderStatus:
         try:
-            ao = cast(AlpacaOrder, self._client.get_order_by_id(broker_order_id))
+            ao = cast("AlpacaOrder", self._client.get_order_by_id(broker_order_id))
             return self._translate_order(ao)
         except APIError as exc:
             if exc.status_code == 404:
@@ -233,7 +231,7 @@ class AlpacaBroker:
 
     def find_order_by_client_id(self, client_order_id: OrderId) -> BrokerOrderStatus | None:
         try:
-            ao = cast(AlpacaOrder, self._client.get_order_by_client_id(str(client_order_id)))
+            ao = cast("AlpacaOrder", self._client.get_order_by_client_id(str(client_order_id)))
             return self._translate_order(ao)
         except APIError as exc:
             if exc.status_code == 404:
@@ -244,7 +242,7 @@ class AlpacaBroker:
 
     def list_positions(self) -> list[BrokerPosition]:
         try:
-            positions = cast(list[AlpacaPosition], self._client.get_all_positions())
+            positions = cast("list[AlpacaPosition]", self._client.get_all_positions())
         except APIError as exc:
             raise BrokerUnavailable(str(exc)) from exc
         except RequestException as exc:
@@ -253,7 +251,7 @@ class AlpacaBroker:
 
     def get_account(self) -> BrokerAccount:
         try:
-            acct = cast(TradeAccount, self._client.get_account())
+            acct = cast("TradeAccount", self._client.get_account())
         except APIError as exc:
             raise BrokerUnavailable(str(exc)) from exc
         except RequestException as exc:

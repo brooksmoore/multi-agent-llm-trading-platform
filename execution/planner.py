@@ -33,6 +33,7 @@ from core.types import (
     OrderState,
     OrderType,
     TimeInForce,
+    is_crypto_symbol,
     new_id,
     normalize_symbol,
 )
@@ -52,6 +53,14 @@ _OPTIONS_MULTIPLIER: Decimal = Decimal("100")   # 1 equity-options contract = 10
 # Alpaca caps fractional qty at 9dp; submitting more precision is silently
 # truncated by the broker, leaving the OMS unable to reconcile filled_qty.
 _FRACTIONAL_QTY_PRECISION: Decimal = Decimal("0.000000001")
+
+# When SELL-capping a crypto position at the local ledger's `current_qty`,
+# subtract this dust buffer to absorb local-vs-broker precision drift. The
+# local lots ledger and Alpaca's reported balance can disagree at the 9th
+# decimal (cumulative fee/rounding skew across many fills); without the
+# buffer, a "sell all" request rejects with a 1-satoshi insufficient-balance
+# error. 10 satoshi ≈ 5e-7 USD on SOL — economically negligible.
+_CRYPTO_SELL_DUST_BUFFER: Decimal = Decimal("0.00000001")
 
 # Planner rejection reasons. Returned as outcome strings so callers
 # (and the dashboard) can distinguish "skipped sub-$1" from "agent
@@ -363,7 +372,13 @@ class ExecutionPlanner:
         # For SELL orders against an existing position, cap qty at what we
         # actually hold. Prevents going short on rounding or stale-mark drift.
         if side == OrderSide.SELL and not is_options and current_qty > Decimal("0"):
-            qty = min(qty, current_qty)
+            cap = current_qty
+            if is_crypto_symbol(symbol):
+                # Leave a dust buffer so a "sell all" doesn't reject when the
+                # local ledger and Alpaca disagree at the 9th decimal. See
+                # _CRYPTO_SELL_DUST_BUFFER for the rationale.
+                cap = max(cap - _CRYPTO_SELL_DUST_BUFFER, Decimal("0"))
+            qty = min(qty, cap)
 
         order_class = OrderClass.MLEG if is_options else OrderClass.SIMPLE
 
@@ -494,7 +509,18 @@ class ExecutionPlanner:
             )
             return PLAN_REJECT_NO_MARK
 
-        notional = open_qty * current_mark
+        # Leave a dust buffer when closing crypto so the request never
+        # exceeds the broker's actual balance. See _CRYPTO_SELL_DUST_BUFFER
+        # for the rationale; without this, hourly "sell all" requests on
+        # SOL / BTC reject with 1-satoshi insufficient_balance errors.
+        close_qty = open_qty
+        if is_crypto_symbol(symbol):
+            close_qty = max(open_qty - _CRYPTO_SELL_DUST_BUFFER, Decimal("0"))
+            if close_qty <= Decimal("0"):
+                self.dropped_no_position += 1
+                return PLAN_REJECT_NO_POSITION
+
+        notional = close_qty * current_mark
         if notional < _MIN_NOTIONAL:
             self.dropped_sub_min += 1
             return PLAN_REJECT_SUB_MIN
@@ -514,7 +540,7 @@ class ExecutionPlanner:
             agent_id=intent.agent_id,
             symbol=symbol,
             side=OrderSide.SELL,
-            qty=open_qty,
+            qty=close_qty,
             order_type=OrderType.MARKET,
             order_class=OrderClass.SIMPLE,
             time_in_force=TimeInForce.DAY,
@@ -530,7 +556,7 @@ class ExecutionPlanner:
                 symbol=symbol,
                 target_weight=Decimal("0"),
                 position_value_usd=notional,
-                qty=open_qty,
+                qty=close_qty,
                 effective_vol_target=effective_vol_tgt,
                 effective_max_gross_val=emg,
                 realized_vol_30d=Decimal("0.08"),

@@ -809,6 +809,47 @@ class TestPlannerDeltaAware:
         # Close-path uses actual open qty, not a weight calculation.
         assert order.qty == Decimal("1.2")
 
+    def test_crypto_sell_all_leaves_dust_buffer(self) -> None:
+        """Regression for 2026-05-18 hourly broker rejections on SOLUSD.
+
+        Local ledger had 34.978276250, Alpaca held 34.978276249 (1-satoshi
+        skew from cumulative fee/rounding). A "sell all" request rejected
+        with insufficient_balance. The planner must subtract a small dust
+        buffer when capping crypto SELL qty so it never asks for more than
+        the broker can actually deliver.
+        """
+        from execution.planner import _CRYPTO_SELL_DUST_BUFFER
+
+        planner, _oms, ledger, *_ = _make_planner()
+        local_qty = Decimal("34.978276250")
+        _seed_position(ledger, symbol="SOLUSD", qty=local_qty,
+                       price=Decimal("150"), agent_id=AgentId.HAIKU)
+        snap = _snapshot(price=Decimal("150"), symbol="SOLUSD",
+                         vol=Decimal("0.25"))
+        order = self._plan(
+            planner,
+            _intent(action=Action.SELL, target_weight=Decimal("0"),
+                    symbol="SOLUSD", agent_id=AgentId.HAIKU,
+                    sleeve=Sleeve.CRYPTO),
+            snap=snap,
+        )
+        assert not isinstance(order, str), order
+        assert order.side == OrderSide.SELL
+        # Must be strictly less than local qty by at least the buffer.
+        assert order.qty <= local_qty - _CRYPTO_SELL_DUST_BUFFER
+
+    def test_equity_sell_all_no_dust_buffer(self) -> None:
+        """Dust buffer is crypto-only: equity sells still cap at exact qty
+        (fractional equities still use exact ledger qty; whole-share rounding
+        is handled by the position quantizer, not this cap)."""
+        planner, _oms, ledger, *_ = _make_planner()
+        _seed_position(ledger, symbol="SPY", qty=Decimal("1.2"),
+                       price=Decimal("100"))
+        order = self._plan(planner, _intent(action=Action.SELL,
+                                             target_weight=Decimal("0")))
+        assert not isinstance(order, str)
+        assert order.qty == Decimal("1.2")  # exact, no buffer subtracted
+
     def test_sell_with_target_zero_no_lots_returns_no_position(self) -> None:
         """Sell-to-zero on a symbol we don't hold: NO_POSITION (close path)."""
         planner, _oms, _ledger, *_ = _make_planner()
