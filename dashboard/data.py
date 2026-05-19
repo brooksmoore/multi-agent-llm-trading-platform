@@ -108,6 +108,15 @@ class SpendPoint:
 
 
 @dataclass(frozen=True)
+class DailyNavClose:
+    """End-of-day NAV per calendar date. Used for daily-return comparison vs
+    SPY. We take the LAST snapshot per date — close enough to an EOD mark
+    for a paper-trading bot."""
+    date: str   # ISO date (YYYY-MM-DD)
+    nav: Decimal
+
+
+@dataclass(frozen=True)
 class CalibrationPoint:
     agent_id: str
     conviction_bucket: int
@@ -552,6 +561,33 @@ class DashboardData:
         return [
             NavPoint(ts=ts, total_nav=_as_decimal(nav) if nav is not None else None)
             for ts, nav in rows
+        ]
+
+    def daily_nav_closes(self) -> list[DailyNavClose]:
+        """One row per calendar date, with the LAST equity-snapshot NAV that
+        day. Used for daily-return vs SPY comparison."""
+        conn = self._open_snapshot_ro()
+        if conn is None:
+            return []
+        try:
+            # substr(ts, 1, 10) extracts the ISO date. MAX(ts) picks the
+            # latest snapshot for that date; we then join back to fetch its
+            # total_nav. Done as a single grouped query.
+            rows = conn.execute(
+                "SELECT substr(ts, 1, 10) AS d, total_nav "
+                "FROM equity_snapshots "
+                "WHERE ts IN (SELECT MAX(ts) FROM equity_snapshots "
+                "             GROUP BY substr(ts, 1, 10)) "
+                "ORDER BY d ASC"
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+        return [
+            DailyNavClose(date=d, nav=_as_decimal(nav))
+            for d, nav in rows
+            if nav is not None
         ]
 
     def spend_curve(self) -> list[SpendPoint]:

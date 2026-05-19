@@ -202,6 +202,43 @@ def build_app(data: DashboardData, spy: SPYProvider | None = None) -> Flask:
             "spy_today_return": spy_today_return,
         })
 
+    @app.route("/api/daily_vs_spy")
+    def daily_vs_spy() -> object:
+        """One row per trading day: bot's daily % return vs SPY's daily % return.
+
+        Daily % is computed from the LAST equity_snapshot NAV per calendar
+        date (close-of-day proxy) and SPY's daily close from Alpaca's
+        AlpacaMarketData. Only dates with BOTH a NAV close and a SPY close
+        are emitted, so weekends/holidays drop out automatically (SPY
+        doesn't trade then) and crypto-only nav drift doesn't get falsely
+        compared to nothing.
+        """
+        nav_closes = data.daily_nav_closes()
+        spy_closes = spy.daily_closes(days=90) if spy is not None else []
+        spy_by_date = {d: float(c) for d, c in spy_closes}
+
+        out: list[dict[str, object]] = []
+        prev_nav: float | None = None
+        prev_spy: float | None = None
+        # Iterate in date order. Skip dates lacking a SPY close.
+        for pt in nav_closes:
+            if pt.date not in spy_by_date:
+                continue
+            nav_val = float(pt.nav)
+            spy_val = spy_by_date[pt.date]
+            if prev_nav is not None and prev_nav > 0 and prev_spy:
+                nav_pct = (nav_val - prev_nav) / prev_nav
+                spy_pct = (spy_val - prev_spy) / prev_spy
+                out.append({
+                    "date": pt.date,
+                    "nav_pct": nav_pct,
+                    "spy_pct": spy_pct,
+                    "alpha_pct": nav_pct - spy_pct,
+                })
+            prev_nav = nav_val
+            prev_spy = spy_val
+        return jsonify({"daily": out})
+
     @app.route("/api/sleeve_curves")
     def sleeve_curves() -> object:
         by_agent: dict[str, list[dict[str, float | str]]] = {}
@@ -563,6 +600,12 @@ _HTML = r"""<!doctype html>
     </div>
   </div>
 
+  <!-- Daily return comparison: bot vs SPY, one bar pair per trading day -->
+  <div class="card chart-card" style="margin-bottom:14px;">
+    <h3>Daily return: portfolio vs SPY</h3>
+    <div class="chart-wrap" style="min-height:240px;"><canvas id="daily-vs-spy-chart"></canvas></div>
+  </div>
+
   <!-- Activity feed -->
   <div class="card" style="margin-bottom:14px;">
     <div style="display:flex; align-items:center; gap:14px; margin-bottom:10px;">
@@ -685,6 +728,13 @@ async function fetchNav() {
     const j = await r.json();
     renderNav(j.nav, j.spy);
     computeAlpha(j.nav_today_return, j.spy_today_return);
+  } catch (e) { console.error(e); }
+}
+async function fetchDailyVsSpy() {
+  try {
+    const r = await fetch('/api/daily_vs_spy');
+    const j = await r.json();
+    renderDailyVsSpy(j.daily || []);
   } catch (e) { console.error(e); }
 }
 async function fetchSleeves() {
@@ -989,7 +1039,7 @@ const chartDefaults = {
   },
 };
 
-let navChart, sleeveChart, calChart, spendChart;
+let navChart, sleeveChart, calChart, spendChart, dailyVsSpyChart;
 
 function renderNav(nav, spy) {
   const ctx = document.getElementById('nav-chart').getContext('2d');
@@ -1021,6 +1071,49 @@ function computeAlpha(navRet, spyRet) {
     const fmt = (r) => (r > 0 ? '+' : '') + (r * 100).toFixed(2) + '%';
     sub.textContent = `port ${fmt(navRet)} · SPY ${fmt(spyRet)}`;
   }
+}
+
+function renderDailyVsSpy(rows) {
+  const ctx = document.getElementById('daily-vs-spy-chart').getContext('2d');
+  if (!rows || rows.length === 0) {
+    if (dailyVsSpyChart) { dailyVsSpyChart.data = { labels: [], datasets: [] }; dailyVsSpyChart.update('none'); }
+    return;
+  }
+  const labels = rows.map(r => r.date);
+  const navPct  = rows.map(r => +(r.nav_pct  * 100).toFixed(2));
+  const spyPct  = rows.map(r => +(r.spy_pct  * 100).toFixed(2));
+  // Cumulative alpha line so you can see compounding outperformance over time.
+  let cum = 0;
+  const alphaCum = rows.map(r => { cum += r.alpha_pct * 100; return +cum.toFixed(2); });
+  const data = {
+    labels,
+    datasets: [
+      { type: 'bar', label: 'Portfolio %', data: navPct,
+        backgroundColor: navPct.map(v => v >= 0 ? '#3fb95066' : '#f8514966'),
+        borderColor:     navPct.map(v => v >= 0 ? '#3fb950'   : '#f85149'),
+        borderWidth: 1, borderRadius: 2, categoryPercentage: 0.8, barPercentage: 0.9 },
+      { type: 'bar', label: 'SPY %', data: spyPct,
+        backgroundColor: '#8891a366', borderColor: '#8891a3',
+        borderWidth: 1, borderRadius: 2, categoryPercentage: 0.8, barPercentage: 0.9 },
+      { type: 'line', label: 'Cum. alpha (port − SPY)', data: alphaCum,
+        borderColor: '#d2a8ff', backgroundColor: '#d2a8ff22',
+        borderWidth: 2, pointRadius: 2, tension: 0.2, fill: false, yAxisID: 'y1' },
+    ],
+  };
+  const opts = {
+    ...chartDefaults,
+    plugins: { ...chartDefaults.plugins,
+      tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y >= 0 ? '+' : ''}${ctx.parsed.y.toFixed(2)}%` } } },
+    scales: {
+      x: { ...chartDefaults.scales.x, grid: { display: false } },
+      y: { ...chartDefaults.scales.y, title: { display: true, text: 'daily %', color: '#8891a3' },
+           ticks: { ...(chartDefaults.scales.y?.ticks || {}), callback: (v) => v + '%' } },
+      y1: { position: 'right', grid: { display: false }, ticks: { color: '#d2a8ff', callback: (v) => v + '%' },
+            title: { display: true, text: 'cum. alpha %', color: '#d2a8ff' } },
+    },
+  };
+  if (dailyVsSpyChart) { dailyVsSpyChart.data = data; dailyVsSpyChart.options = opts; dailyVsSpyChart.update('none'); return; }
+  dailyVsSpyChart = new Chart(ctx, { type: 'bar', data, options: opts });
 }
 
 function renderSleeves(byAgent) {
@@ -1081,6 +1174,7 @@ function refresh() {
   fetchSnapshot();
   fetchActivity();
   fetchNav();
+  fetchDailyVsSpy();
   fetchSleeves();
   fetchCal();
   fetchSpendCurve();
