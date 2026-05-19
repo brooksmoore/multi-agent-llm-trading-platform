@@ -1082,9 +1082,9 @@ function renderDailyVsSpy(rows) {
   const labels = rows.map(r => r.date);
   const navPct  = rows.map(r => +(r.nav_pct  * 100).toFixed(2));
   const spyPct  = rows.map(r => +(r.spy_pct  * 100).toFixed(2));
-  // Cumulative alpha line so you can see compounding outperformance over time.
-  let cum = 0;
-  const alphaCum = rows.map(r => { cum += r.alpha_pct * 100; return +cum.toFixed(2); });
+  // Per-day alpha (portfolio − SPY) so you can see day-by-day whether
+  // we beat SPY and by how much. Positive = outperformed that day.
+  const alphaDaily = rows.map(r => +(r.alpha_pct * 100).toFixed(2));
   const data = {
     labels,
     datasets: [
@@ -1097,7 +1097,7 @@ function renderDailyVsSpy(rows) {
       { type: 'bar', label: 'SPY %', data: spyPct,
         backgroundColor: '#8891a366', borderColor: '#8891a3',
         borderWidth: 1, borderRadius: 2, categoryPercentage: 0.8, barPercentage: 0.9 },
-      { type: 'line', label: 'Cum. alpha (port − SPY)', data: alphaCum,
+      { type: 'line', label: 'Daily alpha (port − SPY)', data: alphaDaily,
         borderColor: '#d2a8ff', backgroundColor: '#d2a8ff22',
         borderWidth: 2, pointRadius: 2, tension: 0.2, fill: false, yAxisID: 'y1' },
     ],
@@ -1111,7 +1111,7 @@ function renderDailyVsSpy(rows) {
       y: { ...chartDefaults.scales.y, title: { display: true, text: 'daily %', color: '#8891a3' },
            ticks: { ...(chartDefaults.scales.y?.ticks || {}), callback: (v) => v + '%' } },
       y1: { position: 'right', grid: { display: false }, ticks: { color: '#d2a8ff', callback: (v) => v + '%' },
-            title: { display: true, text: 'cum. alpha %', color: '#d2a8ff' } },
+            title: { display: true, text: 'daily alpha %', color: '#d2a8ff' } },
     },
   };
   if (dailyVsSpyChart) { dailyVsSpyChart.data = data; dailyVsSpyChart.options = opts; dailyVsSpyChart.update('none'); return; }
