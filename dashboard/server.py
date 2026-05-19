@@ -1089,8 +1089,10 @@ function renderDailyVsSpy(rows) {
     labels,
     datasets: [
       { type: 'bar', label: 'Portfolio %', data: navPct,
-        backgroundColor: navPct.map(v => v >= 0 ? '#3fb95066' : '#f8514966'),
-        borderColor:     navPct.map(v => v >= 0 ? '#3fb950'   : '#f85149'),
+        // Color reflects ALPHA (beat SPY), not absolute sign. A -1.5% day
+        // when SPY is -1.8% still beat SPY and should be green.
+        backgroundColor: navPct.map((v, i) => v >= spyPct[i] ? '#3fb95066' : '#f8514966'),
+        borderColor:     navPct.map((v, i) => v >= spyPct[i] ? '#3fb950'   : '#f85149'),
         borderWidth: 1, borderRadius: 2, categoryPercentage: 0.8, barPercentage: 0.9 },
       { type: 'bar', label: 'SPY %', data: spyPct,
         backgroundColor: '#8891a366', borderColor: '#8891a3',
