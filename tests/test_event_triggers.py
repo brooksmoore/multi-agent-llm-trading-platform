@@ -86,6 +86,45 @@ def test_news_event_triggers_deep_dive_on_held_opus_name(app: App) -> None:
     # Seed an Opus holding via the lot ledger
     app.lots.book_fill(Fill(
         id=new_id(), order_id=new_id(), agent_id=AgentId.OPUS,
+        symbol="NVDA", side=OrderSide.BUY,
+        qty=Decimal("5"), price=Decimal("200"),
+        timestamp=datetime.now(UTC),
+    ))
+    app._opus_run_deep_dive = MagicMock()
+
+    app.bus.publish(NewsHighImpactScoredEvent(
+        symbol="NVDA", impact=4, headline="NVDA news", published_at=datetime.now(UTC),
+    ))
+
+    app._opus_run_deep_dive.assert_called_once_with("NVDA")
+
+
+def test_news_event_triggers_deep_dive_on_watchlisted_opus_name(app: App) -> None:
+    """High-impact news on a watchlisted (not-held) name also fires the dive.
+
+    Plan 2c follow-up: when Opus has 0 holdings, restricting to held names
+    leaves the event-driven trigger permanently dormant.
+    """
+    app.opus._memory.remember("opus:watchlist", "NVDA,MSFT")
+    app._opus_run_deep_dive = MagicMock()
+
+    app.bus.publish(NewsHighImpactScoredEvent(
+        symbol="NVDA", impact=4, headline="NVDA news",
+        published_at=datetime.now(UTC),
+    ))
+
+    app._opus_run_deep_dive.assert_called_once_with("NVDA")
+
+
+def test_news_event_skips_off_plumbing_name(app: App) -> None:
+    """News on a symbol outside PLUMBING_UNIVERSE doesn't fire, even if held.
+
+    Off-plumbing names have no mark data, so the resulting intent would just
+    be rejected by the planner as unsized:no_mark. Don't burn Opus budget on
+    a guaranteed-reject.
+    """
+    app.lots.book_fill(Fill(
+        id=new_id(), order_id=new_id(), agent_id=AgentId.OPUS,
         symbol="TSM", side=OrderSide.BUY,
         qty=Decimal("5"), price=Decimal("200"),
         timestamp=datetime.now(UTC),
@@ -93,18 +132,20 @@ def test_news_event_triggers_deep_dive_on_held_opus_name(app: App) -> None:
     app._opus_run_deep_dive = MagicMock()
 
     app.bus.publish(NewsHighImpactScoredEvent(
-        symbol="TSM", impact=4, headline="TSM news", published_at=datetime.now(UTC),
+        symbol="TSM", impact=5, headline="TSM news",
+        published_at=datetime.now(UTC),
     ))
 
-    app._opus_run_deep_dive.assert_called_once_with("TSM")
+    app._opus_run_deep_dive.assert_not_called()
 
 
-def test_news_event_skips_unheld_name(app: App) -> None:
-    """News on a name Opus doesn't hold does NOT trigger a deep dive."""
+def test_news_event_skips_unrelated_name(app: App) -> None:
+    """News on a name Opus neither holds nor watchlists does NOT trigger a dive."""
     app._opus_run_deep_dive = MagicMock()
 
+    # AAPL is in plumbing but not held and not watchlisted for this test.
     app.bus.publish(NewsHighImpactScoredEvent(
-        symbol="UNHELD", impact=5, headline="huge news",
+        symbol="AAPL", impact=5, headline="huge news",
         published_at=datetime.now(UTC),
     ))
 
@@ -115,24 +156,24 @@ def test_news_event_rate_limited_to_one_per_iso_week(app: App) -> None:
     """Second high-impact event in same ISO week is suppressed."""
     app.lots.book_fill(Fill(
         id=new_id(), order_id=new_id(), agent_id=AgentId.OPUS,
-        symbol="TSM", side=OrderSide.BUY, qty=Decimal("5"),
+        symbol="NVDA", side=OrderSide.BUY, qty=Decimal("5"),
         price=Decimal("200"), timestamp=datetime.now(UTC),
     ))
     app.lots.book_fill(Fill(
         id=new_id(), order_id=new_id(), agent_id=AgentId.OPUS,
-        symbol="ASML", side=OrderSide.BUY, qty=Decimal("3"),
+        symbol="AVGO", side=OrderSide.BUY, qty=Decimal("3"),
         price=Decimal("700"), timestamp=datetime.now(UTC),
     ))
     app._opus_run_deep_dive = MagicMock()
 
     # First event: fires the dive
     app.bus.publish(NewsHighImpactScoredEvent(
-        symbol="TSM", impact=4, headline="TSM news",
+        symbol="NVDA", impact=4, headline="NVDA news",
         published_at=datetime.now(UTC),
     ))
     # Second event in the same ISO week: should be rate-limited
     app.bus.publish(NewsHighImpactScoredEvent(
-        symbol="ASML", impact=5, headline="ASML news",
+        symbol="AVGO", impact=5, headline="AVGO news",
         published_at=datetime.now(UTC),
     ))
 
@@ -144,20 +185,20 @@ def test_news_event_failed_dive_does_not_burn_quota(app: App) -> None:
     """If _opus_run_deep_dive raises, the rate-limit slot is NOT marked used."""
     app.lots.book_fill(Fill(
         id=new_id(), order_id=new_id(), agent_id=AgentId.OPUS,
-        symbol="TSM", side=OrderSide.BUY, qty=Decimal("5"),
+        symbol="NVDA", side=OrderSide.BUY, qty=Decimal("5"),
         price=Decimal("200"), timestamp=datetime.now(UTC),
     ))
     app._opus_run_deep_dive = MagicMock(side_effect=RuntimeError("network"))
 
     # First publish triggers the failing dive.
     app.bus.publish(NewsHighImpactScoredEvent(
-        symbol="TSM", impact=4, headline="x", published_at=datetime.now(UTC),
+        symbol="NVDA", impact=4, headline="x", published_at=datetime.now(UTC),
     ))
 
     # Recovery: quota not used; second publish on a working dive succeeds.
     app._opus_run_deep_dive = MagicMock()
     app.bus.publish(NewsHighImpactScoredEvent(
-        symbol="TSM", impact=4, headline="x2", published_at=datetime.now(UTC),
+        symbol="NVDA", impact=4, headline="x2", published_at=datetime.now(UTC),
     ))
 
     app._opus_run_deep_dive.assert_called_once()

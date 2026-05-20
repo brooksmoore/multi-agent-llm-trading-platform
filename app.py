@@ -75,9 +75,14 @@ from core.types import (
     KillSwitchState,
     MarketSnapshot,
     Order,
+    OrderClass,
     OrderSide,
+    OrderState,
+    OrderType,
     Sleeve,
+    TimeInForce,
     VixBucket,
+    new_id,
     normalize_symbol,
 )
 from core.types import (
@@ -130,6 +135,18 @@ JOB_SONNET_EOD               = "sonnet_eod"               # 16:30 ET
 # Manager journal fresh input. Off-schedule deep dives still fire
 # event-driven on NewsHighImpactScoredEvent (T2.5), rate-limited.
 JOB_OPUS_THURSDAY_DEEPDIVE   = "opus_thursday_deepdive"   # Thu 16:30 ET
+# Plan 2c follow-up: Opus.observe() was orphaned when JOB_OPUS_DAILY was
+# removed (commit 4425450). Restored on a once-weekly Monday cadence so
+# Opus can refresh its watchlist and emit starter intents while holdings
+# are below TARGET_HOLDINGS. Single weekly call at Opus pricing stays
+# inside the $0.10/day cap.
+JOB_OPUS_MONDAY_INIT         = "opus_monday_init"         # Mon 09:35 ET
+# M1: Manager owns a SPY reserve position so the unallocated capital earns
+# market beta instead of structurally underperforming the benchmark. The
+# job is idempotent — checks the lot ledger first and only buys if MANAGER
+# has no open SPY. Runs weekly so a flatten/wipe self-heals on the next
+# Monday rather than requiring a manual restart.
+JOB_MANAGER_RESERVE_CHECK    = "manager_reserve_check"    # Mon 09:40 ET
 JOB_MANAGER_FRIDAY           = "manager_friday"           # Fri 17:00 ET
 # T1.6 / T2.3: JOB_MANAGER_MORNING_BRIEF removed; replaced by JOB_HAIKU_MORNING_SYNTHESIS
 JOB_HAIKU_MORNING_SYNTHESIS  = "haiku_morning_synthesis"  # Mon-Fri 08:30 ET
@@ -144,7 +161,8 @@ JOB_MANAGER_SUNDAY_CRITIQUE  = "manager_sunday_critique"  # Sun 18:00 ET (T2.4)
 
 ALL_JOB_IDS: frozenset[str] = frozenset({
     JOB_HAIKU_NEWS_SCAN, JOB_HAIKU_CLOSE,
-    JOB_SONNET_EOD, JOB_OPUS_THURSDAY_DEEPDIVE,
+    JOB_SONNET_EOD, JOB_OPUS_THURSDAY_DEEPDIVE, JOB_OPUS_MONDAY_INIT,
+    JOB_MANAGER_RESERVE_CHECK,
     JOB_MANAGER_FRIDAY, JOB_HAIKU_MORNING_SYNTHESIS, JOB_HAIKU_CRYPTO,
     JOB_BUDGET_RESET, JOB_NEWS_FETCH, JOB_NEWS_NIGHTLY,
     JOB_PORTFOLIO_SNAPSHOT, JOB_PORTFOLIO_SNAPSHOT_WEEKEND,
@@ -433,7 +451,8 @@ class App:
         # Surface the Manager's current sleeve-weight allocation at boot so
         # silent staleness ({} = no reallocation has run yet) is visible in
         # the log instead of inferred from the absence of writes. The first
-        # real reallocation only fires every 4th Friday (iso_week % 4 == 0).
+        # real reallocation fires on the first Friday at least 4 weeks after
+        # the previous run (tracked via `last_capital_reallocation` memory).
         from agents.manager_bridge import SLEEVE_WEIGHTS_FILE, read_sleeve_weights
         weights = read_sleeve_weights()
         if weights:
@@ -1087,6 +1106,20 @@ class App:
             CronTrigger(day_of_week="thu", hour=16, minute=30, timezone=et),
             id=JOB_OPUS_THURSDAY_DEEPDIVE, replace_existing=True,
         )
+        # Weekly Monday observe(): lets Opus refresh the watchlist and emit
+        # starter intents during initiation mode (holdings < TARGET_HOLDINGS).
+        # Without this, a flattened Opus has no path back into the market
+        # since the Thursday deep-dive requires holdings or a clean watchlist.
+        sched.add_job(
+            self._job_opus_monday_init,
+            CronTrigger(day_of_week="mon", hour=9, minute=35, timezone=et),
+            id=JOB_OPUS_MONDAY_INIT, replace_existing=True,
+        )
+        sched.add_job(
+            self._job_manager_reserve_check,
+            CronTrigger(day_of_week="mon", hour=9, minute=40, timezone=et),
+            id=JOB_MANAGER_RESERVE_CHECK, replace_existing=True,
+        )
         sched.add_job(
             self._job_manager_friday,
             CronTrigger(day_of_week="fri", hour=17, minute=0, timezone=et),
@@ -1196,6 +1229,14 @@ class App:
     def _job_opus_thursday_deepdive(self) -> None:
         self._opus_deep_dive_rotation(slot=0)
 
+    def _job_opus_monday_init(self) -> None:
+        """Weekly Opus.observe() pass — refreshes watchlist and emits starter
+        intents when below TARGET_HOLDINGS. Skip-when-unchanged gating in
+        dispatch_observation prevents wasted calls once Opus is fully built
+        and signals haven't moved.
+        """
+        self.dispatch_observation(self.opus)
+
     def _opus_deep_dive_rotation(self, *, slot: int) -> None:
         """Pick the slot-th-oldest deep-dive candidate and run on it.
 
@@ -1216,9 +1257,25 @@ class App:
                 seen.add(sym_u)
                 candidates.append(sym_u)
 
+        # Drop any candidate not in PLUMBING_UNIVERSE: the data layer never
+        # fetches bars for off-plumbing names, so the deep-dive would burn
+        # an LLM call only for the planner to reject the resulting intent
+        # with unsized:no_mark. ASML/TSM in the watchlist were doing exactly
+        # this for two weeks straight.
+        plumbing = {s.upper() for s in PLUMBING_UNIVERSE}
+        eligible = [s for s in candidates if s in plumbing]
+        dropped = [s for s in candidates if s not in plumbing]
+        if dropped:
+            log.warning(
+                "opus deep_dive: dropping off-plumbing candidates %s "
+                "(no mark data available); fix universe or watchlist",
+                dropped,
+            )
+        candidates = eligible
+
         if not candidates:
             log.info(
-                "opus deep_dive: no holdings or watchlist candidates; skipping",
+                "opus deep_dive: no eligible holdings or watchlist candidates; skipping",
             )
             return
 
@@ -1339,6 +1396,118 @@ class App:
             )
 
     # Manager --------------------------------------------------------------
+    # M1: target dollar value of the Manager's SPY reserve. Mirrors the
+    # $10k Manager slice declared in settings.starting_equity's comment
+    # ("$30k × 3 sleeves = $90k deployed, $10k Manager reserve"). Held in
+    # SPY rather than cash so the reserve earns market beta — the previous
+    # behavior (idle cash) was a structural ~25 bps/quarter drag vs the
+    # SPY benchmark.
+    _MANAGER_RESERVE_TARGET_USD: Decimal = Decimal("10000")
+
+    def _job_manager_reserve_check(self) -> None:
+        """Ensure the Manager sleeve holds ~$10k in SPY.
+
+        Idempotent: checks the lot ledger first; submits a market buy only
+        when MANAGER has no open SPY. Self-heals on the next Monday after
+        any flatten or partial sell. The order goes through the OMS so
+        normal fill/event/lot-booking flow applies — the MANAGER agent_id
+        ensures the resulting lot is attributed correctly and not visible
+        to sleeve agents through the position-filter view.
+        """
+        try:
+            held = self.lots.open_qty_by_symbol(AgentId.MANAGER)
+        except Exception:
+            log.exception("manager_reserve_check: lot ledger query failed")
+            return
+        spy_qty = held.get("SPY", Decimal("0"))
+        if spy_qty > Decimal("0"):
+            log.info(
+                "manager_reserve_check: MANAGER already holds %.4f SPY; nothing to do",
+                float(spy_qty),
+            )
+            return
+
+        # Don't double-submit if a previous run's order is still in flight
+        # (e.g. accepted but not yet filled when the bot restarted).
+        try:
+            open_orders = self.oms.list_open_orders()
+        except Exception:
+            log.exception("manager_reserve_check: oms.list_open_orders failed")
+            return
+        for o in open_orders:
+            if o.agent_id == AgentId.MANAGER and o.symbol == "SPY":
+                log.info(
+                    "manager_reserve_check: MANAGER SPY order %s already open "
+                    "(state=%s); skipping submit", o.id, o.state,
+                )
+                return
+
+        # Resolve a SPY mark from the latest cached bar. Falls back to
+        # broker latest-price if the bar cache is empty.
+        now = self.clock.now()
+        try:
+            bars = self.market_data.get_bars_batch(
+                ["SPY"], now - timedelta(days=10), now,
+            )
+            spy_bars = bars.get("SPY") or []
+        except Exception:
+            log.warning("manager_reserve_check: get_bars_batch failed", exc_info=True)
+            spy_bars = []
+        if spy_bars:
+            mark = spy_bars[-1].close
+        else:
+            log.warning("manager_reserve_check: no SPY bars available; skipping")
+            return
+        if mark <= Decimal("0"):
+            log.warning("manager_reserve_check: non-positive SPY mark %s; skipping", mark)
+            return
+
+        # Cash check — don't try to buy if the broker can't cover it.
+        try:
+            account = self.broker.get_account()
+        except Exception:
+            log.exception("manager_reserve_check: broker.get_account failed")
+            return
+        if account.cash < self._MANAGER_RESERVE_TARGET_USD:
+            log.warning(
+                "manager_reserve_check: insufficient cash $%.2f < target $%.2f; "
+                "deferring", float(account.cash), float(self._MANAGER_RESERVE_TARGET_USD),
+            )
+            return
+
+        # Fractional shares rounded to 4 decimals (Alpaca paper accepts this).
+        qty = (self._MANAGER_RESERVE_TARGET_USD / mark).quantize(Decimal("0.0001"))
+        if qty <= Decimal("0"):
+            log.warning("manager_reserve_check: computed qty %s ≤ 0; skipping", qty)
+            return
+
+        order = Order(
+            id=new_id(),
+            intent_id=new_id(),  # synthetic — no Intent originates this order
+            agent_id=AgentId.MANAGER,
+            symbol="SPY",
+            side=OrderSide.BUY,
+            qty=qty,
+            order_type=OrderType.MARKET,
+            order_class=OrderClass.SIMPLE,
+            time_in_force=TimeInForce.DAY,
+            state=OrderState.PENDING,
+            created_at=now,
+        )
+        log.info(
+            "manager_reserve_check: submitting MANAGER SPY BUY qty=%s @ mark $%.2f "
+            "(target $%.2f)", qty, float(mark), float(self._MANAGER_RESERVE_TARGET_USD),
+        )
+        try:
+            result = self.oms.submit_order(order)
+        except Exception:
+            log.exception("manager_reserve_check: oms.submit_order failed")
+            return
+        log.info(
+            "manager_reserve_check: submitted order=%s accepted=%s rejection=%s",
+            order.id, result.accepted, result.rejection_reason,
+        )
+
     def _build_manager_ctx(self, state: AgentState):
         """Assemble the full Manager analytics context. Tolerant of partial data."""
         # OBSERVATIONAL — SPYProvider feeds the growth_metrics_v2 block (daily
@@ -1419,9 +1588,27 @@ class App:
             if gated_strategic_call_ran:
                 self._last_manager_fingerprint = mgr_fp
 
-        # Every 4th Friday: capital reallocation
-        iso_week = state.timestamp.isocalendar().week
-        if iso_week % 4 == 0:
+        # Capital reallocation: every 4 weeks since the last successful run.
+        # Previously gated on `iso_week % 4 == 0`, which depends on calendar
+        # alignment — under a 5-week bot lifetime the function had not fired
+        # once. Tracking the actual elapsed weeks via a memory key guarantees
+        # one run per ~4-week window from any start date.
+        today = state.timestamp.date()
+        last_realloc_raw = manager_mem.recall("last_capital_reallocation") or ""
+        try:
+            last_realloc_date = date.fromisoformat(last_realloc_raw) if last_realloc_raw else None
+        except ValueError:
+            last_realloc_date = None
+        weeks_since = (
+            (today - last_realloc_date).days / 7.0
+            if last_realloc_date is not None
+            else float("inf")
+        )
+        if weeks_since >= 4.0:
+            log.info(
+                "manager.capital_reallocation: firing (weeks_since_last=%.1f, "
+                "last=%s)", weeks_since, last_realloc_date,
+            )
             try:
                 realloc = self.manager.capital_reallocation(state, ctx=ctx)
             except Exception:
@@ -1449,6 +1636,14 @@ class App:
             if mapped:
                 write_sleeve_weights(mapped)
                 log.info("manager.capital_reallocation: persisted sleeve weights %s", mapped)
+            # Stamp the run regardless of whether weights changed, so a "hold
+            # everything" decision still satisfies the 4-week cadence.
+            manager_mem.remember("last_capital_reallocation", today.isoformat())
+        else:
+            log.info(
+                "manager.capital_reallocation: skipping (only %.1f weeks since "
+                "last run; need 4.0)", weeks_since,
+            )
 
     def _job_manager_sunday_critique(self) -> None:
         """Weekly Sunday 18:00 ET adversarial critique (T2.4 / Plan 2c).
@@ -1591,9 +1786,24 @@ class App:
         except Exception:
             log.warning("on_news_high_impact: lot ledger query failed", exc_info=True)
             return
-        if symbol not in {s.upper() for s in held}:
+        # Fire on watchlist names too, not just held. When Opus is flat (as
+        # it has been since the 5/11 flatten), restricting to held leaves the
+        # event-driven trigger permanently dormant. Watchlist candidates are
+        # the names Opus has explicitly flagged for diligence — news on those
+        # is exactly the cue to surface them. Must be in PLUMBING_UNIVERSE so
+        # the resulting intent has a mark to size against.
+        held_syms = {s.upper() for s in held}
+        watchlist_syms = {s.upper() for s in self.opus.get_watchlist()}
+        plumbing_syms = {s.upper() for s in PLUMBING_UNIVERSE}
+        if symbol not in plumbing_syms:
             log.debug(
-                "on_news_high_impact: %s not held by Opus; ignoring", symbol,
+                "on_news_high_impact: %s not in plumbing universe; ignoring", symbol,
+            )
+            return
+        if symbol not in (held_syms | watchlist_syms):
+            log.debug(
+                "on_news_high_impact: %s not held or watchlisted by Opus; ignoring",
+                symbol,
             )
             return
 
