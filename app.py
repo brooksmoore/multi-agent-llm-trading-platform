@@ -382,6 +382,7 @@ class App:
         self._volatility_thread: threading.Thread | None = None
         self._volatility_stop = threading.Event()
         self._dashboard_thread: threading.Thread | None = None
+        self._dashboard_server: Any = None  # werkzeug BaseWSGIServer; shut down in stop()
         self._started_at: datetime | None = None
         self._started = False
         self._stopped = False
@@ -483,7 +484,18 @@ class App:
 
         log.info("App: stopping...")
 
-        # Stop scheduler first so no new jobs fire while we tear down.
+        # Stop the dashboard server FIRST so no new HTTP requests start
+        # hitting the OMS store / lot ledger after we close them below.
+        # Without this, requests in flight at shutdown crash with
+        # `sqlite3.ProgrammingError: Cannot operate on a closed database`
+        # and the non-daemon per-request worker threads block the
+        # interpreter from exiting on SIGINT.
+        if self._dashboard_server is not None:
+            self._safe_call(self._dashboard_server.shutdown)
+        if self._dashboard_thread is not None:
+            self._dashboard_thread.join(timeout=5)
+
+        # Stop scheduler so no new jobs fire while we tear down.
         self._safe_call(lambda: self.scheduler.shutdown(wait=False))
 
         # Stop volatility scanner thread
@@ -2042,9 +2054,28 @@ class App:
         )
         flask_app = build_app(data, SPYProvider())
 
+        # Use werkzeug's make_server directly (rather than flask_app.run) so
+        # we can hold a reference to the server and call shutdown() cleanly
+        # in stop(). flask_app.run() blocks forever and leaves non-daemon
+        # per-request handler threads alive, which prevents the interpreter
+        # from exiting after the first SIGINT — a user-visible bug where the
+        # process kept serving /api/activity (against a closed DB) for
+        # minutes after "App: stopped".
+        try:
+            from werkzeug.serving import make_server  # noqa: PLC0415
+        except Exception:
+            log.warning("werkzeug.make_server unavailable; skipping dashboard", exc_info=True)
+            return
+
+        server = make_server("127.0.0.1", 8081, flask_app, threaded=True)
+        # daemon_threads=True ensures Werkzeug's per-request handler threads
+        # don't block interpreter exit if a request is mid-flight at shutdown.
+        server.daemon_threads = True
+        self._dashboard_server = server
+
         def _run() -> None:
             try:
-                flask_app.run(host="127.0.0.1", port=8081, debug=False, threaded=True)
+                server.serve_forever()
             except Exception:
                 log.exception("dashboard thread crashed")
 
