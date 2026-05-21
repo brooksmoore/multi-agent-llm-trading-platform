@@ -2198,7 +2198,11 @@ def _setup_logging(level: str) -> None:
     # Werkzeug logs every dashboard poll at INFO; apscheduler announces every
     # job add/start; alpaca's stream pings INFO on each connection event.
     # We still want WARNING+ from all of them so real failures surface.
-    for noisy in ("werkzeug", "apscheduler", "alpaca", "alpaca.trading.stream"):
+    # httpx is also added to the silence list: it logs every outbound HTTP
+    # request at INFO, which (a) drowns out our own signal and (b) leaks the
+    # Telegram bot token in URLs like /bot{TOKEN}/sendMessage. Real failures
+    # still surface at WARNING+.
+    for noisy in ("werkzeug", "apscheduler", "alpaca", "alpaca.trading.stream", "httpx"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 

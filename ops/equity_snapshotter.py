@@ -15,14 +15,18 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any, TypeVar
 
 from core.types import AgentId, normalize_symbol
 from execution.agent_state_tracker import AgentStateTracker
 from execution.broker import Broker
 from execution.lots import LotLedger
+
+T = TypeVar("T")
 
 # Agents whose sleeve equity tracks open lots. Manager has no lots, so a
 # mark-update would be a no-op and is skipped.
@@ -31,6 +35,48 @@ _TRADING_AGENTS: tuple[AgentId, ...] = (AgentId.HAIKU, AgentId.SONNET, AgentId.O
 log = logging.getLogger(__name__)
 
 SNAPSHOT_INTERVAL_SECS: float = 60.0
+
+# Hard cap on how long a broker call may block the snapshotter loop.
+# alpaca-py's TradingClient doesn't expose a request timeout, so a network
+# blip can hang the underlying socket forever. Without this watchdog the
+# snapshotter has been observed to wedge mid-call and stop writing rows
+# for hours. The hung underlying thread is daemon-leaked: it will resolve
+# when the OS times out the socket or the process exits.
+BROKER_CALL_TIMEOUT_SECS: float = 10.0
+
+
+def _call_with_timeout(
+    fn: Callable[[], T],
+    *,
+    timeout: float,
+    label: str,
+) -> tuple[T | None, BaseException | None]:
+    """Run ``fn()`` in a daemon thread; return (result, error_or_none).
+
+    On timeout, returns ``(None, TimeoutError)`` and lets the underlying
+    thread keep running — it's daemon so it dies with the process if the
+    call truly never returns. In practice transient DNS/network failures
+    resolve in seconds, so a leaked thread cleans itself up shortly after.
+    """
+    result_box: list[T | None] = [None]
+    err_box: list[BaseException | None] = [None]
+    done = threading.Event()
+
+    def _runner() -> None:
+        try:
+            result_box[0] = fn()
+        except BaseException as e:  # noqa: BLE001 — surface any failure mode
+            err_box[0] = e
+        finally:
+            done.set()
+
+    t = threading.Thread(
+        target=_runner, daemon=True, name=f"snapshotter-call-{label}",
+    )
+    t.start()
+    if not done.wait(timeout=timeout):
+        return None, TimeoutError(f"{label} exceeded {timeout:.0f}s")
+    return result_box[0], err_box[0]
 
 
 _DDL_EQUITY = """
@@ -152,13 +198,26 @@ class EquitySnapshotter:
         positions_rows: list[tuple[str, str, str, str, str, str]] = []
         marks: dict[str, Decimal] = {}
         if self._broker is not None:
-            try:
-                acct = self._broker.get_account()
+            acct, err = _call_with_timeout(
+                self._broker.get_account,
+                timeout=BROKER_CALL_TIMEOUT_SECS,
+                label="get_account",
+            )
+            if err is not None:
+                log.warning("snapshotter: broker.get_account failed: %s", err)
+            elif acct is not None:
                 total_nav = acct.equity
-            except Exception:
-                log.warning("snapshotter: broker.get_account failed", exc_info=True)
-            try:
-                positions = list(self._broker.list_positions())
+
+            positions_result, err = _call_with_timeout(
+                lambda: list(self._broker.list_positions()),  # type: ignore[union-attr]
+                timeout=BROKER_CALL_TIMEOUT_SECS,
+                label="list_positions",
+            )
+            if err is not None:
+                log.warning("snapshotter: broker.list_positions failed: %s", err)
+                positions_result = None
+            if positions_result is not None:
+                positions = positions_result
                 for p in positions:
                     qty = p.qty
                     market_value = qty * p.current_price
@@ -175,8 +234,6 @@ class EquitySnapshotter:
                     # Build canonical mark dict for per-agent equity recompute.
                     # normalize_symbol collapses "BTC/USD" → "BTCUSD".
                     marks[normalize_symbol(p.symbol)] = p.current_price
-            except Exception:
-                log.warning("snapshotter: broker.list_positions failed", exc_info=True)
 
         # ── Drive per-agent equity recompute BEFORE reading sleeves. ─────────
         # Without this, sleeve equity is only recomputed inside dispatch_observation,

@@ -153,6 +153,63 @@ def test_tick_normalizes_crypto_symbol_form(tmp_path: Path) -> None:
     assert Decimal(row["opus"]) == Decimal("30100")
 
 
+def test_tick_does_not_hang_when_broker_blocks_forever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Regression: the snapshotter wedged for ~24h when an alpaca-py call
+    hung on a DNS-failed socket (alpaca-py exposes no request timeout).
+    Watchdog must abort the call and let the loop continue with NULL NAV.
+    """
+    tracker, ledger, broker, snap = _build(tmp_path)
+
+    # Shorten the watchdog timeout so the test takes ~0.2s, not 10s.
+    monkeypatch.setattr(
+        "ops.equity_snapshotter.BROKER_CALL_TIMEOUT_SECS", 0.2,
+    )
+
+    import threading
+    block = threading.Event()  # never set → simulates an indefinite hang
+
+    def _hang_account() -> BrokerAccount:
+        block.wait()  # blocks until the test ends; daemon thread is leaked
+        raise AssertionError("unreachable")
+
+    def _hang_positions() -> list[BrokerPosition]:
+        block.wait()
+        raise AssertionError("unreachable")
+
+    broker.get_account = _hang_account  # type: ignore[method-assign]
+    broker.list_positions = _hang_positions  # type: ignore[method-assign]
+
+    start = datetime.now(UTC)
+    with caplog.at_level("WARNING", logger="ops.equity_snapshotter"):
+        snap.tick_once(now=datetime(2026, 5, 5, 20, 0, tzinfo=UTC))
+    elapsed = (datetime.now(UTC) - start).total_seconds()
+
+    # Each call has its own 0.2s timeout; total tick should finish well under 1s.
+    assert elapsed < 1.0, f"tick blocked for {elapsed:.2f}s — watchdog not firing"
+
+    # The row is still written so the time series has a heartbeat — total_nav
+    # is NULL because we couldn't read it, but sleeve equity (computed from
+    # the ledger) is still meaningful.
+    conn = sqlite3.connect(str(tmp_path / "equity.db"))
+    try:
+        cur = conn.execute("SELECT total_nav FROM equity_snapshots ORDER BY ts DESC LIMIT 1")
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] is None  # total_nav NULL because account call hung
+
+    # Surfaces the timeout as a WARNING so it's visible in logs, not silent.
+    assert any(
+        "get_account" in r.message and "exceeded" in r.message for r in caplog.records
+    )
+
+    # Unblock the leaked daemon threads so the test process exits cleanly.
+    block.set()
+
+
 def test_tick_with_no_broker_positions_keeps_starting_equity(tmp_path: Path) -> None:
     """Sanity: agents with no lots should remain at starting equity."""
     tracker, ledger, broker, snap = _build(tmp_path)
