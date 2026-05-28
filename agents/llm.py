@@ -52,6 +52,14 @@ OPUS_MODEL = "claude-opus-4-7"
 # Applied per-attempt independently of the 429 retry counter.
 _BACKOFF_529_SECS: list[float] = [1.0, 4.0, 16.0]
 
+# Per-request wall-clock timeout for the Anthropic SDK. The SDK default is 600s
+# (10 min); under DNS/network flapping a single hung request at that ceiling —
+# multiplied by our retries — could wedge a sleeve's observe() for tens of
+# minutes, which starves the hourly crypto job's scheduler slot ("max instances
+# reached"). 60s is well above p99 latency for our short prompts and bounds the
+# worst-case hang to ~3×60s + backoff.
+_LLM_REQUEST_TIMEOUT_SECS: float = 60.0
+
 
 _RAW_RESPONSE_LOG = Path(
     os.environ.get("LLM_RAW_RESPONSE_LOG", "logs/llm_responses.jsonl")
@@ -111,7 +119,9 @@ class LLMClient:
         self._model = model
         self._max_retries = max_retries
         self._client = (
-            anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+            anthropic.Anthropic(api_key=api_key, timeout=_LLM_REQUEST_TIMEOUT_SECS)
+            if api_key
+            else anthropic.Anthropic(timeout=_LLM_REQUEST_TIMEOUT_SECS)
         )
 
     def call(
@@ -227,4 +237,19 @@ class LLMClient:
                     time.sleep(_BACKOFF_529_SECS[attempt] + random.uniform(0, 1))
                 else:
                     time.sleep(1.0)
+            except (anthropic.APITimeoutError, anthropic.APIConnectionError) as exc:
+                # Transient DNS/socket flaps (the recurring getaddrinfo failures
+                # against api.anthropic.com / data.alpaca.markets) surface here.
+                # Retry with the 529 backoff curve so a brief outage recovers the
+                # tick instead of dropping it; if it persists past max_retries the
+                # caller logs and returns [] — no wedged scheduler slot either way.
+                last_exc = exc
+                if attempt >= self._max_retries - 1:
+                    raise
+                backoff = (
+                    _BACKOFF_529_SECS[attempt]
+                    if attempt < len(_BACKOFF_529_SECS)
+                    else _BACKOFF_529_SECS[-1]
+                )
+                time.sleep(backoff + random.uniform(0, 1))
         raise last_exc

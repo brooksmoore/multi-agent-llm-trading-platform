@@ -299,12 +299,21 @@ class AlpacaBroker:
         logger.info("AlpacaBroker: trade stream started (paper=%s)", self._paper)
 
     def stop_stream(self) -> None:
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream = None
-        if self._stream_thread is not None:
-            self._stream_thread.join(timeout=5)
-            self._stream_thread = None
+        # TradingStream.stop() calls asyncio.run_coroutine_threadsafe(...).result()
+        # with no timeout.  When the stream's event loop is wedged on a blocking
+        # DNS call (socket.gaierror [Errno 8]) it can never process stop_ws(),
+        # so .result() blocks forever and SIGINT never terminates the process.
+        # Work-around: fire stop() in a daemon thread and cap the wait at 2s.
+        # The stream thread itself is daemon=True, so it dies with the process
+        # regardless; we just need not to block the main shutdown path.
+        stream, self._stream = self._stream, None
+        thread, self._stream_thread = self._stream_thread, None
+        if stream is not None:
+            t = threading.Thread(target=stream.stop, daemon=True, name="stream-stop")
+            t.start()
+            t.join(timeout=2.0)
+        if thread is not None:
+            thread.join(timeout=2)
 
     # ── Translators ───────────────────────────────────────────────────────────
 
