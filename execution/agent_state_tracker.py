@@ -29,7 +29,15 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from core.types import AgentId, AgentState, DrawdownBucket, Fill, OrderSide, normalize_symbol
+from core.types import (
+    DUST_NOTIONAL_USD,
+    AgentId,
+    AgentState,
+    DrawdownBucket,
+    Fill,
+    OrderSide,
+    normalize_symbol,
+)
 from execution.kill_switch import (
     CONSECUTIVE_LOSS_BENCH_TRIGGER,
     KillSwitchEngine,
@@ -398,6 +406,15 @@ class AgentStateTracker:
         missing: list[str] = []
         for lot in self._ledger.all_lots():
             if lot.agent_id == agent_id and not lot.is_closed:
+                # Skip dust lots: a sub-cent remaining position (crypto in-kind
+                # fee residue or float-rounded sell sliver) is not a real
+                # holding. Including it forces a mark lookup that need not exist
+                # and spams "missing marks for held lots" while contributing
+                # nothing measurable to equity. Newer fills auto-close such
+                # slivers in LotLedger.close_lots; this guards dust already
+                # persisted from before that fix.
+                if lot.remaining_qty * lot.entry_price < DUST_NOTIONAL_USD:
+                    continue
                 # Lots may carry crypto symbols in either "BTC/USD" or "BTCUSD"
                 # form depending on which path persisted them. Normalize before
                 # lookup so a single canonical mark serves both.

@@ -24,6 +24,16 @@ def new_id() -> uuid.UUID:
     return uuid.uuid4()
 
 
+# A lot whose remaining position is worth less than this at any reasonable mark
+# is dust, not a real holding. Crypto sells settle in-kind (Alpaca deducts the
+# taker fee from the base asset), and float-rounded sell quantities rarely match
+# the open quantity to the last wei — so a sub-cent sliver is left behind. Such
+# a lot must be treated as closed: otherwise it lingers forever as a phantom
+# open position that demands a mark price every equity tick (the source of the
+# repeating "missing marks for held lots: ['ETHUSD']" warnings).
+DUST_NOTIONAL_USD: Decimal = Decimal("0.01")
+
+
 def normalize_symbol(symbol: str) -> str:
     """Canonical form for trading symbols.
 

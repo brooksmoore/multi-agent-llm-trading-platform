@@ -18,6 +18,7 @@ from datetime import date
 from decimal import Decimal
 
 from core.types import (
+    DUST_NOTIONAL_USD,
     AgentId,
     Fill,
     FillId,
@@ -298,6 +299,13 @@ class LotLedger:
                     break
                 consume = min(lot.remaining_qty, remaining_to_close)
                 new_remaining = lot.remaining_qty - consume
+                # A sub-cent sliver left after a crypto in-kind fee or a
+                # float-rounded sell is dust, not a position — snap it to zero
+                # and close the lot so it never becomes a phantom open holding.
+                if new_remaining > Decimal("0") and (
+                    new_remaining * exit_fill.price < DUST_NOTIONAL_USD
+                ):
+                    new_remaining = Decimal("0")
                 is_closed = new_remaining == Decimal("0")
                 updated = replace(
                     lot,

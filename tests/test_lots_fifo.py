@@ -101,6 +101,38 @@ def test_fifo_partial_close_updates_remaining() -> None:
     assert affected.exit_price is None
 
 
+def test_close_snaps_sub_cent_dust_to_closed() -> None:
+    """A crypto in-kind fee leaves a sub-cent sliver; the lot must close, not
+    linger as a phantom open holding demanding a mark every tick."""
+    ledger = LotLedger()
+    ledger.open_lot(
+        _fill(OrderSide.BUY, "1.0", "2000", day=1, symbol="ETHUSD")
+    )
+    # Sell slightly less than held (in-kind fee deducted from base asset),
+    # leaving 5.6e-10 ETH ≈ $1e-6 of dust.
+    sell = _fill(OrderSide.SELL, "0.99999999944", "2000", day=5, symbol="ETHUSD")
+    closed = ledger.close_lots(
+        AgentId.HAIKU, "ETHUSD", Decimal("0.99999999944"), sell, LotMethod.FIFO
+    )
+
+    assert closed[0].is_closed is True
+    assert closed[0].remaining_qty == Decimal("0")
+    assert ledger.open_lots(AgentId.HAIKU, "ETHUSD") == []
+
+
+def test_close_keeps_material_remainder_open() -> None:
+    """A remainder worth more than a cent is a real position and stays open."""
+    ledger = LotLedger()
+    ledger.open_lot(_fill(OrderSide.BUY, "1.0", "2000", day=1, symbol="ETHUSD"))
+    sell = _fill(OrderSide.SELL, "0.5", "2000", day=5, symbol="ETHUSD")
+    closed = ledger.close_lots(
+        AgentId.HAIKU, "ETHUSD", Decimal("0.5"), sell, LotMethod.FIFO
+    )
+
+    assert closed[0].is_closed is False
+    assert closed[0].remaining_qty == Decimal("0.5")
+
+
 def test_fifo_full_close_sets_exit_fields() -> None:
     ledger = LotLedger()
     ledger.open_lot(_fill(OrderSide.BUY, "10", "100", day=1))
