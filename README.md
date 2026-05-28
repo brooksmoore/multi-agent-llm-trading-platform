@@ -6,6 +6,13 @@ Three Claude models — **Haiku 4.5, Sonnet 4.6, Opus 4.7** — each manage a $1
 
 Local "Bloomberg-lite" terminal at `http://localhost:8081`.
 
+> **Ops note (2026-05-24):** this bot was being killed by the *other* local bots, not by
+> its own code — pure_arb_bot's and kalshi_bot_2.0's restart scripts used bare
+> `pkill -f dashboard.py` / `observer` patterns that matched this bot's processes too
+> (seen here as repeated "Signal 2 / graceful shutdown" cascades). Those scripts have
+> been scoped to their own folders. This bot launches with `uv run python app.py` and
+> uses port **8081** (kalshi=8082, pure_arb=8083) — no port conflict exists.
+
 ## Status
 
 Active development. Core platform is built and runs end-to-end against an Alpaca paper account. The Python guardrail layer, OMS with crash-recovery replay, broker reconciliation, kill-switch engine, and 41-file pytest suite are all in place. Live paper trading is in progress; backtesting harness and weekly performance reporting are next.

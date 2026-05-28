@@ -457,3 +457,62 @@ Smoke test suite (`tests/test_smoke.py`, 11 tests):
 **Pending (M10 remaining):**
 - Sub-task 2: Real Telegram integration (`ops/telegram.py`) — python-telegram-bot v21+, MarkdownV2, 1-min dedup, Acknowledge button.
 - Sub-task 3 (BLOCKED): Baseline backtest engine — must confirm with Brooks before starting.
+
+---
+
+## Path A — Fair-Test Hardening (Manager + Opus + Health) — 2026-05-28
+
+**Context:** After 19 trading days the bot was behind SPY by ~2.9% (beat SPY 9/19 days =
+47.4%, avg daily excess −0.151%/day). Sleeve attribution showed the LLM-edge thesis is so far
+disproven by the ledger: Haiku (7-ETF closet-index basket) +$370–520 carried everything;
+Sonnet (the only genuine single-name picker) net −$65; Opus $0 (≈97% idle cash). BUT the
+Manager's capital reallocation had **never once executed**, so the adaptive design had never
+actually run. Brooks chose Path A: fix the broken pieces, then a **10-trading-day kill
+criterion** — if cumulative daily-excess-vs-SPY isn't positive, pivot/kill (no goalpost moves).
+
+**What was fixed:**
+
+1. **Manager capital reallocation — silent no-op (real bug).** The `reallocation.json` prompt
+   emits *dollar* allocations (`current_allocation` / `new_allocation`, e.g.
+   `{"haiku":950,"sonnet":1100,"opus":950}`), but `app.py` looked for a nonexistent
+   `sleeve_weights` multiplier key, then fell back to iterating the whole response dict — whose
+   keys (`decision_basis`, `new_allocation`, …) never parse as `AgentId`, so `mapped` was always
+   empty and `write_sleeve_weights()` never fired. Empty `manager_sleeve_weights.json` = `{}`
+   since 2026-05-04, no `last_capital_reallocation` memory key. **Fix (`app.py` ~1629):** read
+   the real schema, derive `multiplier = new_allocation / current_allocation` per sleeve, rebase
+   to mean-1.0 if no baseline, clamp to ±25% (the prompt's own per-4-week rule). Added
+   instrumentation: logs raw response keys and emits an explicit `produced NO usable weights`
+   WARNING instead of failing silently. Verified vs documented schema + `test_agents_m7`.
+
+2. **LLM hang → starved scheduler (health).** `anthropic.Anthropic(...)` was constructed with
+   **no timeout** (SDK default 600s/request). Under the recurring `getaddrinfo` DNS flaps a
+   single `observe()` could wedge for tens of minutes; with the crypto job on an hourly trigger
+   + `max_instances=1`, every subsequent tick was skipped ("maximum number of running instances
+   reached"). **Fix (`agents/llm.py`):** `_LLM_REQUEST_TIMEOUT_SECS = 60`, and the retry loop
+   now also catches `APITimeoutError` / `APIConnectionError` with the 529 backoff curve so
+   transient flaps recover the tick instead of dropping it. Worst-case hang ~3×60s + backoff.
+   **`app.py` scheduler:** `job_defaults={"coalesce": True, "misfire_grace_time": 300}`.
+
+3. **Opus idle capital (strategy, reversible).** Opus targets 5 holdings at ≤2 starters/cycle
+   but fired only twice weekly (Mon init + Thu deep-dive) → ~$30k (≈30% of NAV) sat in cash for
+   weeks, a structural drag vs SPY on up days. **Added `JOB_OPUS_DAILY_INIT`** (`_job_opus_daily_init`,
+   Mon-Fri 10:00 ET): self-guarded book-building that dispatches **only while open holdings <
+   TARGET_HOLDINGS**, then self-disables. Does not make Opus a day-trader (management-mode ticks
+   dedupe via `signal_fingerprint`). Fully reversible — delete the one job to revert.
+
+**Also checked:** "ghost" python processes were a false alarm — `src/main.py` / `run_arb.py`
+belong to a separate repo (`/Users/brooksmoore/Desktop/pure_arb_bot`); exactly one clean
+`app.py` instance runs for this bot.
+
+**Test results:** 710 passed, 1 skipped. New code lint-clean (remaining ruff items in `app.py`
+are pre-existing: `LiveMetrics` forward-ref, import sort).
+
+**Deploy note:** the 00:22 restart loaded only the Manager fix; the llm.py timeout, scheduler
+defaults, and Opus daily job were edited afterward and need a **second restart** to go live.
+
+**What to watch (fair test):**
+- Daily: `opus_daily_init: under-invested … dispatching` → idle cash deploying toward 5 holdings.
+- Fri 17:00 ET: Manager logs either `persisted sleeve weights {…}` or `produced NO usable
+  weights` — no more silent failure.
+- Kill criterion: 10 trading days from this deploy; measured via the SPY-pairing script
+  (per-day max NAV from `equity_snapshots.db` × `SPYProvider().daily_closes()`).

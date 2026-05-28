@@ -22,6 +22,11 @@ data/.cache/
 *.db-wal
 *.db.bak
 *.bak
+# Timestamped/suffixed manual backups (e.g. lots.db.bak-pre-flatten-2026...).
+# The bare *.bak glob above does not match anything after the ".bak".
+*.bak-*
+*.db.bak-*
+.fuse_hidden*
 *.duckdb
 *.parquet
 
