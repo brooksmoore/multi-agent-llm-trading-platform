@@ -188,3 +188,47 @@ def test_realloc_cadence_helper() -> None:
     last = date(2026, 4, 24)
     weeks_since = (today - last).days / 7.0
     assert weeks_since >= 4.0
+
+
+def test_reallocation_writes_weights_when_due(
+    app: App, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ≥4 weeks have elapsed, a dollar-allocation response is converted to
+    multipliers and persisted; a second call the same day is a no-op."""
+    import agents.manager_bridge as bridge
+
+    weights_file = tmp_path / "sleeve_weights.json"
+    monkeypatch.setattr(bridge, "SLEEVE_WEIGHTS_FILE", weights_file)
+
+    # Manager returns a dollar-allocation shape: haiku +10%, sonnet -10%.
+    monkeypatch.setattr(
+        app.manager,
+        "capital_reallocation",
+        lambda state, ctx=None: {
+            "current_allocation": {"haiku": 1000, "sonnet": 1000, "opus": 1000},
+            "new_allocation": {"haiku": 1100, "sonnet": 900, "opus": 1000},
+        },
+    )
+
+    state = app.build_agent_state(agent_id=AgentId.MANAGER)
+    ctx = app._build_manager_ctx(state)
+    mem = app._memories[AgentId.MANAGER]
+    assert not mem.recall("last_capital_reallocation")  # never run → due
+
+    app._run_capital_reallocation_if_due(state, ctx, mem)
+
+    written = bridge.read_sleeve_weights()
+    assert written[AgentId.HAIKU] == Decimal("1.1")
+    assert written[AgentId.SONNET] == Decimal("0.9")
+    assert mem.recall("last_capital_reallocation")  # stamped
+
+    # Second call same day → not due → file unchanged.
+    called = {"n": 0}
+
+    def _spy(state, ctx=None):  # noqa: ANN001, ANN202, ARG001
+        called["n"] += 1
+        return {}
+
+    monkeypatch.setattr(app.manager, "capital_reallocation", _spy)
+    app._run_capital_reallocation_if_due(state, ctx, mem)
+    assert called["n"] == 0  # skipped without invoking the LLM

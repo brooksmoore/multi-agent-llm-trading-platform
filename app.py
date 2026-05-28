@@ -141,6 +141,10 @@ JOB_OPUS_THURSDAY_DEEPDIVE   = "opus_thursday_deepdive"   # Thu 16:30 ET
 # are below TARGET_HOLDINGS. Single weekly call at Opus pricing stays
 # inside the $0.10/day cap.
 JOB_OPUS_MONDAY_INIT         = "opus_monday_init"         # Mon 09:35 ET
+# Path A (2026-05-28): accelerate Opus capital deployment. Self-guarded —
+# only dispatches while open holdings < TARGET_HOLDINGS, then self-disables.
+# Fixes ~30% of NAV sitting idle in the Opus sleeve, which lags SPY on up days.
+JOB_OPUS_DAILY_INIT          = "opus_daily_init"          # Mon-Fri 10:00 ET (until built)
 # M1: Manager owns a SPY reserve position so the unallocated capital earns
 # market beta instead of structurally underperforming the benchmark. The
 # job is idempotent — checks the lot ledger first and only buys if MANAGER
@@ -162,12 +166,23 @@ JOB_MANAGER_SUNDAY_CRITIQUE  = "manager_sunday_critique"  # Sun 18:00 ET (T2.4)
 ALL_JOB_IDS: frozenset[str] = frozenset({
     JOB_HAIKU_NEWS_SCAN, JOB_HAIKU_CLOSE,
     JOB_SONNET_EOD, JOB_OPUS_THURSDAY_DEEPDIVE, JOB_OPUS_MONDAY_INIT,
+    JOB_OPUS_DAILY_INIT,
     JOB_MANAGER_RESERVE_CHECK,
     JOB_MANAGER_FRIDAY, JOB_HAIKU_MORNING_SYNTHESIS, JOB_HAIKU_CRYPTO,
     JOB_BUDGET_RESET, JOB_NEWS_FETCH, JOB_NEWS_NIGHTLY,
     JOB_PORTFOLIO_SNAPSHOT, JOB_PORTFOLIO_SNAPSHOT_WEEKEND,
     JOB_AGENT_PNL_SNAPSHOT, JOB_MANAGER_SUNDAY_CRITIQUE,
 })
+
+
+# Calendar-day window of daily bars loaded into every AgentState. Sized by the
+# longest-lookback consumer: Sonnet's 12-1 momentum needs 252 + 21 ≈ 273 daily
+# bars, which is ~397 calendar days once weekends/holidays are removed. Do NOT
+# shrink this below ~400 without re-checking each agent's signal — Haiku's
+# 210-day SMA and Sonnet's momentum both silently return None on short history,
+# which looks like "agent went quiet" rather than an error. The upstream bar
+# cache already serves this cheaply, so the window is not a live-cost concern.
+_AGENT_STATE_LOOKBACK_DAYS = 400
 
 
 # ─── App ──────────────────────────────────────────────────────────────────────
@@ -376,7 +391,16 @@ class App:
         self.alerts = AlertManager(self.bus, settings.ntfy_topic, telegram=self.telegram)
 
         # Scheduler (NYSE timezone for cron triggers)
-        self.scheduler = BackgroundScheduler(timezone=ET)
+        # job_defaults: coalesce collapses a backlog of missed fires into one
+        # (we never want to replay 5 stale crypto ticks after a hang); the
+        # misfire_grace_time lets a job delayed by a busy worker pool still run
+        # within 5 min instead of being dropped silently. max_instances stays 1
+        # (the default) — with the LLM request timeout now bounding observe(),
+        # a single instance can no longer wedge the slot for over an hour.
+        self.scheduler = BackgroundScheduler(
+            timezone=ET,
+            job_defaults={"coalesce": True, "misfire_grace_time": 300},
+        )
 
         # Background thread state
         self._volatility_thread: threading.Thread | None = None
@@ -436,6 +460,20 @@ class App:
         self._register_jobs()
         if not self.scheduler.running:
             self.scheduler.start()
+
+        # One-shot catch-up: the weekly Friday cron misses entirely whenever
+        # the process is down at 17:00 ET (the common case under frequent
+        # restarts), so fire an overdue reallocation a short delay after boot.
+        # Off the critical path; a no-op unless ≥4 weeks have elapsed.
+        self.scheduler.add_job(
+            self._catch_up_reallocation,
+            "date",
+            run_date=datetime.now(UTC) + timedelta(seconds=45),
+            id="reallocation_catch_up",
+            misfire_grace_time=300,
+            coalesce=True,
+            replace_existing=True,
+        )
 
         # 4. Optional: dashboard thread
         if self._run_dashboard:
@@ -584,7 +622,9 @@ class App:
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="agent-state") as pool:
             bars_fut = pool.submit(
                 self.market_data.get_bars_batch,
-                list(symbols), ts - timedelta(days=400), ts,
+                list(symbols),
+                ts - timedelta(days=_AGENT_STATE_LOOKBACK_DAYS),
+                ts,
             )
             positions_fut = pool.submit(self.broker.list_positions)
             account_fut = pool.submit(self.broker.get_account)
@@ -1127,6 +1167,13 @@ class App:
             CronTrigger(day_of_week="mon", hour=9, minute=35, timezone=et),
             id=JOB_OPUS_MONDAY_INIT, replace_existing=True,
         )
+        # Path A: daily book-building until the Opus sleeve is fully invested.
+        # Self-guarded inside the job — no-ops once holdings reach target.
+        sched.add_job(
+            self._job_opus_daily_init,
+            weekday(10, 0),
+            id=JOB_OPUS_DAILY_INIT, replace_existing=True,
+        )
         sched.add_job(
             self._job_manager_reserve_check,
             CronTrigger(day_of_week="mon", hour=9, minute=40, timezone=et),
@@ -1247,6 +1294,34 @@ class App:
         dispatch_observation prevents wasted calls once Opus is fully built
         and signals haven't moved.
         """
+        self.dispatch_observation(self.opus)
+
+    def _job_opus_daily_init(self) -> None:
+        """Daily (Mon-Fri) book-building cycle, ACTIVE ONLY while the Opus
+        sleeve is under-invested (open holdings < TARGET_HOLDINGS).
+
+        Opus's normal cadence is twice-weekly (Mon init + Thu deep-dive). At
+        ≤2 starter intents per cycle that deploys its ~$30k sleeve over ~3-4
+        weeks, leaving ~30% of NAV sitting in cash — a structural drag against
+        SPY on up days. This job accelerates *initial* deployment to a few
+        days, then self-disables the moment the book reaches target. It does
+        NOT make Opus a daily trader: once in management mode the signal
+        fingerprint dedupes unchanged ticks, and this guard stops dispatching
+        entirely. Remove this job to revert to pure twice-weekly Opus.
+        """
+        from agents.opus_agent import TARGET_HOLDINGS  # noqa: PLC0415
+        held = self.lots.open_qty_by_symbol(AgentId.OPUS)
+        n_held = sum(1 for q in held.values() if q > 0)
+        if n_held >= TARGET_HOLDINGS:
+            log.info(
+                "opus_daily_init: skip — book built (%d/%d holdings)",
+                n_held, TARGET_HOLDINGS,
+            )
+            return
+        log.info(
+            "opus_daily_init: under-invested (%d/%d holdings) — dispatching "
+            "book-building cycle", n_held, TARGET_HOLDINGS,
+        )
         self.dispatch_observation(self.opus)
 
     def _opus_deep_dive_rotation(self, *, slot: int) -> None:
@@ -1600,11 +1675,23 @@ class App:
             if gated_strategic_call_ran:
                 self._last_manager_fingerprint = mgr_fp
 
-        # Capital reallocation: every 4 weeks since the last successful run.
-        # Previously gated on `iso_week % 4 == 0`, which depends on calendar
-        # alignment — under a 5-week bot lifetime the function had not fired
-        # once. Tracking the actual elapsed weeks via a memory key guarantees
-        # one run per ~4-week window from any start date.
+        # Capital reallocation runs on its own 4-week elapsed-time cadence,
+        # independent of the regime/journal fingerprint gate above. Extracted
+        # so the startup catch-up can fire it too (see _catch_up_reallocation).
+        self._run_capital_reallocation_if_due(state, ctx, manager_mem)
+
+    def _run_capital_reallocation_if_due(
+        self, state: AgentState, ctx: object, manager_mem: Any
+    ) -> None:
+        """Run the Manager's capital reallocation iff ≥4 weeks since the last.
+
+        Cadence is tracked by the `last_capital_reallocation` memory key rather
+        than calendar alignment, so it fires once per ~4-week window from any
+        start date. This must NOT depend on the process being alive at the
+        Friday-17:00 cron instant: with frequent external restarts the bot is
+        almost never up at that exact minute, which is why the reallocation had
+        never run. The startup catch-up calls this directly.
+        """
         today = state.timestamp.date()
         last_realloc_raw = manager_mem.recall("last_capital_reallocation") or ""
         try:
@@ -1616,26 +1703,79 @@ class App:
             if last_realloc_date is not None
             else float("inf")
         )
-        if weeks_since >= 4.0:
+        if weeks_since < 4.0:
             log.info(
-                "manager.capital_reallocation: firing (weeks_since_last=%.1f, "
-                "last=%s)", weeks_since, last_realloc_date,
+                "manager.capital_reallocation: skipping (only %.1f weeks since "
+                "last run; need 4.0)", weeks_since,
             )
-            try:
-                realloc = self.manager.capital_reallocation(state, ctx=ctx)
-            except Exception:
-                log.exception("manager.capital_reallocation failed")
-                realloc = {}
-            # Persist the new sleeve weights so sizing.effective_max_gross
-            # picks them up on the next dispatch. Manager returns a dict like
-            # {"sleeve_weights": {"haiku": 1.10, "sonnet": 0.90, ...}} or a
-            # flat {"haiku": 1.10, ...}; accept both shapes.
+            return
+
+        log.info(
+            "manager.capital_reallocation: firing (weeks_since_last=%.1f, "
+            "last=%s)", weeks_since, last_realloc_date,
+        )
+        try:
+            realloc = self.manager.capital_reallocation(state, ctx=ctx)
+        except Exception:
+            log.exception("manager.capital_reallocation failed")
+            realloc = {}
+        # Persist the new sleeve weights so sizing.effective_max_gross
+        # picks them up on the next dispatch.
+        #
+        # The manager prompt (reallocation.json) emits DOLLAR allocations,
+        # not multipliers:
+        #   {"current_allocation": {"haiku": 1000, ...},
+        #    "new_allocation":     {"haiku":  950, "sonnet": 1100, ...}, ...}
+        # sizing.effective_max_gross expects MULTIPLIERS (1.0 = base). So we
+        # derive multiplier = new_allocation / current_allocation per sleeve.
+        # We still accept the legacy shapes (`sleeve_weights` map, or a flat
+        # {sleeve: multiplier} dict) for backward-compat.
+        log.info(
+            "manager.capital_reallocation: raw response keys=%s",
+            sorted(realloc.keys()) if isinstance(realloc, dict) else type(realloc),
+        )
+        new_alloc = realloc.get("new_allocation") if isinstance(realloc, dict) else None
+        cur_alloc = realloc.get("current_allocation") if isinstance(realloc, dict) else None
+        mapped: dict[AgentId, Decimal] = {}
+        if isinstance(new_alloc, dict) and new_alloc:
+            # Dollar-allocation shape: convert to multipliers.
+            for k, v in new_alloc.items():
+                try:
+                    aid = AgentId(str(k).lower())
+                except (ValueError, TypeError):
+                    continue
+                try:
+                    new_d = Decimal(str(v))
+                except Exception:
+                    continue
+                base = None
+                if isinstance(cur_alloc, dict) and k in cur_alloc:
+                    try:
+                        base = Decimal(str(cur_alloc[k]))
+                    except Exception:
+                        base = None
+                if base and base > 0:
+                    mult = new_d / base
+                else:
+                    # No baseline → treat the allocation as already-normalised
+                    # weights and rebase to a 1.0 mean across sleeves below.
+                    mult = new_d
+                mapped[aid] = mult
+            # If we had no per-sleeve baseline, rebase so the mean multiplier
+            # is 1.0 (preserves relative tilts without inflating gross).
+            if not (isinstance(cur_alloc, dict) and cur_alloc):
+                vals = list(mapped.values())
+                mean = sum(vals) / Decimal(len(vals)) if vals else Decimal(0)
+                if mean > 0:
+                    mapped = {a: (m / mean) for a, m in mapped.items()}
+        else:
+            # Legacy shapes: {"sleeve_weights": {...}} or flat {sleeve: mult}.
             weights_raw = (
                 realloc.get("sleeve_weights")
-                if isinstance(realloc.get("sleeve_weights"), dict)
+                if isinstance(realloc, dict)
+                and isinstance(realloc.get("sleeve_weights"), dict)
                 else realloc
             )
-            mapped: dict[AgentId, Decimal] = {}
             for k, v in (weights_raw or {}).items():
                 try:
                     aid = AgentId(str(k).lower())
@@ -1645,17 +1785,38 @@ class App:
                     mapped[aid] = Decimal(str(v))
                 except Exception:
                     continue
-            if mapped:
-                write_sleeve_weights(mapped)
-                log.info("manager.capital_reallocation: persisted sleeve weights %s", mapped)
-            # Stamp the run regardless of whether weights changed, so a "hold
-            # everything" decision still satisfies the 4-week cadence.
-            manager_mem.remember("last_capital_reallocation", today.isoformat())
+        # Clamp to the ±25% per-4-week step the prompt promises (defence in
+        # depth — Python enforces, the LLM should already respect it).
+        lo, hi = Decimal("0.75"), Decimal("1.25")
+        mapped = {a: max(lo, min(hi, m)) for a, m in mapped.items()}
+        if mapped:
+            write_sleeve_weights(mapped)
+            log.info("manager.capital_reallocation: persisted sleeve weights %s", mapped)
         else:
-            log.info(
-                "manager.capital_reallocation: skipping (only %.1f weeks since "
-                "last run; need 4.0)", weeks_since,
+            log.warning(
+                "manager.capital_reallocation: produced NO usable weights "
+                "(new_allocation=%s current_allocation=%s) — sleeves stay at base 1.0x",
+                new_alloc, cur_alloc,
             )
+        # Stamp the run regardless of whether weights changed, so a "hold
+        # everything" decision still satisfies the 4-week cadence.
+        manager_mem.remember("last_capital_reallocation", today.isoformat())
+
+    def _catch_up_reallocation(self) -> None:
+        """One-shot post-boot catch-up for an overdue capital reallocation.
+
+        The Friday-17:00 cron only fires if the process is alive at that exact
+        minute. Frequent external restarts mean it almost never is, so without
+        this the 4-week reallocation never runs. Scheduled a short delay after
+        boot (off the start() critical path) and a no-op when not yet due.
+        """
+        try:
+            state = self.build_agent_state(agent_id=AgentId.MANAGER)
+            ctx = self._build_manager_ctx(state)
+            manager_mem = self._memories[AgentId.MANAGER]
+            self._run_capital_reallocation_if_due(state, ctx, manager_mem)
+        except Exception:
+            log.exception("manager.capital_reallocation: startup catch-up failed")
 
     def _job_manager_sunday_critique(self) -> None:
         """Weekly Sunday 18:00 ET adversarial critique (T2.4 / Plan 2c).
@@ -2240,7 +2401,13 @@ def main() -> int:
             time.sleep(1.0)
     finally:
         app.stop()
-    return 0
+        # Python's concurrent.futures atexit handler joins every ThreadPoolExecutor
+        # thread with no timeout.  If an LLM job was in-flight at SIGINT time
+        # (Anthropic SDK default timeout = 600 s) the interpreter would wait up
+        # to 10 minutes before exiting.  All meaningful cleanup (memory flush,
+        # DB close, shutdown summary) has already been done in app.stop() above,
+        # so we can hard-exit here and skip the thread-wait entirely.
+        os._exit(0)
 
 
 if __name__ == "__main__":
