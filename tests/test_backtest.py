@@ -181,3 +181,17 @@ def test_walk_forward_uses_distinct_date_windows() -> None:
     for r in results:
         assert r.n_rebalances >= 1
         assert len(r.dates) > 20  # non-trivial window
+
+
+# ── Fail-before for Fix 2 (Auditor handoff): eliminate _SONNET_TRADABLE duplication ──
+# Must be committed RED first. The baseline must share the *exact same frozenset object*
+# (identity) as the live agent.
+
+
+def test_sonnet_baseline_imports_tradable_from_live_agent() -> None:
+    """Baseline must share the exact same frozenset object as the live agent — not a copy."""
+    from agents.sonnet_agent import _SONNET_TRADABLE as live_tradable
+    from backtest.strategies import _SONNET_TRADABLE as baseline_tradable  # currently a copy
+    assert live_tradable is baseline_tradable, (
+        "baseline _SONNET_TRADABLE must be the live agent's frozenset, not a re-derived copy"
+    )
