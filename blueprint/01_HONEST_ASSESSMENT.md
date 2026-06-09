@@ -90,6 +90,53 @@ The single most important thing I want you to walk away from this assessment wit
 
 ---
 
+## 2026-06-09 — Rules-only baseline backtest results (5-year, walk-forward)
+
+**Run by:** Claude (auditor), standing in for Grok. Data via yfinance, 2021-06-09 → 2026-06-09.
+**Purpose:** stake-in-the-ground numbers for the DoD "beats rules-only baseline" gate; to be compared against live LLM sleeve performance as paper trading accumulates.
+
+### Haiku — Faber GTAA (SMA trend-following, ETF universe)
+
+| Metric | Value |
+|---|---|
+| CAGR | +4.4% |
+| SPY CAGR | +11.8% |
+| **Excess vs SPY** | **−7.4%/yr** |
+| Ann. volatility | 6.8% |
+| Sharpe | 0.69 |
+| Max drawdown | −9.1% |
+
+**Walk-forward (4 windows):** 1 of 4 beat SPY (+5.2%, −24.8%, −16.9%, −20.3%)
+
+**Honest read:** This is a risk-reduction strategy, not a return-maximizer. In a 5-year bull market, going to cash when assets are below their SMA is costly — but the −9% max drawdown vs SPY's worse 2022 drawdown shows the signal doing what it was designed to do. The bar for the Haiku LLM sleeve is: beat this rules baseline, not beat SPY directly.
+
+### Sonnet — Price momentum (top-5 by 12-1 momentum, 74-name universe)
+
+| Metric | Value |
+|---|---|
+| CAGR | +18.8% |
+| SPY CAGR | +11.8% |
+| **Excess vs SPY** | **+7.0%/yr** |
+| Ann. volatility | 14.0% |
+| Sharpe | 1.32 |
+| Max drawdown | −17.4% |
+
+**Walk-forward (4 windows):** 1 of 4 beat SPY (+6.1%, −15.0%, −18.6%, −25.4%)
+
+**Honest read:** The full-period win is real but period-dependent. It was almost entirely driven by the 2021–mid-2022 momentum tailwind (tech mega-caps). Once that reversed, the strategy lagged badly in 3 of 4 subsequent windows. The walk-forward is the more honest picture. The Sonnet LLM sleeve's job is to add judgment on top of this signal — e.g. recognising when the momentum factor is likely to mean-revert and reducing exposure.
+
+### Opus — GARP discretionary
+
+**Not backtestable.** Opus's signal is its fundamental reasoning (EDGAR filings, earnings quality, competitive positioning) — there is no mechanical rule to replay on historical prices. The LLM reasoning *is* the strategy. Live paper trading is the only valid test.
+
+### Implications for honest odds
+
+The 25–35% probability of beating SPY quoted at project start was already conservative. These results suggest the rules-only signals are not reliably positive in the recent 5-year sample, and the walk-forward consistency is poor (1/4 windows for both). The LLM layer needs to add edge on top of marginal baselines AND cover ~$0.50/day API cost.
+
+**Revised framing:** 20–30% probability of beating SPY net of costs over a 12-month live sample. Still worth building — the downside is a research dashboard and personal data asset, not a loss. But the numbers should not be read optimistically.
+
+---
+
 ## 2026-06-07 — Security pass addendum (Anthropic agent-security principles)
 **What (done now):** `.gitignore` hardened (`*.pem`/`*.key`/`*.p12` added alongside `.env`; no secret in git history). Added `DEFINITION_OF_DONE.md` with a security section.
 **Assessment vs the four principles:**
