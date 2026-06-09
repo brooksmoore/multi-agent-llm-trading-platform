@@ -346,7 +346,7 @@ class YFinanceMarketData:
             auto_adjust=False,
             group_by="ticker",
             progress=False,
-            threads=True,
+            threads=False,
         )
         if df is None or df.empty:
             return out

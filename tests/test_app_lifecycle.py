@@ -267,4 +267,34 @@ def test_app_constructs_with_empty_credentials(tmp_path: Path, override_field: s
         run_recover_on_start=False,
     )
     assert app.budget is not None
+
+
+def test_reconciler_interval_is_tighter_for_robinhood_broker_kind(tmp_path: Path) -> None:
+    """Robinhood (no push stream) must use a tighter poll interval than the Alpaca default.
+
+    The selection is driven by settings.broker_kind, not the concrete broker instance
+    (tests inject FakeBroker to avoid real deps; the declared kind still governs the
+    safety-net poll rate for the live path).
+    """
+    settings = _make_settings(tmp_path)
+    settings.broker_kind = "robinhood"
+    # Non-live dry-run path does not require a real token, but the field must be
+    # present (the live guard only fires when robinhood_live_enabled=True).
+    settings.robinhood_auth_token = "dummy-for-dry-run"
+    settings.robinhood_live_enabled = False
+    settings.reconciler_interval_robinhood_secs = 17  # non-default to prove selection
+
+    bars = {"SPY": [_make_bar("SPY", datetime(2026, 4, 25, 10, 0, tzinfo=UTC))]}
+    app = App(
+        settings,
+        broker=FakeBroker(),
+        market_data=StubMarketData(bars),
+        universe=["SPY"],
+        run_dashboard=False,
+        run_volatility_scanner=False,
+        run_recover_on_start=False,
+    )
+    # The reconciler was built with the robinhood-specific interval.
+    assert app.reconciler._interval_secs == 17  # noqa: SLF001
+    app.stop()
     app.stop()

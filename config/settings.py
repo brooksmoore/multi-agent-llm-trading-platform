@@ -19,10 +19,24 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # ── Broker selection ───────────────────────────────────────────────────────
+    # "alpaca" (paper, default) or "robinhood" (live agentic MCP). Switching to
+    # robinhood does NOT by itself place live orders — robinhood_live_enabled
+    # gates that separately (defaults False → dry-run).
+    broker_kind: str = "alpaca"
+
     # ── Alpaca (paper) ─────────────────────────────────────────────────────────
     alpaca_api_key: str = ""
     alpaca_secret_key: str = ""
     alpaca_paper: bool = True
+
+    # ── Robinhood (agentic MCP — REAL MONEY) ───────────────────────────────────
+    # robinhood_live_enabled is the live-trading safety gate. False = dry-run:
+    # the adapter logs intended orders and sends nothing. Set True only after the
+    # MCP tool schema is verified and a dry-run→tiny-live test has passed.
+    robinhood_mcp_url: str = "https://agent.robinhood.com/mcp/trading"
+    robinhood_auth_token: str = ""
+    robinhood_live_enabled: bool = False
 
     # ── Market data source ─────────────────────────────────────────────────────
     # "alpaca" requires a paid SIP subscription; "yfinance" is free daily bars.
@@ -59,7 +73,13 @@ class Settings(BaseSettings):
     logs_dir: str = "logs"
 
     # ── Reconciler ─────────────────────────────────────────────────────────────
+    # Alpaca has a push WS stream for fills; reconciler is a safety net (60s ok).
+    # Robinhood has NO push stream — every fill and terminal state waits on the
+    # poll. Tighten aggressively for robinhood (balanced vs rate limits on the
+    # new MCP endpoint). Owner can override via env if the tighter default
+    # triggers limits.
     reconciler_interval_secs: int = 60
+    reconciler_interval_robinhood_secs: int = 20
     reconciler_qty_tolerance: Decimal = Decimal("1")   # shares
 
     # ── Per-agent tracker ──────────────────────────────────────────────────────

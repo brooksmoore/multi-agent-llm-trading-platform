@@ -401,16 +401,22 @@ def test_opus_returns_empty_on_budget_exhausted() -> None:
     mem.close()
 
 
-def test_opus_caps_intents_at_three() -> None:
+def test_opus_initiation_caps_intents_at_remaining_slots() -> None:
+    """H1 (2026-05-28): initiation mode may emit up to remaining open slots
+    (TARGET_HOLDINGS - held) in one cycle so the book deploys in one call
+    instead of spreading across several days. With 0 positions and 5 LLM
+    intents, all 5 should be accepted (= TARGET_HOLDINGS open slots).
+    """
+    from agents.opus_agent import TARGET_HOLDINGS  # noqa: PLC0415
     response = json.dumps({
         "portfolio_observation": "many intents",
         "intents": [
             {
-                "symbol": f"SYM{i}", "action": "buy", "target_weight": 0.10,
+                "symbol": f"SYM{i}", "action": "buy", "target_weight": 0.05,
                 "thesis_id": f"SYM{i}-2026", "trigger": "strong thesis",
                 "conviction": 7, "expected_horizon_days": 60,
             }
-            for i in range(5)
+            for i in range(TARGET_HOLDINGS)
         ],
         "thesis_health_check": [],
         "calibration_note": "",
@@ -419,7 +425,48 @@ def test_opus_caps_intents_at_three() -> None:
     mock_llm.call.return_value = (response, _mock_memo())
     mem = AgentMemory(":memory:", AgentId.OPUS)
     agent = OpusAgent(llm=mock_llm, memory=mem)
+    # _minimal_state() has positions=[] → initiation → cap = TARGET_HOLDINGS
     intents = agent.observe(_minimal_state())
+    assert len(intents) == TARGET_HOLDINGS
+    mem.close()
+
+
+def test_opus_management_caps_intents_at_three() -> None:
+    """Management mode retains the original _MAX_INTENTS=3 cap."""
+    import dataclasses  # noqa: PLC0415
+
+    from agents.opus_agent import TARGET_HOLDINGS  # noqa: PLC0415
+    from core.types import AssetClass  # noqa: PLC0415
+    from execution.broker import BrokerPosition  # noqa: PLC0415
+
+    response = json.dumps({
+        "portfolio_observation": "many intents",
+        "intents": [
+            {
+                "symbol": f"SYM{i}", "action": "buy", "target_weight": 0.10,
+                "thesis_id": f"SYM{i}-2026", "trigger": "strong thesis",
+                "conviction": 8, "expected_horizon_days": 60,
+            }
+            for i in range(6)
+        ],
+        "thesis_health_check": [],
+        "calibration_note": "",
+    })
+    mock_llm = MagicMock(spec=LLMClient)
+    mock_llm.call.return_value = (response, _mock_memo())
+    mem = AgentMemory(":memory:", AgentId.OPUS)
+    agent = OpusAgent(llm=mock_llm, memory=mem)
+    # Build a state with TARGET_HOLDINGS positions → management mode
+    _p = lambda sym: BrokerPosition(  # noqa: E731
+        symbol=sym, qty=Decimal("1"),
+        avg_entry_price=Decimal("100"), current_price=Decimal("105"),
+        asset_class=AssetClass.EQUITY,
+    )
+    full_state = dataclasses.replace(
+        _minimal_state(),
+        positions=[_p(f"HELD{i}") for i in range(TARGET_HOLDINGS)],
+    )
+    intents = agent.observe(full_state)
     assert len(intents) <= 3
     mem.close()
 

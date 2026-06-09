@@ -532,25 +532,6 @@ _HTML = r"""<!doctype html>
     <div id="agents" class="grid agents"></div>
   </div>
 
-  <!-- T1.5: per-sleeve P&L attribution snapshots (daily 16:45 ET) -->
-  <div class="card" style="margin-bottom:14px;">
-    <div style="padding:0 0 8px;" class="label">
-      Per-Sleeve P&amp;L Attribution · last 10 days · realized + unrealized from lot ledger
-    </div>
-    <table class="tbl mono" style="width:100%;">
-      <thead><tr>
-        <th style="text-align:left;">Date</th>
-        <th style="text-align:left;">Agent</th>
-        <th style="text-align:right;">Realized</th>
-        <th style="text-align:right;">Unrealized</th>
-        <th style="text-align:right;">Total</th>
-        <th style="text-align:right;">Open lots</th>
-        <th style="text-align:right;">Closed lots</th>
-      </tr></thead>
-      <tbody id="agent-pnl-body"><tr><td colspan="7" class="dim">no data yet</td></tr></tbody>
-    </table>
-  </div>
-
   <!-- Charts row: NAV vs SPY + sleeve curves -->
   <div class="grid charts" style="margin-bottom:14px;">
     <div class="card chart-card">
@@ -589,8 +570,27 @@ _HTML = r"""<!doctype html>
     </div>
   </div>
 
+  <!-- Per-sleeve P&L attribution (last 10 days) -->
+  <div class="card" style="margin-bottom:14px;">
+    <div style="padding:0 0 8px;" class="label">
+      Per-Sleeve P&amp;L Attribution · last 10 days · realized + unrealized from lot ledger
+    </div>
+    <table class="tbl mono" style="width:100%;">
+      <thead><tr>
+        <th style="text-align:left;">Date</th>
+        <th style="text-align:left;">Agent</th>
+        <th style="text-align:right;">Realized</th>
+        <th style="text-align:right;">Unrealized</th>
+        <th style="text-align:right;">Total</th>
+        <th style="text-align:right;">Open lots</th>
+        <th style="text-align:right;">Closed lots</th>
+      </tr></thead>
+      <tbody id="agent-pnl-body"><tr><td colspan="7" class="dim">no data yet</td></tr></tbody>
+    </table>
+  </div>
+
   <!-- Bottom: positions, calibration, spend -->
-  <div class="grid row3">
+  <div class="grid row3" style="margin-bottom:14px;">
     <div class="card chart-card">
       <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
         <h3 style="margin:0;">Open Positions</h3>
@@ -980,6 +980,42 @@ function escapeHtml(s) {
 }
 
 // ─── Charts ────────────────────────────────────────────────────────────
+function isWeekend(ts) {
+  const day = new Date(ts).getUTCDay();
+  return day === 0 || day === 6;
+}
+
+// Reduce a time-series (array of objects) to one value per trading day.
+// tsFn(item) → ISO timestamp string; valFn(item) → number.
+// Points are assumed to be in ascending time order; last value of each day wins.
+// Weekend dates are dropped.
+function toTradingDays(pts, tsFn, valFn) {
+  const byDate = {};
+  pts.forEach(p => {
+    const ts = tsFn(p);
+    if (isWeekend(ts)) return;
+    byDate[ts.slice(0, 10)] = valFn(p);   // later entries overwrite earlier ones
+  });
+  return byDate;   // { 'YYYY-MM-DD': value }
+}
+
+// Format 'YYYY-MM-DD' → 'M/D' for tick labels
+function fmtDayLabel(d) {
+  const [, m, day] = d.split('-');
+  return `${parseInt(m, 10)}/${parseInt(day, 10)}`;
+}
+
+// Common category-scale x-axis options (no continuous time → no weekend gaps)
+const categoryXAxis = {
+  type: 'category',
+  ticks: {
+    color: '#8891a3', font: { size: 10 },
+    maxTicksLimit: 7,
+    callback: function(value) { return fmtDayLabel(this.getLabelForValue(value)); },
+  },
+  grid: { color: '#1a1e29' },
+};
+
 const chartDefaults = {
   responsive: true, maintainAspectRatio: false,
   plugins: { legend: { labels: { color: '#e6e8ee', font: { size: 11 } } } },
@@ -993,17 +1029,30 @@ let navChart, sleeveChart, calChart, spendChart;
 
 function renderNav(nav, spy) {
   const ctx = document.getElementById('nav-chart').getContext('2d');
+
+  // Reduce to one value per trading day (last intraday snapshot wins; weekends dropped)
+  const navByDate = toTradingDays(nav, p => p.ts, p => p.nav);
+  const spyByDate = toTradingDays(spy, p => p.ts, p => p.value);
+
+  // Sorted union of all trading dates present in either series
+  const labels = [...new Set([...Object.keys(navByDate), ...Object.keys(spyByDate)])].sort();
+
   const data = {
+    labels,
     datasets: [
-      { label: 'NAV', data: nav.map(p => ({ x: p.ts, y: p.nav })), borderColor: '#79c0ff', backgroundColor: '#79c0ff22', borderWidth: 2, pointRadius: 0, tension: 0.2, fill: false },
-      { label: 'SPY (anchored)', data: spy.map(p => ({ x: p.ts, y: p.value })), borderColor: '#8891a3', borderDash: [4, 4], borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false },
+      { label: 'NAV',          data: labels.map(d => navByDate[d] ?? null), borderColor: '#79c0ff', backgroundColor: '#79c0ff22', borderWidth: 2, pointRadius: 0, tension: 0.2, fill: false, spanGaps: true },
+      { label: 'SPY (anchored)', data: labels.map(d => spyByDate[d] ?? null), borderColor: '#8891a3', borderDash: [4, 4], borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false, spanGaps: true },
     ],
   };
-  if (navChart) { navChart.data = data; navChart.update('none'); return; }
-  navChart = new Chart(ctx, {
-    type: 'line', data,
-    options: { ...chartDefaults, plugins: { ...chartDefaults.plugins, tooltip: { callbacks: { title: (items) => fmtTimeET(items[0].parsed.x) } } }, scales: { ...chartDefaults.scales, x: { ...chartDefaults.scales.x, type: 'time', time: { unit: 'day', displayFormats: { day: 'M/d' } } } } },
-  });
+
+  const opts = {
+    ...chartDefaults,
+    plugins: { ...chartDefaults.plugins, tooltip: { callbacks: { title: items => labels[items[0].dataIndex] } } },
+    scales: { ...chartDefaults.scales, x: categoryXAxis },
+  };
+
+  if (navChart) { navChart.data = data; navChart.options = opts; navChart.update('none'); return; }
+  navChart = new Chart(ctx, { type: 'line', data, options: opts });
 }
 
 function computeAlpha(navRet, spyRet) {
@@ -1025,17 +1074,45 @@ function computeAlpha(navRet, spyRet) {
 
 function renderSleeves(byAgent) {
   const ctx = document.getElementById('sleeve-chart').getContext('2d');
-  const colors = { haiku: '#79c0ff', sonnet: '#d2a8ff', opus: '#ffa657', manager: '#7ee787' };
-  const datasets = Object.entries(byAgent).map(([agent, pts]) => ({
-    label: agent, data: pts.map(p => ({ x: p.ts, y: p.equity })),
-    borderColor: colors[agent] || '#e6e8ee', borderWidth: 1.6, pointRadius: 0, tension: 0.2, fill: false,
+  const colors = { haiku: '#79c0ff', sonnet: '#d2a8ff', opus: '#ffa657' };
+
+  // Last 30 calendar days, one value per trading day, no weekends, no manager
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 30);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+  const agentByDate = {};
+  const allDatesSet = new Set();
+  Object.entries(byAgent)
+    .filter(([agent]) => agent !== 'manager')
+    .forEach(([agent, pts]) => {
+      const byDate = toTradingDays(
+        pts.filter(p => p.ts.slice(0, 10) >= cutoffStr),
+        p => p.ts, p => p.equity,
+      );
+      agentByDate[agent] = byDate;
+      Object.keys(byDate).forEach(d => allDatesSet.add(d));
+    });
+
+  const labels = [...allDatesSet].sort();
+
+  const datasets = Object.entries(agentByDate).map(([agent, byDate]) => ({
+    label: agent,
+    data: labels.map(d => byDate[d] ?? null),
+    borderColor: colors[agent] || '#e6e8ee',
+    borderWidth: 1.6, pointRadius: 0, tension: 0.2, fill: false, spanGaps: true,
   }));
-  const data = { datasets };
-  if (sleeveChart) { sleeveChart.data = data; sleeveChart.update('none'); return; }
-  sleeveChart = new Chart(ctx, {
-    type: 'line', data,
-    options: { ...chartDefaults, plugins: { ...chartDefaults.plugins, tooltip: { callbacks: { title: (items) => fmtTimeET(items[0].parsed.x) } } }, scales: { ...chartDefaults.scales, x: { ...chartDefaults.scales.x, type: 'time', time: { unit: 'hour', displayFormats: { hour: 'HH:mm', day: 'M/d' } } } } },
-  });
+
+  const data = { labels, datasets };
+
+  const opts = {
+    ...chartDefaults,
+    plugins: { ...chartDefaults.plugins, tooltip: { callbacks: { title: items => labels[items[0].dataIndex] } } },
+    scales: { ...chartDefaults.scales, x: categoryXAxis },
+  };
+
+  if (sleeveChart) { sleeveChart.data = data; sleeveChart.options = opts; sleeveChart.update('none'); return; }
+  sleeveChart = new Chart(ctx, { type: 'line', data, options: opts });
 }
 
 function renderCal(points) {
@@ -1087,7 +1164,7 @@ function refresh() {
   fetchAgentPnl();
 }
 refresh();
-setInterval(refresh, 15000);
+setInterval(refresh, 60000);
 </script>
 </body>
 </html>

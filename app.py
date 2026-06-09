@@ -8,9 +8,9 @@ Architecture:
     │              BudgetLedger, BudgetWatcher, LotLedger, WashSaleChecker,
     │              MarketData, Broker, four LLMClients, four AgentMemory dbs,
     │              HaikuAgent, SonnetAgent, OpusAgent, ManagerAgent
-    ├── threads:    Reconciler (60s), HeartbeatWriter (30s),
-    │               VolatilityScanner (60s during market hours), dashboard,
-    │               BudgetWatcher (30s)
+    ├── threads:    Reconciler (per-broker interval; 60s Alpaca / 20s Robinhood),
+    │               HeartbeatWriter (30s), VolatilityScanner (300s during market hours),
+    │               dashboard, BudgetWatcher (30s)
     └── scheduler:  BackgroundScheduler with all blueprint §2 cron jobs
 
 Lifecycle:
@@ -20,7 +20,7 @@ Lifecycle:
 Crash recovery:
     OMS.recover() replays the append-only event log on every startup, so
     SIGKILL is safe — no state is lost beyond the in-flight broker call,
-    which the reconciler closes on the next 60s tick.
+    which the reconciler closes on the next poll tick (broker-specific interval).
 """
 
 from __future__ import annotations
@@ -250,7 +250,7 @@ class App:
         self.budget = BudgetLedger(self._budget_path, daily_limit=settings.daily_spend_cap)
         self.budget_watcher = BudgetWatcher(self.budget, self.kill, bus=self.bus)
 
-        self.broker: Broker = broker if broker is not None else self._build_alpaca_broker()
+        self.broker: Broker = broker if broker is not None else self._build_broker()
         self.market_data: MarketData = (
             market_data if market_data is not None else self._build_market_data()
         )
@@ -284,11 +284,20 @@ class App:
         self._last_manager_fingerprint: str | None = None
         self.bus.subscribe("fill.received", self._on_fill_received)
 
+        # Reconciler interval is chosen per broker_kind. Robinhood has no push
+        # stream, so every fill awareness depends on this poll; default 20s.
+        # Alpaca uses its WS stream as primary and 60s as safety net.
+        kind = (settings.broker_kind or "alpaca").lower()
+        rec_interval = (
+            settings.reconciler_interval_robinhood_secs
+            if kind == "robinhood"
+            else settings.reconciler_interval_secs
+        )
         self.reconciler = Reconciler(
             self.oms,
             self.broker,
             self.kill,
-            interval_secs=settings.reconciler_interval_secs,
+            interval_secs=rec_interval,
             qty_tolerance=settings.reconciler_qty_tolerance,
             bus=self.bus,
         )
@@ -304,6 +313,13 @@ class App:
         self._llm_manager_lite = LLMClient(
             self.budget, model=SONNET_MODEL, api_key=api_key,
         )
+        # H2 (2026-05-28): Sonnet-bound client for Opus initiation book-building.
+        # Initiation = "pick top-conviction names to get invested" — structured
+        # enough for Sonnet. Opus model reserved for management-mode thesis review
+        # and weekly deep-dives where the reasoning premium is earned.
+        self._llm_opus_lite = LLMClient(
+            self.budget, model=SONNET_MODEL, api_key=api_key,
+        )
 
         # Agent memories (one SQLite db each)
         self._memories = {
@@ -315,7 +331,11 @@ class App:
 
         self.haiku = HaikuAgent(self._llm_haiku, self._memories[AgentId.HAIKU])
         self.sonnet = SonnetAgent(self._llm_sonnet, self._memories[AgentId.SONNET])
-        self.opus = OpusAgent(self._llm_opus, self._memories[AgentId.OPUS])
+        self.opus = OpusAgent(
+            self._llm_opus,
+            self._memories[AgentId.OPUS],
+            llm_lite=self._llm_opus_lite,
+        )
         self.manager = ManagerAgent(
             self._llm_manager,
             self._memories[AgentId.MANAGER],
@@ -333,6 +353,7 @@ class App:
         self.calibration = CalibrationTracker(str(data_dir / "calibration.db"))
         self.calibration_recorder = CalibrationRecorder(
             self.calibration, self.lots, self.store, self.bus,
+            memories=self._memories,
         )
 
         # Manager drawdown responder: when AgentStateTracker fires a
@@ -2091,7 +2112,7 @@ class App:
                     self._scan_volatility_once(self.clock.now().date())
             except Exception:
                 log.exception("volatility scanner: tick failed")
-            self._volatility_stop.wait(60.0)
+            self._volatility_stop.wait(300.0)
 
     def _scan_volatility_once(self, today: date) -> None:
         """Fire on macro event today OR publish PositionIntradayShockEvent on
@@ -2246,6 +2267,39 @@ class App:
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
+    def _build_broker(self) -> Broker:
+        """Select the broker adapter from settings.broker_kind (default: alpaca)."""
+        kind = (self.settings.broker_kind or "alpaca").lower()
+        if kind == "robinhood":
+            return self._build_robinhood_broker()
+        if kind == "alpaca":
+            return self._build_alpaca_broker()
+        raise RuntimeError(f"Unknown broker_kind={kind!r} (expected 'alpaca' or 'robinhood')")
+
+    def _build_robinhood_broker(self) -> Broker:
+        """Construct RobinhoodBroker (agentic MCP).
+
+        live_trading_enabled defaults False → dry-run (logs intended orders, sends
+        nothing). Real-money guard: refuse to arm live without an auth token.
+        """
+        from execution.robinhood_broker import RobinhoodBroker  # noqa: PLC0415
+        live = bool(self.settings.robinhood_live_enabled)
+        if live and not self.settings.robinhood_auth_token:
+            raise RuntimeError(
+                "robinhood_live_enabled=True but robinhood_auth_token is empty "
+                "(real-money guard)"
+            )
+        if live:
+            log.warning(
+                "RobinhoodBroker armed for LIVE trading — real money. Ensure the MCP "
+                "tool schema has been verified against list_tools() first."
+            )
+        return RobinhoodBroker(
+            auth_token=self.settings.robinhood_auth_token,
+            mcp_url=self.settings.robinhood_mcp_url,
+            live_trading_enabled=live,
+        )
+
     def _build_alpaca_broker(self) -> Broker:
         """Construct AlpacaBroker (paper). Imported lazily so tests don't need alpaca-py."""
         if not self.settings.alpaca_paper:
@@ -2329,6 +2383,41 @@ class App:
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
 
 
+class _RateLimitFilter(logging.Filter):
+    """Collapse repeated identical log records to one per interval.
+
+    The Alpaca trading websocket logs a full ERROR + traceback on every
+    reconnect attempt; during a DNS/network drop that is thousands of identical
+    records per minute, which shreds log rotation and destroys observability.
+    This filter lets the FIRST occurrence through (so a real outage is visible),
+    suppresses repeats within `min_interval_s`, and annotates the next emitted
+    copy with how many were suppressed. Keyed by logger name + message prefix,
+    so distinct errors are tracked independently.
+    """
+
+    def __init__(self, min_interval_s: float = 60.0) -> None:
+        super().__init__()
+        self._min = min_interval_s
+        self._last: dict[str, float] = {}
+        self._suppressed: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        key = f"{record.name}:{str(record.msg)[:80]}"
+        now = time.monotonic()
+        with self._lock:
+            last = self._last.get(key)
+            if last is None or (now - last) >= self._min:
+                n = self._suppressed.pop(key, 0)
+                if n:
+                    record.msg = f"{record.msg} [+{n} identical suppressed in last {self._min:.0f}s]"
+                    record.args = ()
+                self._last[key] = now
+                return True
+            self._suppressed[key] = self._suppressed.get(key, 0) + 1
+            return False
+
+
 def _setup_logging(level: str) -> None:
     from logging.handlers import RotatingFileHandler
     from pathlib import Path
@@ -2365,6 +2454,16 @@ def _setup_logging(level: str) -> None:
     # still surface at WARNING+.
     for noisy in ("werkzeug", "apscheduler", "alpaca", "alpaca.trading.stream", "httpx"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # Rate-limit the Alpaca websocket reconnect storm: it logs an ERROR +
+    # traceback on every retry during a network drop (thousands/min), which was
+    # rotating 10 MB of logs every ~minute and destroying observability. One
+    # record per minute per distinct message keeps the signal, kills the flood.
+    # Attached to the stream logger (ERROR-level, so the WARNING cap above does
+    # not catch it) and the parent alpaca logger for good measure.
+    _ratelimit = _RateLimitFilter(min_interval_s=60.0)
+    for noisy in ("alpaca.trading.stream", "alpaca"):
+        logging.getLogger(noisy).addFilter(_ratelimit)
 
 
 def main() -> int:

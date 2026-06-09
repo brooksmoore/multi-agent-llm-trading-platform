@@ -138,6 +138,15 @@ class AgentMemory:
             )
             self._conn.commit()
 
+    def conviction_by_intent_id(self, intent_id: str) -> int | None:
+        """Return the conviction recorded for this intent_id, or None if not found."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT conviction FROM intent_log WHERE intent_id = ?",
+                (intent_id,),
+            ).fetchone()
+        return int(row["conviction"]) if row is not None else None
+
     def record_outcome(self, intent_id: IntentId, outcome: str) -> None:
         """Set the realized outcome for a previously recorded intent."""
         with self._lock:

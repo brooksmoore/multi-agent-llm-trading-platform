@@ -87,3 +87,14 @@ The single most important thing I want you to walk away from this assessment wit
 ---
 
 *End of assessment. Open questions for sign-off are in §13 of `00_BLUEPRINT.md`.*
+
+---
+
+## 2026-06-07 — Security pass addendum (Anthropic agent-security principles)
+**What (done now):** `.gitignore` hardened (`*.pem`/`*.key`/`*.p12` added alongside `.env`; no secret in git history). Added `DEFINITION_OF_DONE.md` with a security section.
+**Assessment vs the four principles:**
+- *Least agency:* ALREADY the system's core strength — LLMs propose weights only, Python computes every dollar, RiskGate is un-bypassable, no cross-agent visibility (cartel guard). This is exactly what the principle asks for.
+- *Static keys = compromised:* mitigate via Alpaca PAPER keys until graduation (a leaked paper key moves no real money); at graduation, broker key scoped to trading only, no funding/withdrawal.
+- *Sandbox untrusted input:* GAP — four LLM agents ingest EDGAR/Finnhub/RSS text with no prompt-injection defense yet. Needs a `GROK_HANDOFF_SECURITY_INJECTION.md` modeled on hood_agent_1's (delimit + label untrusted source text, fail-safe schema validation) before live.
+- *Dynamic per-task scope:* order-capable keys present only during live sessions.
+**Status:** secrets ✅; untrusted-input hardening 🔴 OPEN (write the injection handoff for data/news.py + EDGAR adapter before any real capital). Tracked in DEFINITION_OF_DONE.md.

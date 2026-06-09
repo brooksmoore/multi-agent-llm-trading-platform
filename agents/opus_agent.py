@@ -28,6 +28,11 @@ TARGET_HOLDINGS: int = 5
 # conviction sizing comes after the deep-dive earns it.
 _INITIATION_MAX_TARGET_WEIGHT: Decimal = Decimal("0.05")
 
+# H1 (2026-05-28): allow a single initiation cycle to propose as many starters
+# as needed to fill the book in one shot (up to remaining slots). Replaces the
+# hard ≤2 cap that forced ~3-4 daily Opus calls to reach TARGET_HOLDINGS.
+_INITIATION_MAX_STARTERS: int = TARGET_HOLDINGS
+
 # Persisted in opus memory under this key — comma-separated, max ~20 names.
 _WATCHLIST_KEY: str = "opus:watchlist"
 _WATCHLIST_MAX: int = 20
@@ -45,9 +50,19 @@ _ACTION_MAP: dict[str, str | None] = {
 
 
 class OpusAgent(BaseAgent):
-    def __init__(self, llm: LLMClient, memory: AgentMemory) -> None:
+    def __init__(
+        self,
+        llm: LLMClient,
+        memory: AgentMemory,
+        llm_lite: LLMClient | None = None,
+    ) -> None:
         super().__init__(AgentId.OPUS)
         self._llm = llm
+        # H2 (2026-05-28): cheaper model (Sonnet) for initiation book-building;
+        # Opus reserved for management-mode daily_check and deep-dives where the
+        # reasoning premium is earned. Defaults to self._llm if not wired so
+        # existing callers and tests that omit llm_lite continue working.
+        self._llm_lite = llm_lite if llm_lite is not None else llm
         self._memory = memory
         self._prompt = _PROMPT_PATH.read_text()
 
@@ -65,12 +80,18 @@ class OpusAgent(BaseAgent):
         mode = "initiation" if len(state.positions) < TARGET_HOLDINGS else "management"
         context = self._format_daily_context(state, mode=mode)
 
+        # H2: initiation uses the lite (Sonnet) client — structured book-building
+        # doesn't warrant Opus pricing. Management-mode thesis review and deep-dives
+        # stay on the premium model where the reasoning edge matters.
+        client = self._llm_lite if mode == "initiation" else self._llm
+        call_type = "daily_check_lite" if mode == "initiation" else "daily_check"
+
         try:
-            response_text, _ = self._llm.call(
+            response_text, _ = client.call(
                 system=render_system_prompt(self._prompt, state),
                 user=context,
                 agent_id=AgentId.OPUS,
-                call_type="daily_check",
+                call_type=call_type,
                 max_tokens=2048,
             )
         except Exception:
@@ -243,12 +264,15 @@ class OpusAgent(BaseAgent):
         recent = self._memory.recent_intents_summary(3)
 
         if mode == "initiation":
+            remaining = max(1, TARGET_HOLDINGS - len(state.positions))
             question = (
                 "Today's question (INITIATION MODE): your sleeve has fewer than "
-                f"{TARGET_HOLDINGS} holdings. Either propose ≤2 starter intents "
-                f"(target_weight ≤ {float(_INITIATION_MAX_TARGET_WEIGHT):.2f}, "
-                "conviction ≥ 7), or use watchlist_add to queue candidates for "
-                "this week's deep-dives — or both. Return JSON only."
+                f"{TARGET_HOLDINGS} holdings ({remaining} slot(s) open). Propose "
+                f"up to {remaining} starter intent(s) — one per open slot — to "
+                f"fill the book in this cycle "
+                f"(target_weight ≤ {float(_INITIATION_MAX_TARGET_WEIGHT):.2f} each, "
+                "conviction ≥ 7). Also use watchlist_add for any additional "
+                "candidates. Return JSON only."
             )
         else:
             question = (
@@ -289,7 +313,15 @@ class OpusAgent(BaseAgent):
         obs = str(data.get("portfolio_observation", ""))
         intents: list[Intent] = []
 
-        for item in data.get("intents", [])[: _MAX_INTENTS]:
+        # H1: in initiation mode allow up to `remaining` starters (fill the book
+        # in one cycle); in management mode the original _MAX_INTENTS cap applies.
+        if mode == "initiation":
+            remaining_slots = max(1, TARGET_HOLDINGS - len(state.positions))
+            intent_cap = min(remaining_slots, _INITIATION_MAX_STARTERS)
+        else:
+            intent_cap = _MAX_INTENTS
+
+        for item in data.get("intents", [])[:intent_cap]:
             try:
                 raw_action = str(item.get("action", "buy"))
                 mapped = _ACTION_MAP.get(raw_action, raw_action)

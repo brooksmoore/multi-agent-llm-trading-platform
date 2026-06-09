@@ -465,7 +465,18 @@ class OMS:
                         self._record_accepted(order_id, event.broker_order_id, ts=ts)
                 case BrokerOrderState.PARTIALLY_FILLED | BrokerOrderState.FILLED:
                     if event.fill is None:
-                        logger.error("FILL event without fill payload: %s", event)
+                        # Some brokers (Alpaca's stream, and Robinhood which has
+                        # no stream at all) deliver a fill/partial-fill state with
+                        # no payload. This is BENIGN: the Reconciler is the source
+                        # of truth and synthesizes the missing Fill from the
+                        # broker's authoritative filled_qty on its next poll
+                        # (≤reconcile interval). Logged at INFO, not ERROR, so it
+                        # doesn't pollute real-error visibility.
+                        logger.info(
+                            "fill state %s with no payload for order=%s "
+                            "(reconciler will recover from broker filled_qty)",
+                            event.new_state, order_id,
+                        )
                         return
                     self._handle_fill(order_id, event.fill, ts=ts)
                 case BrokerOrderState.CANCELED:

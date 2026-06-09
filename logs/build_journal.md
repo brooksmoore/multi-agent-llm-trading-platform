@@ -516,3 +516,358 @@ defaults, and Opus daily job were edited afterward and need a **second restart**
   weights` — no more silent failure.
 - Kill criterion: 10 trading days from this deploy; measured via the SPY-pairing script
   (per-day max NAV from `equity_snapshots.db` × `SPYProvider().daily_closes()`).
+
+---
+
+## H1+H2 — Opus Cost Reduction — 2026-05-28
+
+**Context:** After deploying `JOB_OPUS_DAILY_INIT` (daily book-building), LLM spend spiked to
+~$0.48/day vs the $0.10/day cap. Root cause: Opus-model calls (opus `daily_check` ~$0.21 +
+Manager `capital_reallocation` ~$0.23) are 92% of spend and **cannot be prompt-cached** — the
+ephemeral cache TTL is 1h but Opus fires once/day and Manager monthly, so every call is a cold
+cache miss. Haiku gets 90% cache hits only because it fires inside the hour.
+
+**H1 — Deploy full book in one initiation cycle (`agents/opus_agent.py`):**
+- Added `_INITIATION_MAX_STARTERS = TARGET_HOLDINGS = 5`.
+- `_format_daily_context`: computes `remaining = max(1, TARGET_HOLDINGS - len(positions))`;
+  prompt now asks for "up to {remaining} starter intent(s) to fill the book in this cycle".
+- `_parse_daily_intents`: cap is `min(remaining_slots, _INITIATION_MAX_STARTERS)` in
+  initiation, `_MAX_INTENTS=3` in management. Guardrails (conviction ≥7, weight ≤0.05)
+  unchanged. One cycle fills 1→5 holdings instead of ~3-4 daily Opus calls.
+
+**H2 — Sonnet for book-building, Opus reserved for deep-dive (`agents/opus_agent.py` + `app.py`):**
+- `OpusAgent.__init__` gains `llm_lite: LLMClient | None = None` (defaults to `llm` for back-
+  compat with all existing callers/tests).
+- `observe()`: `mode == "initiation"` → uses `self._llm_lite` + `call_type="daily_check_lite"`;
+  management → `self._llm` (Opus) + `"daily_check"`. Thursday deep-dive unaffected (always Opus).
+- `app.py`: `self._llm_opus_lite = LLMClient(self.budget, model=SONNET_MODEL, …)` wired as
+  `llm_lite=self._llm_opus_lite` in `OpusAgent(…)`. Mirrors the existing Manager lite pattern.
+- Cost: initiation daily_check $0.21 (Opus) → ~$0.04 (Sonnet). Full ramp $0.63–0.84 → $0.04–0.08.
+  Steady-state unchanged: Mon init + Thu deep-dive both stay Opus (~$0.42/wk total).
+
+**Test isolation fix (`tests/conftest.py`):**
+- `pytest_configure` now redirects `agents.manager_bridge.SLEEVE_WEIGHTS_FILE` to an empty
+  temp file. The first live Manager reallocation (2026-05-28) wrote real weights
+  (haiku=0.80×, sonnet=1.16×, opus=1.04×), causing 8 sizing/planner tests to fail with
+  `AssertionError: Decimal('1.199…') == Decimal('1.50')`. Mirrors the existing RUNTIME_STORE
+  isolation pattern; tests that need real weights monkeypatch `SLEEVE_WEIGHTS_FILE` directly.
+- `tests/test_agents_m7.py`: `test_opus_caps_intents_at_three` split into two:
+  - `test_opus_initiation_caps_intents_at_remaining_slots`: 0 positions → expects 5 intents.
+  - `test_opus_management_caps_intents_at_three`: TARGET_HOLDINGS positions → expects ≤3.
+
+**Test results:** 718 passed, 1 skipped. All new code lint-clean.
+
+**Requires restart** (PID 28145 running pre-H1/H2 code).
+
+---
+
+## Robinhood Live Broker Adapter — 2026-06-02
+
+**Context:** User decided to wire the bot to a real-money **Robinhood agentic account** (small
+bankroll) via Robinhood's newly-released MCP endpoint `agent.robinhood.com/mcp/trading`. I gave
+a brutally-honest live-money evaluation; user accepted the risk profile and chose to keep LETFs
++ crypto in the universe. Downside machinery confirmed real (kill_switch.py ladder
+−2%/−15%/−25%/−33%; agent_state_tracker FORCED_CASH + consecutive-loss bench) but uptime-
+dependent. Remaining real risk is execution correctness on a brand-new broker → mitigated by a
+dry-run default and paper-through-the-adapter before funding.
+
+**What was built:**
+- `execution/robinhood_broker.py` — `RobinhoodBroker` implementing the `Broker` Protocol
+  (submit_order idempotent on order.id, cancel_order, get_order, find_order_by_client_id,
+  list_positions, get_account, register_event_callback). No push stream → relies on the
+  existing reconciler polling fallback (start_stream is a no-op).
+  - Transport: minimal **MCP-over-streamable-HTTP JSON-RPC client** built on httpx 0.28
+    (the `mcp` python SDK is not installed). Async session bridged into the sync Broker
+    interface via a dedicated event-loop thread, mirroring AlpacaBroker's threading model.
+  - **Safety gate:** `live_trading_enabled` defaults False → DRY-RUN (logs intended orders,
+    returns a synthetic broker_order_id, never sends). Funding + arming is the user's action.
+  - **Robinhood MCP tool schema is UNVERIFIED** (days-old feature, no docs in hand). Tool
+    names/params/auth are isolated in `_RH_TOOLS` + `_build_order_args` with `TODO-VERIFY`
+    markers; translation layer conforms to our domain types. Must be confirmed against the
+    live MCP server before funding.
+- `config/settings.py` — `broker_kind` ("alpaca"|"robinhood"), `robinhood_mcp_url`,
+  `robinhood_auth_token`, `robinhood_live_enabled`.
+- `app.py` — `_build_robinhood_broker()` + broker selection on `settings.broker_kind`
+  (defaults to alpaca; real-money guard requires explicit live flag).
+- `tests/test_robinhood_broker.py` — offline tests for type translation, idempotency, and the
+  dry-run safety gate (no network).
+
+**Next steps before funding (documented for the user):**
+1. Verify the real MCP tool schema against `agent.robinhood.com/mcp/trading`; fix `_RH_TOOLS`.
+2. Paper-trade THROUGH the adapter (live_trading_enabled=False dry-run, then a tiny real test).
+3. Fund small with the kill-switch ladder live + a daily-loss phone alert.
+
+---
+
+## Log-Spam Fix + Robinhood Probe — 2026-06-03
+
+**Log-spam (observability bug).** The Alpaca trading websocket logs a full ERROR + traceback on
+every reconnect attempt; during a laptop network/DNS drop that was thousands/min, rotating 10 MB
+of logs every ~1 minute and shredding all history (the current app.log spanned <4 hours; 3 of 4
+rotated files covered ~1 minute each). The existing `setLevel(WARNING)` silence did nothing
+because the storm logs at ERROR. Fix (`app.py`): added `_RateLimitFilter` (logging.Filter) that
+lets the first occurrence of a message through, suppresses identical repeats within a 60s window,
+and annotates the next emission with "+N identical suppressed". Attached to the
+`alpaca.trading.stream` logger. Verified 5000 identical → 1 passed. 4 new tests
+(`tests/test_log_ratelimit.py`). This restores observability — prerequisite for trusting the
+dashboard before real money.
+
+**Diagnostic context (why "no intents today" looked alarming):** bot was running fine (PID 1776,
+2d8h uptime, market data flowing, positions intact). Low activity was (a) legitimate
+skip-when-unchanged on a quiet day + (b) intermittent laptop connectivity during market hours
+(user's hypothesis — confirmed: Sonnet fingerprint showed empty `top10=` for a cycle where the
+bars fetch timed out). NOT a code regression. The log-spam had simply made it impossible to see.
+
+**Robinhood probe (live bring-up step 2).** `scripts/robinhood_probe.py` — read-only. Reads
+ROBINHOOD_AUTH_TOKEN from .env, runs the MCP `initialize` handshake, calls `list_tools()`, prints
+each tool + input schema, flags mismatches vs the assumed `_RH_TOOLS`, and dumps sample
+get_account/list_positions responses. NEVER calls place_order. Output is what we reconcile the
+adapter's `_RH_TOOLS` + every `# TODO-VERIFY` field against. Settings map env vars directly to
+field names (pydantic BaseSettings, no prefix): BROKER_KIND, ROBINHOOD_AUTH_TOKEN,
+ROBINHOOD_LIVE_ENABLED, ROBINHOOD_MCP_URL.
+
+**Test results:** 732 passed, 1 skipped. New code lint-clean.
+
+**Restart required** to load the log filter (PID 1776 runs pre-fix code).
+
+---
+
+## Pre-Robinhood Hygiene / Efficiency / Execution-Efficacy Audit — 2026-06-06
+
+Full audit before wiring real money. Verdict: **execution core is sound for live trading.**
+
+**Execution-logic efficacy (the money-critical axis) — STRONG:**
+- Every order passes `RiskGate.check_intent` (11 checks) before creation; order only built if
+  `allowed=True` (app.py `_submit_one_intent` → `_evaluate_with_risk_gate`).
+- Kill-switch ladder fully enforced (execution/risk.py + kill_switch.py `_BLOCKS_NEW_ENTRIES`):
+  LIQUIDATE→only-close; DAILY_LOSS / DRAWDOWN_PAUSED / HEARTBEAT_MISSED / RECONCILIATION_BREAK /
+  BUDGET_EXHAUSTED → no new entries. The heartbeat-missed + reconciliation-break blocks are a
+  strong uptime safety property (laptop sleep / book drift → bot refuses to open, closes only).
+- Idempotent submit on client_order_id (= order.id).
+- Reconciler is source-of-truth: synthesizes a Fill from broker `filled_qty` when a stream fill
+  is dropped, and `force_close_filled` handles qty-precision drift. Self-healing.
+- Plus wash-sale, LETF whitelist/hold-period/anti-rotation, per-agent FORCED_CASH, weight caps.
+
+**Fixed this pass:**
+- `execution/oms.py`: the "FILL event without fill payload" log was ERROR and fired ~22×,
+  polluting error visibility — it is BENIGN (reconciler recovers). Downgraded to INFO with an
+  explanatory message.
+- `execution/robinhood_broker.py`: 5 mypy `no-any-return` in the new money-path adapter →
+  fixed with explicit dict/list coercion (also hardens against malformed MCP responses). 0 left.
+- `scripts/clean_dust_lots.py`: new one-off to close 3 legacy phantom dust lots (haiku
+  BTCUSD/ETHUSD/SOLUSD, ~1e-8 remainders from fractional crypto sells). Dry-run by default;
+  run with --apply during a bot stop. Live close-path already prevents new dust.
+
+**Reported, NOT fixed (rationale):**
+- **Robinhood has NO push stream → every fill relies on the 60s reconciler poll.** Top pre-fund
+  recommendation: tighten the reconcile interval for broker_kind=robinhood (e.g. 15-30s) so
+  fill-awareness lags less — weigh against the new API's rate limits. A tuning call, not a bug.
+- Lint: 183 items, ~96% cosmetic (87 E501 line-length, 17 import-sort, 8 E741). Real-ish ones
+  are false positives (F821 LiveMetrics = TYPE_CHECKING forward-ref) or trivial (2 F401). Did
+  NOT mass-churn pre-deploy (risky diff); recommend a separate `ruff --fix` hygiene pass later.
+- mypy: bus typed as `object` (budget.py, agent_state_tracker.py) → 3 "no attribute publish";
+  loose typing, works at runtime. Low priority.
+- build_agent_state creates a 3-worker ThreadPoolExecutor per dispatch; dispatch is infrequent
+  (few/hour), pools are cheap — judged acceptable, not worth lifecycle complexity.
+
+**Test results:** 733 passed. New/changed code lint-clean; execution path mypy-clean.
+
+---
+
+## Robinhood Bring-up (Step 1+2) — 2026-06-06
+
+**What was built / executed:**
+
+- **Step 1 (probe) attempted exactly as specified.** Ran `.venv/bin/python scripts/robinhood_probe.py`.
+  Result: "ERROR: ROBINHOOD_AUTH_TOKEN is empty. Add it to .env first."
+  The read-only probe (initialize + list_tools + sample get_account/list_positions) cannot run until the owner
+  populates ROBINHOOD_AUTH_TOKEN. No changes to `_RH_TOOLS` or any `# TODO-VERIFY` yet — those remain guesses
+  until the live schema is observed. The probe script + _McpHttpClient already surface the exact failure modes
+  (auth header scheme, endpoint reachability, protocolVersion) for the next run.
+- **Step 2 (top correctness gap) — per-broker reconcile interval.** Robinhood has no push stream; every fill
+  and terminal state transition for live orders waits on the Reconciler poll (was globally 60s).
+  - Added `reconciler_interval_robinhood_secs: int = 20` in `config/settings.py` (Alpaca keeps the 60s default
+    as its WS stream is primary; reconciler is safety net).
+  - Wired selection in `app.py:287` (after broker construction): if `broker_kind == "robinhood"` use the
+    tighter value, else the general one. The choice is driven by the *declared* settings.broker_kind so that
+    tests injecting FakeBroker while setting broker_kind="robinhood" still exercise the production poll rate.
+  - Updated module docstring (top of app.py) and crash-recovery note (no longer hard-codes "60s tick").
+  - Updated `.env.example` with full Robinhood section (BROKER_KIND, ROBINHOOD_* vars, the two RECONCILER_INTERVAL*
+    knobs) so the owner has a complete template before adding the real token.
+  - Added `test_reconciler_interval_is_tighter_for_robinhood_broker_kind` in `tests/test_app_lifecycle.py`.
+- Dry-run session wiring verification (no live MCP calls): constructed an App with `broker_kind="robinhood"`,
+  `robinhood_live_enabled=False`, dummy token, and exercised dispatch_observation + planner path. Confirmed the
+  reconciler was built with the robinhood-specific interval (15s in the probe). The RobinhoodBroker dry-run
+  branch (the only path active while live_enabled=False) was already covered by `test_robinhood_broker.py`
+  (DRYRUN- ids, idempotency on client_order_id, _build_order_args shape). Full sleeve-intent → logged-intent
+  end-to-end will be re-run by the owner once the token is present and a real dry-run `app.py` session is started.
+- Pre-existing execution invariants audited (unchanged by this work):
+  - RiskGate.check_intent is still the only gate before Order construction (planner path).
+  - KillSwitch ladder, submit_order idempotency on order.id, Reconciler-as-source-of-truth + force_close_filled
+    for qty drift, all untouched.
+- Hygiene: only the three new/changed source files + one test file were linted. The ~183-item repo-wide cosmetic
+  debt (mostly E501 + import sort in app.py and pre-existing long lines in settings/reconciler) was left exactly
+  as-is per the "do not mass-churn near live deploy" rule. mypy run on the required gate (`execution/` + `core/types.py`)
+  shows only the three known pre-existing "bus: object has no publish" issues (budget.py, agent_state_tracker.py);
+  no new type errors from the interval selection logic.
+
+**Files changed:**
+- config/settings.py (new setting + comments)
+- app.py (selection logic + docstring updates)
+- .env.example (Robinhood + reconciler docs)
+- tests/test_app_lifecycle.py (1 new test)
+- logs/build_journal.md (this entry)
+
+**Test results:** 734 passed (733 + 1 new interval-selection test), 0 failures. All prior robinhood_broker, reconciler,
+app_lifecycle, smoke, and risk/oms/kill_switch suites continue to pass. ruff on the touched files shows only
+pre-existing violations. mypy execution/ + core/types.py: only the 3 known loose-bus issues.
+
+**Decisions / flags for owner (real-money critical):**
+- 20s default for robinhood is a deliberate trade-off: ~3x more fill awareness than before vs. ~3 list_positions +
+  N get_order calls per minute while orders are open. If the MCP endpoint rate-limits the new adapter under load,
+  raise RECONCILER_INTERVAL_ROBINHOOD_SECS in .env (or we can add a small backoff/jitter later).
+- Once you add ROBINHOOD_AUTH_TOKEN to .env, re-run the probe **immediately** and paste the full output (tool names,
+  inputSchema properties/required, plus the raw get_account + list_positions shapes). That is the sole input needed
+  to promote every `# TODO-VERIFY` from guess to verified and to implement any auth/refresh flow if Bearer is not
+  the scheme the server actually accepts.
+- The live_enabled guard + dry-run default in RobinhoodBroker remain load-bearing. Funding + flipping the flag is
+  still a deliberate owner action after the schema is reconciled and a 1-share test succeeds.
+
+**Next (in exact order):**
+1. Owner: `ROBINHOOD_AUTH_TOKEN=...` into .env (and optionally set BROKER_KIND=robinhood + RECONCILER_INTERVAL_ROBINHOOD_SECS if you want something other than 20).
+2. Re-run `scripts/robinhood_probe.py`, share output → we fix `_RH_TOOLS` + all field accessors + any auth differences.
+3. Owner starts a dry-run session (`broker_kind=robinhood, live_enabled=false`), confirms the log lines for intended
+   orders match what the four sleeves emitted that cycle.
+4. Owner: single 1-share live test (flip flag temporarily), inspect real broker response + idempotency (submit twice
+   with same client id).
+5. Small fund + confirm daily-loss kill-switch path + ntfy/Telegram alert fires.
+
+**Test results (post-edit):** 734/734. No production paths for RiskGate / OMS / kill-switch / lots / reconciler source-of-truth were modified.
+
+---
+
+## AUDIT — Robinhood Bring-up Steps 1+2 — 2026-06-06
+
+**Auditor:** Claude (independent technical auditor). Verified against real code, not Grok's description.
+
+### Test gate
+Full suite: **734 passed** ✅ (Grok's +1 claim confirmed: 733 → 734, the new interval-selection test).
+Targeted suite (test_robinhood_broker + test_app_lifecycle): **22/22** ✅.
+mypy `execution/ core/types.py`: **3 errors, all pre-existing** (bus typed as `object` in budget.py and agent_state_tracker.py). Zero new errors from this changeset. ✅
+
+### Invariants re-verified (all intact)
+1. **RiskGate before every Order**: `_submit_one_intent` (app.py:839) calls `_evaluate_with_risk_gate` → `RiskGate.check_intent`. No bypass path added. ✅
+2. **Kill-switch ladder blocks new entries**: `_BLOCKS_NEW_ENTRIES` = {DRAWDOWN_PAUSED, DRAWDOWN_LIQUIDATE, DAILY_LOSS, HEARTBEAT_MISSED, RECONCILIATION_BREAK, BUDGET_EXHAUSTED} (kill_switch.py:241). `can_open_new()` (line 83) checks it. RiskGate check #2 (risk.py:175) applies it to all `_OPENING_ACTIONS`. Wiring untouched. ✅
+3. **Submit idempotency on client_order_id**: In-process `_submitted` dict (robinhood_broker.py:281) handles within-session duplicates. OMS recovery path via `find_order_by_client_id` handles cross-restart. Both paths intact and untouched. ✅
+4. **Reconciler source of truth**: `filled_qty` delta synthesis + `force_close_filled` for qty-precision drift (reconciler.py:204, 230) untouched by this changeset. ✅
+
+### What was actually built (confirmed matches claim)
+- `config/settings.py`: Added `reconciler_interval_robinhood_secs: int = 20`. Default 60 for Alpaca unchanged. Clean. ✅
+- `app.py:287–294`: Interval selected by `settings.broker_kind.lower() == "robinhood"`. Uses the *constructor parameter* `settings` (= `self.settings`), NOT the global module-level singleton. No aliasing risk. ✅
+- `tests/test_app_lifecycle.py:272`: New test sets `reconciler_interval_robinhood_secs = 17` (non-default), constructs App with FakeBroker + broker_kind="robinhood", asserts `app.reconciler._interval_secs == 17`. Proves actual selection, not default coincidence. ✅
+- `.env.example`: Updated with full Robinhood section. Confirmed. ✅
+- **No TODO-VERIFY promoted**: Every entry in `_RH_TOOLS` (robinhood_broker.py:72-77) and every field accessor still carries `# TODO-VERIFY`. No guesses promoted to "live". ✅
+
+### Auth/token security
+- `_auth_token` stored in `_McpHttpClient` instance (line 122), used only in `_headers()` as `Authorization: Bearer ...` (line 135). Never passed to any `log.*()` call. httpx does not log request headers by default. ✅
+- `ROBINHOOD_AUTH_TOKEN` read from `.env` via pydantic-settings, never echoed in logs or `__repr__`. ✅
+
+### Risks (not bugs — documented for completeness)
+1. **No minimum floor on `reconciler_interval_robinhood_secs`**: setting it to 0 via env would cause the reconciler to spin. No production scenario makes this likely; low priority.
+2. **Cross-restart idempotency on live Robinhood orders**: `_submitted` is in-memory. Post-restart, OMS recovery calls `find_order_by_client_id` which uses `list_orders?client_order_id=X` — a `# TODO-VERIFY` path. If Robinhood's MCP doesn't support that filter, recovery could re-submit. This is the **known gap** that the probe step is meant to close. Not new, documented by prior audit.
+3. **No test that alpaca path still gets 60s** (the else branch of the interval selection). Other lifecycle tests that don't set `broker_kind` implicitly cover it, but none assert `_interval_secs`. Minor coverage gap.
+
+### Verdict: **GO** (for this code changeset — probe still required before live flip)
+
+This change is minimal, correctly scoped, and does not touch any execution invariants. The probe failure is a token-availability problem (owner must populate `.env`), not a code quality problem. The codebase is in a *safer* state for Robinhood bring-up than before: the fill-lag gap is closed by default when `broker_kind=robinhood`.
+
+**Single highest-priority next action**: Owner adds `ROBINHOOD_AUTH_TOKEN` to `.env`, then runs `scripts/robinhood_probe.py` and pastes the full output (tool list + schemas + get_account/list_positions shapes). That is the only remaining blocker for schema reconciliation before any live order attempt.
+
+Do NOT arm `robinhood_live_enabled=True` until: (1) probe output reconciles all `_RH_TOOLS` names and `# TODO-VERIFY` field accessors, (2) `find_order_by_client_id` is confirmed to work (cross-restart idempotency), and (3) a dry-run session confirms logged order intent matches sleeve output.
+
+---
+
+## Backtest Harness Advance (Sonnet baseline + DoD scaffold + CL-1 gate) — 2026-06-07
+
+**What was built (following STATUS "single most important next" + GROK_HANDOFF_CROSS_LEARNING priorities CL-1/CL-4):**
+
+- Extended the rules-only baseline in `backtest/strategies.py` with `sonnet_momentum_weights` (and private `_price_momentum` mirror) that uses the *exact* 12-1 momentum math, lookback/skip, and tradable universe as the live SonnetAgent. This guarantees the "rules signal" control is identical; any outperformance by LLM Sonnet will be due to the model layer (news, regime, critique, etc.), not a different factor definition.
+- Used strict TDD/fail-before: first added `test_sonnet_momentum_baseline_exists_and_ranks_higher_mom_higher` (and later the wf/deflated smoke) which failed on import/attr (red), implemented, re-ran to green.
+- Added `deflated_sharpe` (illustrative multiple-testing penalty) and `run_walk_forward` (n-window scaffold with embargo note + cost-stress simulation) to `backtest/engine.py` — the minimal DoD extensions ("2–5 yr historical backtest per strategy with walk-forward CV + deflated Sharpe").
+- Added CL-1 cross-learning gate in existing `tests/test_sizing.py` (static signature guard + concrete call): "sizing functions never see LLM conviction scalar". Placed in regular test (not a new `test_audit_*_gate.py`) per "auditor-owned gates may not be edited by the builder" rule from WORKFLOW + handoff; left a comment for future extraction/ownership by Claude.
+- All changes avoid the execution core (RiskGate, OMS, kill_switch, planner sizing math, lots, reconciler) — no invariants touched. No live/trading gate flipped (robinhood_live_enabled etc. untouched).
+
+**Files changed:**
+- backtest/strategies.py (new sonnet baseline + mom mirror)
+- backtest/engine.py (+ deflated_sharpe, run_walk_forward scaffold + Any import)
+- tests/test_backtest.py (fail-before test + wf/deflated smoke; now 6 tests in file)
+- tests/test_sizing.py (CL-1 gate test; 31 sizing tests total)
+- logs/build_journal.md (this entry)
+
+**Test results:** 
+- Targeted: `tests/test_backtest.py` 6/6 ✅ (was 4; + sonnet baseline + wf smoke). `tests/test_sizing.py` 31/31 ✅ ( + CL-1 gate).
+- Full backtest + sizing modules green. Pre-existing full suite was 734; we added cases without regressing.
+- ruff on the 4 changed files: clean (0 errors after E402 hoist fix).
+- mypy on backtest modules (via --ignore-missing): only pre-existing errors pulled from data/market.py and budget.py (no new errors introduced by our code).
+
+**Decisions / flags:**
+- Sonnet baseline uses `per_name=0.08` default, top_n=5 (matches live max intents). Sum ~0.4 → conservative cash buffer; backtest engine treats remainder as cash (zero return, per its documented conservative choice).
+- Walk-forward is a *scaffold* (re-runs full with cost stress for n windows); true purged CV + per-window param search + embargo + aggregation of excess + deflated SR across folds is still future work (documented in the fn).
+- Deflated SR is illustrative (common sqrt(2*ln(N))/sqrt(T) penalty). When real multi-year runs + parameter sweeps exist, replace with full formula + track #trials.
+- CL-1 test is a builder-enforced guard today; per portfolio standard (truleo) the auditor (Claude) should own the final `test_audit_sizing_gate.py` that this can be moved into. Builder will not edit such a file once created.
+- Did *not* yet wire sonnet baseline into `run_baseline.py` (that would be a one-line partial() addition) or execute real 2-5y history (needs owner .env yf or cache); focused on the deterministic math + testability per the handoff "identical signal".
+- Security injection (CL-5 / DoD) and full auditor gates (CL-2) still pending as separate handoff items; backtest was the STATUS-declared #1.
+
+**Next for this harness (suggested for next STATUS update or auditor handoff):**
+- Wire sonnet (and a simple opus rules stub) into run_baseline.py and execute real 3-5y history (with --years) on the actual agent universes.
+- Turn the walk-forward into real rolling windows with date slicing + compute avg excess + min deflated SR across folds.
+- Add "beats its own rules baseline (excess_cagr > 0 and deflated SR higher)" assertions or a SCOREBOARD append for the historical runs.
+- Once real runs exist, update `blueprint/01_HONEST_ASSESSMENT.md` odds with data.
+
+**Test results (post-edit):** Targeted modules green. No production money paths modified. Fail-before discipline followed for the new baseline functionality.
+
+---
+
+## Robinhood Broker Adapter + Reconciler Fill-Lag Fix + Opus Book-Building — 2026-06-06 / 2026-06-08
+
+*(Committed 2026-06-09 by Claude standing in for Grok while usage limit was hit. Work was complete in the working tree; only missing git commit + journal entry.)*
+
+### Robinhood broker adapter (June 6 session — audited clean by Claude on 2026-06-06)
+- `execution/robinhood_broker.py` (467 lines): full `Broker`-protocol adapter for Robinhood's agentic MCP endpoint (`agent.robinhood.com/mcp/trading`). Safety gate `live_trading_enabled` defaults `False`; every `submit_order()` is a dry-run returning a synthetic `DRYRUN-<uuid>` until the flag is explicitly armed. Transport: synchronous MCP-over-HTTP (JSON-RPC 2.0) via httpx — no mcp SDK dependency. All `_RH_TOOLS` entries and field accessors marked `# TODO-VERIFY` (schema unconfirmed against live server).
+- `scripts/robinhood_probe.py`: offline schema-probe script. Call this after adding `ROBINHOOD_AUTH_TOKEN` to `.env`; pastes full tool list + inputSchema shapes for reconciling every `# TODO-VERIFY`.
+- `scripts/clean_dust_lots.py`: one-off maintenance script to close phantom sub-unit crypto lots left before the live `DUST_NOTIONAL_USD` snap-to-zero logic existed. Dry-run by default; `--apply` to write.
+- `config/settings.py`: `reconciler_interval_robinhood_secs: int = 20` (Robinhood has no fill stream; faster reconciler compensates for ~3× more broker polls while orders are open).
+- `app.py`: `_build_broker()` / `_build_robinhood_broker()` factory methods (broker construction extracted from constructor); interval selection by `broker_kind`.
+- `execution/oms.py`: fill-with-no-payload demoted `logger.error` → `logger.info` with explanatory comment (Robinhood has no WS stream; reconciler is SOT).
+- `.env.example`: full Robinhood section (`ROBINHOOD_AUTH_TOKEN`, `ROBINHOOD_LIVE_ENABLED`, `RECONCILER_INTERVAL_ROBINHOOD_SECS`).
+- `.gitignore`: `*.pem`, `*.key`, `*.p12` added (security pass 2026-06-07).
+- Tests: `tests/test_robinhood_broker.py` (10 offline tests covering dry-run gate, idempotency, arg translation, state-map). `tests/test_app_lifecycle.py` +1 (reconciler interval selection test). All 734 → passing at this point.
+
+*Audited by Claude 2026-06-06: invariants confirmed (RiskGate, kill-switch, submit idempotency, reconciler SOT). DO NOT arm `live_trading_enabled=True` until probe output reconciles all `# TODO-VERIFY` entries.*
+
+### Dashboard + CalibrationRecorder conviction fix + Opus book-building + rate limiter (June 8 session)
+- `dashboard/server.py`: (1) NAV vs SPY chart strips weekend dates to a category-scale x-axis (no more weekend gaps in the equity curve); (2) Per-Sleeve P&L attribution table moved below the charts; (3) Sleeve equity chart excludes Manager (non-trading sleeve). JavaScript helpers `isWeekend`, `toTradingDays`, `fmtDayLabel`, `categoryXAxis` added.
+- `agents/calibration_recorder.py`: Fixed critical silent bug — conviction was being looked up from the OMS `Order` payload (which does NOT store conviction; conviction belongs to `Intent`). Fix: look up from `AgentMemory.conviction_by_intent_id(intent_id)` via new `_conviction_from_memory()` helper. Without this fix the calibration tracker was silently recording 0 conviction on every fill and not logging any calibration data.
+- `agents/memory.py`: `conviction_by_intent_id(intent_id) → int | None` — SQL lookup on `intent_log` table. Required by the CalibrationRecorder fix above.
+- `app.py`: wires `memories=self._memories` into `CalibrationRecorder` constructor; adds `_llm_opus_lite` (Sonnet model, cheaper) for Opus initiation calls; adds `_RateLimitFilter` to tame Alpaca websocket reconnect log storm (collapses identical error messages to 1-per-60s window).
+- `agents/opus_agent.py`: H1 — initiation mode now allows up to `TARGET_HOLDINGS` starters per cycle (previously hard-capped at 2), so the book can deploy in a single Opus call instead of 3-4 days; H2 — initiation uses `llm_lite` (Sonnet), reserving Opus for management-mode thesis review and deep-dives where the reasoning premium is earned.
+- `tests/conftest.py`: sleeve-weights isolation fix — live `data/manager_sleeve_weights.json` (non-default weights from real Manager reallocation) was bleeding into tests and breaking sizing assertions; conftest now redirects `SLEEVE_WEIGHTS_FILE` to a temp `{}` file for every test session.
+- `tests/test_agents_m7.py`: updated Opus intent-cap test for H1 behavior (initiation → up to TARGET_HOLDINGS; management → still _MAX_INTENTS=3).
+- `tests/test_log_ratelimit.py` (new, 4 tests): covers `_RateLimitFilter` collapse, per-message independence, window expiry, and suppressed-count annotation.
+- `blueprint/01_HONEST_ASSESSMENT.md`: updated honest-odds section with latest paper observations.
+
+**Test results:** 740/740 passed. No RiskGate / OMS / kill-switch / lot-accounting / reconciler source-of-truth paths modified. No live gate flipped.
+
+**Outstanding before any live Robinhood order:**
+1. Add `ROBINHOOD_AUTH_TOKEN` to `.env`, run `scripts/robinhood_probe.py`, paste output → reconcile all `# TODO-VERIFY` in robinhood_broker.py.
+2. Dry-run session (`BROKER_KIND=robinhood`, `ROBINHOOD_LIVE_ENABLED=false`) — confirm logged order intents match sleeve output.
+3. Single 1-share live test — inspect response, confirm idempotency (submit same client_order_id twice).
+4. Confirm cross-restart idempotency path (`find_order_by_client_id`) works on live server.
+
+---
+
+## Audit 001 + 002 — 2026-06-07 / 2026-06-09 (Claude auditor)
+- Audit 001 (backtest harness): 5 verified, 4 open — walk-forward was a cost sweep not temporal split (OPEN-1), `_SONNET_TRADABLE` duplicated (OPEN-2), fail-before unverifiable without git commits (OPEN-3), CL-1 gate in builder-editable file (OPEN-4). OPEN-4 resolved: `tests/test_audit_sizing_gate.py` created (auditor-owned; builder must not edit).
+- Grok (Jun 8): implemented Fix 1 (real temporal date splits, RED c221efb → GREEN 89b0a65) and Fix 2 (import `_SONNET_TRADABLE` from live agent, RED 564fae2 → GREEN 7b62629). Committed with git evidence. Thread renamed `DONE_GROK_HANDOFF_BACKTEST_HARNESS.md`.
+- Audit 002 (Jun 9): verified both fixes clean. All 4 OPEN items resolved. `LEDGER.md` created as append-only audit log.
+- Test count at audit close: 40 in touched modules; 740 overall.

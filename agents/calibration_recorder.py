@@ -24,10 +24,11 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from core.events import EventBus, FillReceivedEvent
-from core.types import OrderSide
+from core.types import AgentId, OrderSide
 
 if TYPE_CHECKING:
     from agents.calibration import CalibrationTracker
+    from agents.memory import AgentMemory
     from execution.lots import Lot, LotLedger
     from execution.oms_store import OMSStore
 
@@ -47,10 +48,12 @@ class CalibrationRecorder:
         lots: LotLedger,
         oms_store: OMSStore,
         bus: EventBus,
+        memories: dict[AgentId, "AgentMemory"] | None = None,
     ) -> None:
         self._cal = calibration
         self._lots = lots
         self._store = oms_store
+        self._memories: dict[AgentId, AgentMemory] = memories or {}
         bus.subscribe("fill.received", self._on_fill)
 
     def _on_fill(self, event: FillReceivedEvent) -> None:
@@ -98,7 +101,9 @@ class CalibrationRecorder:
         """Walk the order's OMS events to find submit_intent → (intent_id, conviction).
 
         Lots only carry the *fill* id; the intent is reachable via
-        order_id (fill→order→submit_intent payload).
+        order_id (fill→order→submit_intent payload).  Conviction is NOT stored
+        in the OMS Order payload — it lives in the agent memory intent_log and
+        is fetched there by intent_id.
         """
         # Find the fill.received event for this entry_fill_id to get its order_id.
         order_id = None
@@ -112,7 +117,7 @@ class CalibrationRecorder:
             return None
 
         intent_id: str = ""
-        conviction: int = 0
+        agent_id_str: str = ""
         for ev in self._store.iter_for_order(order_id):
             if ev.kind.value != "order.submit_intent":
                 continue
@@ -121,12 +126,28 @@ class CalibrationRecorder:
                 intent_id = str(raw_iid.get("__uuid__", ""))
             else:
                 intent_id = str(raw_iid or "")
-            intent = ev.payload.get("intent") or {}
-            try:
-                conviction = int(intent.get("conviction") or 0)
-            except (TypeError, ValueError):
-                conviction = 0
+            agent_id_str = str(ev.payload.get("agent_id") or "").split(".")[-1].lower()
             break
-        if not intent_id or conviction <= 0:
+
+        if not intent_id:
+            return None
+
+        # Look up conviction from agent memory (it is NOT in the OMS Order
+        # payload — conviction belongs to Intent, not Order).
+        conviction = self._conviction_from_memory(agent_id_str, intent_id)
+        if conviction <= 0:
             return None
         return intent_id, conviction
+
+    def _conviction_from_memory(self, agent_short_id: str, intent_id: str) -> int:
+        """Return the conviction stored in agent memory for this intent_id, or 0."""
+        for aid, mem in self._memories.items():
+            short = str(aid).split(".")[-1].lower()
+            if short != agent_short_id:
+                continue
+            try:
+                v = mem.conviction_by_intent_id(intent_id)
+                return v if v is not None else 0
+            except Exception:
+                return 0
+        return 0
