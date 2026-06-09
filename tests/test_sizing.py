@@ -243,3 +243,6 @@ def test_combined_scalars() -> None:
 )
 def test_classify_vix(vix: str, expected: VixBucket) -> None:
     assert classify_vix(Decimal(vix)) == expected
+
+
+# CL-1 gate moved to tests/test_audit_sizing_gate.py (auditor-owned — builder must not edit).
