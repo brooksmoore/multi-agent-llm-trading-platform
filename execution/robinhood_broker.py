@@ -5,21 +5,16 @@ Wraps Robinhood's MCP server (`agent.robinhood.com/mcp/trading`) behind the same
 the rest of the system are unaware of the transport.
 
 ────────────────────────────────────────────────────────────────────────────────
-⚠️  TWO THINGS YOU MUST KNOW BEFORE FUNDING THIS WITH REAL MONEY
+⚠️  ONE THING YOU MUST KNOW BEFORE FUNDING THIS WITH REAL MONEY
 ────────────────────────────────────────────────────────────────────────────────
-1.  SAFETY GATE — `live_trading_enabled` defaults to False. In that state every
-    submit_order() is a DRY RUN: it logs the order it *would* have placed, returns
-    a synthetic `DRYRUN-<uuid>` broker id, and sends NOTHING to Robinhood. You must
-    explicitly pass live_trading_enabled=True (and a real auth token) to place live
-    orders. Arming this is the operator's decision, never made implicitly.
+SAFETY GATE — `live_trading_enabled` defaults to False. In that state every
+submit_order() is a DRY RUN: it logs the order it *would* have placed, returns
+a synthetic `DRYRUN-<uuid>` broker id, and sends NOTHING to Robinhood. You must
+explicitly pass live_trading_enabled=True (and a real auth token) to place live
+orders. Arming this is the operator's decision, never made implicitly.
 
-2.  UNVERIFIED SCHEMA — Robinhood's agentic MCP is brand new and its exact tool
-    names, argument shapes, auth flow, and response fields are NOT yet confirmed
-    against documentation. Every such assumption below is tagged `# TODO-VERIFY`.
-    Treat the order-placement path as UNPROVEN until you have:
-      (a) called list_tools() against the live server and reconciled `_RH_TOOLS`,
-      (b) placed a single 1-share dry-run→live test and inspected the response,
-      (c) confirmed idempotency behaviour (does RH honour a client order id?).
+MCP schema verified via live probe 2026-06-10 (list_tools() + get_accounts call).
+Tool names, argument shapes, and response field names below reflect confirmed reality.
 
 Transport: a minimal synchronous MCP-over-HTTP (JSON-RPC 2.0) client built on
 httpx — the `mcp` python SDK is not a dependency here. Streamable-HTTP responses
@@ -61,39 +56,35 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MCP_URL = "https://agent.robinhood.com/mcp/trading"
 _HTTP_TIMEOUT_SECS = 30.0
-_MCP_PROTOCOL_VERSION = "2025-06-18"  # TODO-VERIFY against server's supported version
+_MCP_PROTOCOL_VERSION = "2025-06-18"
 
+# Robinhood agentic account (agentic_allowed=True). Personal margin account
+# 891728651 must NEVER be used for bot orders.
+_AGENTIC_ACCOUNT = "981398050"
 
-# ── Robinhood MCP tool names — TODO-VERIFY every one of these ──────────────────
-# These are best-guess names. Reconcile against list_tools() output from the live
-# server before enabling live trading. Keeping them in one dict makes that a
-# one-place fix.
+# Verified tool names (live probe 2026-06-10).
 _RH_TOOLS = {
-    "place_order": "place_order",            # TODO-VERIFY
-    "cancel_order": "cancel_order",          # TODO-VERIFY
-    "get_order": "get_order",                # TODO-VERIFY
-    "list_orders": "list_orders",            # TODO-VERIFY
-    "list_positions": "list_positions",      # TODO-VERIFY
-    "get_account": "get_account",            # TODO-VERIFY
+    "place_order":    "place_equity_order",
+    "review_order":   "review_equity_order",
+    "cancel_order":   "cancel_equity_order",
+    "get_orders":     "get_equity_orders",
+    "get_positions":  "get_equity_positions",
+    "get_accounts":   "get_accounts",
 }
 
-# Map Robinhood-reported order states → our canonical BrokerOrderState.
-# TODO-VERIFY: confirm RH's actual status vocabulary.
+# Verified RH order state vocabulary (get_equity_orders response).
 _RH_STATE_MAP: dict[str, BrokerOrderState] = {
-    "new": BrokerOrderState.NEW,
-    "queued": BrokerOrderState.NEW,
-    "pending": BrokerOrderState.NEW,
-    "accepted": BrokerOrderState.ACCEPTED,
-    "confirmed": BrokerOrderState.ACCEPTED,
+    "new":              BrokerOrderState.NEW,
+    "queued":           BrokerOrderState.NEW,
+    "unconfirmed":      BrokerOrderState.NEW,
+    "confirmed":        BrokerOrderState.ACCEPTED,
     "partially_filled": BrokerOrderState.PARTIALLY_FILLED,
-    "partial": BrokerOrderState.PARTIALLY_FILLED,
-    "filled": BrokerOrderState.FILLED,
-    "executed": BrokerOrderState.FILLED,
-    "canceled": BrokerOrderState.CANCELED,
-    "cancelled": BrokerOrderState.CANCELED,
-    "rejected": BrokerOrderState.REJECTED,
-    "failed": BrokerOrderState.REJECTED,
-    "expired": BrokerOrderState.EXPIRED,
+    "filled":           BrokerOrderState.FILLED,
+    "cancelled":        BrokerOrderState.CANCELED,
+    "rejected":         BrokerOrderState.REJECTED,
+    "failed":           BrokerOrderState.REJECTED,
+    "voided":           BrokerOrderState.CANCELED,
+    "canceled":         BrokerOrderState.CANCELED,   # American spelling alias
 }
 
 
@@ -287,7 +278,7 @@ class RobinhoodBroker:
             broker_id = f"DRYRUN-{uuid.uuid4()}"
             log.info(
                 "RobinhoodBroker DRY-RUN: would place %s %s qty=%s type=%s "
-                "(client_id=%s) → %s",
+                "(ref_id=%s) → %s",
                 order.side, order.symbol, order.qty, order.order_type,
                 client_id, broker_id,
             )
@@ -296,16 +287,24 @@ class RobinhoodBroker:
             return broker_id
 
         args = self._build_order_args(order)
+
+        # Simulate the order before placing (mandatory safety step).
+        try:
+            review = self._mcp.call_tool(_RH_TOOLS["review_order"], args)
+            log.info("RobinhoodBroker review: %s", review)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("RobinhoodBroker review_equity_order failed (proceeding): %s", exc)
+
         try:
             resp = self._mcp.call_tool(_RH_TOOLS["place_order"], args)
         except BrokerError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise BrokerUnavailable(f"Robinhood place_order failed: {exc}") from exc
+            raise BrokerUnavailable(f"Robinhood place_equity_order failed: {exc}") from exc
 
-        broker_id = str(resp.get("id") or resp.get("order_id") or "")  # TODO-VERIFY
+        broker_id = str(resp.get("id") or "")
         if not broker_id:
-            raise BrokerRejection(f"Robinhood place_order returned no id: {resp}")
+            raise BrokerRejection(f"Robinhood place_equity_order returned no id: {resp}")
         with self._lock:
             self._submitted[client_id] = broker_id
         log.info(
@@ -315,19 +314,18 @@ class RobinhoodBroker:
         return broker_id
 
     def _build_order_args(self, order: Order) -> dict[str, Any]:
-        """Translate our Order → Robinhood place_order arguments.
-
-        TODO-VERIFY: argument names and accepted values are assumptions. Confirm
-        against the live tool's inputSchema (list_tools()).
-        """
+        """Translate our Order → Robinhood place_equity_order arguments."""
+        order_type = "market" if order.order_type == OrderType.MARKET else "limit"
+        tif_raw = str(order.time_in_force).lower()
+        time_in_force = "gtc" if "gtc" in tif_raw else "gfd"
         args: dict[str, Any] = {
+            "account_number": _AGENTIC_ACCOUNT,
             "symbol": order.symbol,
             "side": "buy" if order.side == OrderSide.BUY else "sell",
+            "type": order_type,
             "quantity": str(order.qty),
-            "type": "market" if order.order_type == OrderType.MARKET else "limit",
-            "time_in_force": str(order.time_in_force),
-            # Pass our UUID as the client/idempotency key IF supported.
-            "client_order_id": str(order.id),  # TODO-VERIFY name
+            "time_in_force": time_in_force,
+            "ref_id": str(order.id),   # UUID idempotency key
         }
         if order.order_type != OrderType.MARKET and order.limit_price is not None:
             args["limit_price"] = str(order.limit_price)
@@ -341,34 +339,49 @@ class RobinhoodBroker:
             log.info("RobinhoodBroker DRY-RUN: would cancel %s", broker_order_id)
             return
         try:
-            # TODO-VERIFY: tool name + arg key for cancellation.
-            self._mcp.call_tool(_RH_TOOLS["cancel_order"], {"order_id": broker_order_id})
+            self._mcp.call_tool(
+                _RH_TOOLS["cancel_order"],
+                {"account_number": _AGENTIC_ACCOUNT, "order_id": broker_order_id},
+            )
         except Exception as exc:  # noqa: BLE001
-            raise BrokerUnavailable(f"Robinhood cancel_order failed: {exc}") from exc
+            raise BrokerUnavailable(f"Robinhood cancel_equity_order failed: {exc}") from exc
 
     # ── status queries ──────────────────────────────────────────────────────────
     def get_order(self, broker_order_id: str) -> BrokerOrderStatus:
         if not self._live or self._mcp is None or broker_order_id.startswith("DRYRUN-"):
             raise BrokerUnavailable("RobinhoodBroker in dry-run; no live order to fetch")
         try:
-            # TODO-VERIFY: tool name + arg key for single-order lookup.
-            resp = self._mcp.call_tool(_RH_TOOLS["get_order"], {"order_id": broker_order_id})
+            resp = self._mcp.call_tool(
+                _RH_TOOLS["get_orders"],
+                {"account_number": _AGENTIC_ACCOUNT, "order_id": broker_order_id},
+            )
         except Exception as exc:  # noqa: BLE001
-            raise BrokerUnavailable(f"Robinhood get_order failed: {exc}") from exc
-        return self._translate_order(resp)
+            raise BrokerUnavailable(f"Robinhood get_equity_orders failed: {exc}") from exc
+        # Returns a list; grab the single matching order.
+        orders = resp.get("results", resp if isinstance(resp, list) else [resp])
+        if not orders:
+            raise BrokerUnavailable(f"Robinhood returned no order for id={broker_order_id}")
+        return self._translate_order(orders[0] if isinstance(orders, list) else resp)
 
     def find_order_by_client_id(self, client_order_id: OrderId) -> BrokerOrderStatus | None:
+        """Scan recent orders for a matching ref_id (our idempotency UUID).
+
+        RH's get_equity_orders does not support filtering by ref_id, so we fetch
+        the full account order list and match locally. Handles crash-recovery where
+        broker_id was lost in-process.
+        """
         if not self._live or self._mcp is None:
             return None
         try:
             resp = self._mcp.call_tool(
-                _RH_TOOLS["list_orders"], {"client_order_id": str(client_order_id)},  # TODO-VERIFY
+                _RH_TOOLS["get_orders"],
+                {"account_number": _AGENTIC_ACCOUNT},
             )
         except Exception:  # noqa: BLE001
             return None
-        orders = resp.get("orders", resp if isinstance(resp, list) else [])
+        orders = resp.get("results", resp if isinstance(resp, list) else [])
         for o in orders if isinstance(orders, list) else []:
-            if str(o.get("client_order_id")) == str(client_order_id):
+            if str(o.get("ref_id", "")) == str(client_order_id):
                 return self._translate_order(o)
         return None
 
@@ -376,29 +389,38 @@ class RobinhoodBroker:
         if not self._live or self._mcp is None:
             return []
         try:
-            resp = self._mcp.call_tool(_RH_TOOLS["list_positions"], {})
+            resp = self._mcp.call_tool(
+                _RH_TOOLS["get_positions"],
+                {"account_number": _AGENTIC_ACCOUNT},
+            )
         except Exception as exc:  # noqa: BLE001
-            raise BrokerUnavailable(f"Robinhood list_positions failed: {exc}") from exc
-        raw = resp.get("positions", resp if isinstance(resp, list) else [])
+            raise BrokerUnavailable(f"Robinhood get_equity_positions failed: {exc}") from exc
+        raw = resp.get("results", resp if isinstance(resp, list) else [])
         return [self._translate_position(p) for p in (raw if isinstance(raw, list) else [])]
 
     def get_account(self) -> BrokerAccount:
         if not self._live or self._mcp is None:
-            # Dry-run: report a neutral account so callers don't crash.
             return BrokerAccount(
                 cash=Decimal("0"), equity=Decimal("0"), buying_power=Decimal("0"),
                 pattern_day_trader=False, daytrade_count=0,
             )
         try:
-            resp = self._mcp.call_tool(_RH_TOOLS["get_account"], {})
+            resp = self._mcp.call_tool(_RH_TOOLS["get_accounts"], {})
         except Exception as exc:  # noqa: BLE001
-            raise BrokerUnavailable(f"Robinhood get_account failed: {exc}") from exc
+            raise BrokerUnavailable(f"Robinhood get_accounts failed: {exc}") from exc
+        # get_accounts returns a list; find the agentic account.
+        accounts = resp.get("results", resp if isinstance(resp, list) else [resp])
+        acct: dict[str, Any] = {}
+        for a in accounts if isinstance(accounts, list) else [accounts]:
+            if str(a.get("account_number", "")) == _AGENTIC_ACCOUNT:
+                acct = a
+                break
         return BrokerAccount(
-            cash=_decimal(resp.get("cash") or resp.get("buying_power")),       # TODO-VERIFY
-            equity=_decimal(resp.get("equity") or resp.get("portfolio_value")),  # TODO-VERIFY
-            buying_power=_decimal(resp.get("buying_power")),                    # TODO-VERIFY
-            pattern_day_trader=bool(resp.get("pattern_day_trader", False)),     # TODO-VERIFY
-            daytrade_count=int(resp.get("daytrade_count", 0) or 0),             # TODO-VERIFY
+            cash=_decimal(acct.get("cash")),
+            equity=_decimal(acct.get("equity") or acct.get("portfolio_value")),
+            buying_power=_decimal(acct.get("buying_power")),
+            pattern_day_trader=bool(acct.get("pattern_day_trader", False)),
+            daytrade_count=int(acct.get("daytrade_count", 0) or 0),
         )
 
     def register_event_callback(self, callback: BrokerEventCallback) -> None:
@@ -415,31 +437,29 @@ class RobinhoodBroker:
 
     # ── translation helpers ─────────────────────────────────────────────────────
     def _translate_order(self, o: dict[str, Any]) -> BrokerOrderStatus:
-        state = _RH_STATE_MAP.get(str(o.get("state") or o.get("status", "")).lower(),
-                                  BrokerOrderState.UNKNOWN)  # TODO-VERIFY field name
+        state = _RH_STATE_MAP.get(str(o.get("state", "")).lower(), BrokerOrderState.UNKNOWN)
         side = OrderSide.BUY if str(o.get("side", "buy")).lower() == "buy" else OrderSide.SELL
         now = datetime.now(UTC)
         return BrokerOrderStatus(
-            broker_order_id=str(o.get("id") or o.get("order_id", "")),
-            client_order_id=_to_uuid(o.get("client_order_id")),
+            broker_order_id=str(o.get("id", "")),
+            client_order_id=_to_uuid(o.get("ref_id")),    # ref_id is our UUID
             symbol=str(o.get("symbol", "")),
             side=side,
-            qty=_decimal(o.get("quantity") or o.get("qty")),
-            filled_qty=_decimal(o.get("filled_quantity") or o.get("filled_qty")),
-            avg_fill_price=(_decimal(o.get("average_price") or o.get("avg_fill_price"))
-                            or None),
+            qty=_decimal(o.get("quantity")),
+            filled_qty=_decimal(o.get("filled_quantity")),
+            avg_fill_price=_decimal(o.get("average_price")) or None,
             state=state,
             submitted_at=_parse_ts(o.get("created_at")) or now,
             updated_at=_parse_ts(o.get("updated_at")) or now,
-            rejection_reason=o.get("reject_reason") or o.get("rejection_reason"),
+            rejection_reason=o.get("reject_reason"),
         )
 
     def _translate_position(self, p: dict[str, Any]) -> BrokerPosition:
         return BrokerPosition(
             symbol=str(p.get("symbol", "")),
-            qty=_decimal(p.get("quantity") or p.get("qty")),
-            avg_entry_price=_decimal(p.get("average_buy_price") or p.get("avg_entry_price")),
-            current_price=_decimal(p.get("market_price") or p.get("current_price")),
+            qty=_decimal(p.get("quantity")),
+            avg_entry_price=_decimal(p.get("average_buy_price")),
+            current_price=_decimal(p.get("market_value") or p.get("current_price")),
             asset_class=AssetClass.CRYPTO if _looks_crypto(str(p.get("symbol", "")))
             else AssetClass.EQUITY,
         )

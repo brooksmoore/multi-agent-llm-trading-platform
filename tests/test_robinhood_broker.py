@@ -70,7 +70,8 @@ def test_build_order_args_translation() -> None:
     assert args["side"] == "sell"
     assert args["quantity"] == "3"
     assert args["type"] == "market"
-    assert args["client_order_id"] == str(o.id)
+    assert args["ref_id"] == str(o.id)
+    assert args["account_number"] == "981398050"
 
 
 def test_get_account_dry_run_is_neutral() -> None:
