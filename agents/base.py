@@ -13,35 +13,49 @@ from data.market import Bar
 from execution.broker import BrokerAccount, BrokerPosition
 
 _PLACEHOLDER_RE = re.compile(r"\{\{([a-zA-Z_]+)\}\}")
-
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 _NEWS_HEADLINE_MAX = 140
 _NEWS_SUMMARY_MAX = 280
 
 
+def sanitize_external(text: str) -> str:
+    """Strip control characters from untrusted external text before embedding in prompts.
+
+    Removes C0 control characters (except tab and newline) that could confuse
+    the tokenizer or be used to smuggle hidden instructions. Does not alter
+    printable content — financial news with normal punctuation passes through
+    unchanged.
+    """
+    return _CONTROL_CHARS_RE.sub("", text)
+
+
 def format_news_block(state: "AgentState", limit: int = 12) -> str:
     """Compact news block for the agent's user-message context.
 
-    One bullet per item: headline + summary (when available). Summary is the
-    lede paragraph from Finnhub/RSS — ~200 chars on average — and adds real
-    signal beyond the headline. Capped per-item so context stays bounded.
+    Wrapped in <external_content> tags so the model treats it as data, not
+    instructions. Headlines and summaries are sanitized before embedding.
     """
     if not state.news:
-        return "Recent news: (no items in last 24h)"
+        return "<external_content source='news_feed'>\nRecent news: (no items in last 24h)\n</external_content>"
     items = sorted(state.news, key=lambda n: n.published_at, reverse=True)[:limit]
-    lines = [f"Recent news ({len(items)} of {len(state.news)} items, newest first):"]
+    lines = [
+        "<external_content source='news_feed'>",
+        f"Recent news ({len(items)} of {len(state.news)} items, newest first):",
+    ]
     for n in items:
         when = n.published_at.strftime("%m-%d %H:%M")
         syms = ",".join(n.symbols) if n.symbols else "—"
-        head = n.headline.strip().replace("\n", " ")
+        head = sanitize_external(n.headline.strip().replace("\n", " "))
         if len(head) > _NEWS_HEADLINE_MAX:
             head = head[: _NEWS_HEADLINE_MAX - 3] + "..."
         lines.append(f"  [{when}] [{syms}] {head}")
-        summary = (n.summary or "").strip().replace("\n", " ")
+        summary = sanitize_external((n.summary or "").strip().replace("\n", " "))
         if summary:
             if len(summary) > _NEWS_SUMMARY_MAX:
                 summary = summary[: _NEWS_SUMMARY_MAX - 3] + "..."
             lines.append(f"      {summary}")
+    lines.append("</external_content>")
     return "\n".join(lines)
 
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from agents.base import sanitize_external
 from core.types import NewsItem, NewsSource
 from data.news_store import NewsStore
 
@@ -31,14 +32,15 @@ _SECTOR_PROXIES: dict[str, str] = {
 
 def _format_item(item: NewsItem) -> str:
     when = item.published_at.strftime("%Y-%m-%d %H:%M")
-    summary = (item.summary or "").strip().replace("\n", " ")
+    headline = sanitize_external(item.headline)
+    summary = sanitize_external((item.summary or "").strip().replace("\n", " "))
     if len(summary) > 300:
         summary = summary[:297] + "..."
     body_note = ""
     if item.body:
-        body_note = f"\n  body: {item.body[:1000]}"
+        body_note = f"\n  body: {sanitize_external(item.body[:1000])}"
     summary_line = f"\n  {summary}" if summary else ""
-    return f"- [{when}] [{item.source.value}] {item.headline}{summary_line}{body_note}"
+    return f"- [{when}] [{item.source.value}] {headline}{summary_line}{body_note}"
 
 
 def build_doc_pack(
@@ -75,6 +77,7 @@ def build_doc_pack(
         )
 
     blocks: list[str] = [
+        "<external_content source='news_and_filings'>",
         f"=== Deep-dive doc_pack for {symbol} (assembled {now.isoformat()}) ===",
         "",
     ]
@@ -111,4 +114,5 @@ def build_doc_pack(
         "If the disconfirming evidence in `kill_criteria` is present, exit. "
         "Return the deep_dive JSON schema only."
     )
+    blocks.append("</external_content>")
     return "\n".join(blocks)

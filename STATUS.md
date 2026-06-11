@@ -8,7 +8,7 @@
 - **Live gate:** OFF (never flipped)
 - **Tests:** 740 passing (Robinhood broker 10, log rate-limiter 4, opus book-building 2, dashboard, calibration, lifecycle + all prior suites; CL-1 gate auditor-owned)
 - **Intelligence type:** Full LLM reasoning, heavily fenced (cognitive diversity across model sizes).
-- **Single most important next thing:** Fund Robinhood agentic account 981398050 (currently $0), then run `BROKER_KIND=robinhood` dry-run session to confirm logged order intents match sleeve output. Parallel: wire baselines into `run_baseline.py` and run 2-5y historical data for rules-baseline excess CAGR + deflated SR (DoD requirement).
+- **Single most important next thing:** Run `BROKER_KIND=robinhood` dry-run session to confirm logged order intents match sleeve output (no funding needed — dry-run never calls the MCP). Fund agentic account 981398050 only when ready to arm `live_trading_enabled=True`.
 - **Honest odds this makes money:** 20–30% to beat SPY over 12 months (per `blueprint/01_HONEST_ASSESSMENT.md`). Worth building as a research instrument regardless.
 - **Security posture:** Secrets gitignored (.env/.pem/.key, 2026-06-07). Least-agency is the core strength (LLMs set weights only, Python sets dollars, RiskGate un-bypassable). TODO before live: injection-harden news/EDGAR adapters (CL-5), paper-keys-until-graduation. See `DEFINITION_OF_DONE.md`.
 - **Last updated:** 2026-06-10

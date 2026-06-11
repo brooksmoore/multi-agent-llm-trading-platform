@@ -14,6 +14,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from agents.base import sanitize_external
 from agents.json_utils import parse_json_object
 from agents.llm import BudgetExhausted, LLMClient
 from config.universes import PLUMBING_UNIVERSE
@@ -42,13 +43,16 @@ def _should_score(item: NewsItem) -> bool:
 
 def _build_user_message(item: NewsItem) -> str:
     syms = ", ".join(item.symbols) if item.symbols else "(none)"
-    body = item.body or ""
+    headline = sanitize_external(item.headline)
+    body = sanitize_external(item.body or "")
     return (
+        "<external_content source='news_item'>\n"
         f"Source:        {item.source.value}\n"
         f"Published:     {item.published_at.isoformat()}\n"
         f"Symbols:       {syms}\n"
-        f"Headline:      {item.headline}\n\n"
-        f"Body:\n{body}"
+        f"Headline:      {headline}\n\n"
+        f"Body:\n{body}\n"
+        "</external_content>"
     )
 
 

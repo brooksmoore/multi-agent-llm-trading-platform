@@ -70,10 +70,10 @@ def test_summary_omitted_when_empty() -> None:
     """No summary line should be emitted when summary is None or whitespace."""
     block = format_news_block(_state([_news(summary=None)]))
     lines = block.splitlines()
-    # Header line + 1 headline line, nothing else.
-    assert len(lines) == 2
+    # Tag open + header + 1 headline line + tag close = 4 lines.
+    assert len(lines) == 4
     block2 = format_news_block(_state([_news(summary="   ")]))
-    assert len(block2.splitlines()) == 2
+    assert len(block2.splitlines()) == 4
 
 
 def test_summary_truncated_long() -> None:
