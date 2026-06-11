@@ -259,13 +259,12 @@ class RobinhoodBroker:
         self._callback: BrokerEventCallback | None = None
         # client_order_id (str) → broker_order_id, for in-process idempotency.
         self._submitted: dict[str, str] = {}
+        # dry-run fill simulation: broker_id → Order, broker_id → fill_price
+        self._dry_run_orders: dict[str, Order] = {}
+        self._dry_run_fills: dict[str, Decimal] = {}
         self._lock = threading.Lock()
         mode = "LIVE" if self._live else "DRY-RUN"
-        log.warning(
-            "RobinhoodBroker initialised in %s mode (url=%s). "
-            "Order schema is UNVERIFIED until reconciled against list_tools().",
-            mode, mcp_url,
-        )
+        log.warning("RobinhoodBroker initialised in %s mode (url=%s).", mode, mcp_url)
 
     # ── idempotent submit ──────────────────────────────────────────────────────
     def submit_order(self, order: Order) -> str:
@@ -284,6 +283,7 @@ class RobinhoodBroker:
             )
             with self._lock:
                 self._submitted[client_id] = broker_id
+                self._dry_run_orders[broker_id] = order
             return broker_id
 
         args = self._build_order_args(order)
@@ -348,7 +348,9 @@ class RobinhoodBroker:
 
     # ── status queries ──────────────────────────────────────────────────────────
     def get_order(self, broker_order_id: str) -> BrokerOrderStatus:
-        if not self._live or self._mcp is None or broker_order_id.startswith("DRYRUN-"):
+        if broker_order_id.startswith("DRYRUN-"):
+            return self._simulate_fill(broker_order_id)
+        if not self._live or self._mcp is None:
             raise BrokerUnavailable("RobinhoodBroker in dry-run; no live order to fetch")
         try:
             resp = self._mcp.call_tool(
@@ -387,7 +389,7 @@ class RobinhoodBroker:
 
     def list_positions(self) -> list[BrokerPosition]:
         if not self._live or self._mcp is None:
-            return []
+            raise BrokerUnavailable("RobinhoodBroker in dry-run; no live positions to fetch")
         try:
             resp = self._mcp.call_tool(
                 _RH_TOOLS["get_positions"],
@@ -434,6 +436,53 @@ class RobinhoodBroker:
     def stop_stream(self) -> None:
         if self._mcp is not None:
             self._mcp.close()
+
+    # ── dry-run fill simulation ─────────────────────────────────────────────────
+    def _simulate_fill(self, broker_order_id: str) -> BrokerOrderStatus:
+        """Return a synthetic FILLED status for a dry-run order.
+
+        Price is fetched once from yfinance and then cached so repeated
+        reconciler calls return a stable fill price. Falls back to the
+        order's limit_price, then 0 if the market is closed or lookup fails.
+        """
+        with self._lock:
+            order = self._dry_run_orders.get(broker_order_id)
+            cached_price = self._dry_run_fills.get(broker_order_id)
+
+        if order is None:
+            raise BrokerUnavailable(f"Unknown dry-run order id: {broker_order_id}")
+
+        if cached_price is None:
+            cached_price = self._fetch_last_price(order.symbol, order.limit_price)
+            with self._lock:
+                self._dry_run_fills[broker_order_id] = cached_price
+
+        now = datetime.now(UTC)
+        return BrokerOrderStatus(
+            broker_order_id=broker_order_id,
+            client_order_id=order.id,
+            symbol=order.symbol,
+            side=order.side,
+            qty=order.qty,
+            filled_qty=order.qty,
+            avg_fill_price=cached_price or None,
+            state=BrokerOrderState.FILLED,
+            submitted_at=now,
+            updated_at=now,
+            rejection_reason=None,
+        )
+
+    @staticmethod
+    def _fetch_last_price(symbol: str, fallback: Decimal | None) -> Decimal:
+        try:
+            import yfinance as yf  # noqa: PLC0415
+            ticker = yf.Ticker(symbol)
+            price = ticker.fast_info.get("last_price") or ticker.fast_info.get("regularMarketPrice")
+            if price:
+                return Decimal(str(price))
+        except Exception:  # noqa: BLE001
+            pass
+        return fallback or Decimal("0")
 
     # ── translation helpers ─────────────────────────────────────────────────────
     def _translate_order(self, o: dict[str, Any]) -> BrokerOrderStatus:

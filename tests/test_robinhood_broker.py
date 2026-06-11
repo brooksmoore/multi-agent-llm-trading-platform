@@ -81,9 +81,12 @@ def test_get_account_dry_run_is_neutral() -> None:
     assert acct.pattern_day_trader is False
 
 
-def test_list_positions_dry_run_empty() -> None:
+def test_list_positions_dry_run_raises_unavailable() -> None:
+    import pytest
+    from execution.broker import BrokerUnavailable
     rb = RobinhoodBroker(auth_token="", live_trading_enabled=False)
-    assert rb.list_positions() == []
+    with pytest.raises(BrokerUnavailable):
+        rb.list_positions()
 
 
 def test_translate_order_state_mapping() -> None:
