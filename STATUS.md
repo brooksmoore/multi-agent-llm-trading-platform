@@ -6,12 +6,12 @@
 - **One-liner:** Four Claude models (Haiku/Sonnet/Opus + non-trading Manager) each run a $1K Alpaca paper sleeve; LLMs set target weights, Python sets every dollar and clears every risk check. Goal: beat SPY net of taxes + API costs, ≤ $1/day spend.
 - **Stage:** paper-validating
 - **Live gate:** OFF (never flipped)
-- **Tests:** 745 passing (Robinhood broker 10, log rate-limiter 4, opus book-building 2, dashboard, calibration, lifecycle + all prior suites; CL-1 gate auditor-owned)
+- **Tests:** 756 passing (Robinhood broker 10, log rate-limiter 4, opus book-building 2, dashboard, calibration, lifecycle + all prior suites; CL-1 gate auditor-owned; ultra-review hardening 11 new)
 - **Intelligence type:** Full LLM reasoning, heavily fenced (cognitive diversity across model sizes).
-- **Single most important next thing:** `/code-review ultra` — CL-5 done, broker schema verified, 745 tests green. Run ultra review, then fund agentic account 981398050 + arm `live_trading_enabled=True`.
+- **Single most important next thing:** Fund agentic account 981398050 + arm `live_trading_enabled=True` — ultra review done, 756 tests green, all blocking findings resolved.
 - **Honest odds this makes money:** 20–30% to beat SPY over 12 months (per `blueprint/01_HONEST_ASSESSMENT.md`). Worth building as a research instrument regardless.
-- **Security posture:** Secrets gitignored (.env/.pem/.key, 2026-06-07). Least-agency is the core strength (LLMs set weights only, Python sets dollars, RiskGate un-bypassable). TODO before live: injection-harden news/EDGAR adapters (CL-5), paper-keys-until-graduation. See `DEFINITION_OF_DONE.md`.
-- **Last updated:** 2026-06-10
+- **Security posture:** Secrets gitignored (.env/.pem/.key, 2026-06-07). Least-agency is the core strength (LLMs set weights only, Python sets dollars, RiskGate un-bypassable). XML tag spoofing closed (CL-5 ext, 2026-06-12). See `DEFINITION_OF_DONE.md`.
+- **Last updated:** 2026-06-12
 
 ---
 
@@ -28,3 +28,4 @@
 - 2026-06-09 (Audit 002): All Audit 001 open items confirmed resolved. Backtest harness thread closed (DONE_). Committed all pending working-tree work (Robinhood broker, calibration conviction fix, dashboard UX, opus H1/H2 book-building, log rate limiter) as 3d0c5ca + 8c57dc4. 740/740 green.
 - 2026-06-10: CL-5 prompt injection hardening: sanitize_external() strips C0 control chars from all external content (news/EDGAR/RSS) before it enters LLM prompts; <external_content> structural tags wrap all external blocks; explicit injection policy added to all three agent system prompts. 19 new tests, 745/745 green. DoD pre-live security requirement now met.
 - 2026-06-10: Robinhood MCP probe complete. Verified all tool names, field shapes, account structure via live list_tools() call. Rewrote execution/robinhood_broker.py: correct tool names (place_equity_order, review_equity_order, cancel_equity_order, get_equity_orders, get_equity_positions, get_accounts), account hardcoded to 981398050, ref_id idempotency key, review_equity_order called before every live placement. All 10 broker tests green. 740/740 passing. Next: fund agentic account + dry-run session.
+- 2026-06-12: Ultra review hardening (Fable 5, 15 findings, 12 applied). Blocking fixes: concurrent duplicate-submit sentinel (_INFLIGHT), response dict guards in get_order/find_order_by_client_id, nil UUID → random UUID in _to_uuid, zero-price fill guard in LotLedger dust check, _fetch_last_price returns None not Decimal(0), cached_price falsy-zero fixed. Other fixes: daytrade_count null warning, broker_kind validation at startup (ValueError), sleeve allocation Decimal(0) falsy fix, XML tag spoofing closed (sanitize_external escapes < >). Skipped: #8 false positive, #12 intentional os._exit, #15 reconcile script. 11 new tests, 756/756 green.

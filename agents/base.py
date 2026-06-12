@@ -20,14 +20,15 @@ _NEWS_SUMMARY_MAX = 280
 
 
 def sanitize_external(text: str) -> str:
-    """Strip control characters from untrusted external text before embedding in prompts.
+    """Strip control characters and escape XML angle brackets from untrusted external text.
 
     Removes C0 control characters (except tab and newline) that could confuse
-    the tokenizer or be used to smuggle hidden instructions. Does not alter
-    printable content — financial news with normal punctuation passes through
-    unchanged.
+    the tokenizer or be used to smuggle hidden instructions. Also escapes `<`
+    and `>` so a headline containing `</external_content>` cannot spoof the
+    structural tag boundary used to separate external data from instructions.
     """
-    return _CONTROL_CHARS_RE.sub("", text)
+    cleaned = _CONTROL_CHARS_RE.sub("", text)
+    return cleaned.replace("<", "&lt;").replace(">", "&gt;")
 
 
 def format_news_block(state: "AgentState", limit: int = 12) -> str:

@@ -114,7 +114,8 @@ class _McpHttpClient:
         self._client = httpx.Client(timeout=_HTTP_TIMEOUT_SECS)
         self._session_id: str | None = None
         self._next_id = 1
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()       # serialises all RPC calls
+        self._init_lock = threading.Lock()  # serialises the initialize handshake
         self._initialized = False
 
     def _headers(self) -> dict[str, str]:
@@ -188,23 +189,26 @@ class _McpHttpClient:
     def ensure_initialized(self) -> None:
         if self._initialized:
             return
-        self._rpc(
-            "initialize",
-            {
-                "protocolVersion": _MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "multi-agent-bot", "version": "1.0"},
-            },
-        )
-        # MCP requires a follow-up notification (no id, no response expected).
-        # Best-effort; some servers don't require it.
-        with contextlib.suppress(httpx.HTTPError):
-            self._client.post(
-                self._url,
-                headers=self._headers(),
-                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        # _init_lock serialises concurrent first callers; _rpc uses _lock for
+        # individual requests, so we can't hold _lock here (deadlock).
+        with self._init_lock:
+            if self._initialized:
+                return
+            self._rpc(
+                "initialize",
+                {
+                    "protocolVersion": _MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "multi-agent-bot", "version": "1.0"},
+                },
             )
-        self._initialized = True
+            with contextlib.suppress(httpx.HTTPError):
+                self._client.post(
+                    self._url,
+                    headers=self._headers(),
+                    json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                )
+            self._initialized = True
 
     def list_tools(self) -> list[dict[str, Any]]:
         """Return the server's advertised tools. Use this to reconcile `_RH_TOOLS`."""
@@ -257,21 +261,35 @@ class RobinhoodBroker:
         self._live = live_trading_enabled
         self._mcp = _McpHttpClient(mcp_url, auth_token) if auth_token else None
         self._callback: BrokerEventCallback | None = None
-        # client_order_id (str) → broker_order_id, for in-process idempotency.
+        # client_order_id (str) → broker_order_id. An entry is set to
+        # _INFLIGHT before the MCP call and replaced with the real broker id
+        # on success. Concurrent submits of the same order id see _INFLIGHT
+        # and short-circuit; ref_id idempotency at the server handles any
+        # race that slips through.
         self._submitted: dict[str, str] = {}
         # dry-run fill simulation: broker_id → Order, broker_id → fill_price
         self._dry_run_orders: dict[str, Order] = {}
-        self._dry_run_fills: dict[str, Decimal] = {}
+        self._dry_run_fills: dict[str, Decimal | None] = {}
         self._lock = threading.Lock()
         mode = "LIVE" if self._live else "DRY-RUN"
         log.warning("RobinhoodBroker initialised in %s mode (url=%s).", mode, mcp_url)
+
+    _INFLIGHT = "__INFLIGHT__"
 
     # ── idempotent submit ──────────────────────────────────────────────────────
     def submit_order(self, order: Order) -> str:
         client_id = str(order.id)
         with self._lock:
-            if client_id in self._submitted:
-                return self._submitted[client_id]  # in-process idempotency
+            existing = self._submitted.get(client_id)
+            if existing is not None and existing != self._INFLIGHT:
+                return existing
+            if existing == self._INFLIGHT:
+                # Another thread is mid-placement with the same order id.
+                # ref_id idempotency at the server protects against the duplicate;
+                # return a sentinel so the caller retries reconciliation.
+                log.warning("submit_order: concurrent submit detected for %s; returning inflight", client_id)
+                raise BrokerUnavailable(f"Concurrent submit in progress for order {client_id}; retry")
+            self._submitted[client_id] = self._INFLIGHT  # claim before releasing lock
 
         if not self._live or self._mcp is None:
             broker_id = f"DRYRUN-{uuid.uuid4()}"
@@ -298,13 +316,27 @@ class RobinhoodBroker:
         try:
             resp = self._mcp.call_tool(_RH_TOOLS["place_order"], args)
         except BrokerError:
+            with self._lock:
+                self._submitted.pop(client_id, None)  # release inflight claim
             raise
         except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                self._submitted.pop(client_id, None)
             raise BrokerUnavailable(f"Robinhood place_equity_order failed: {exc}") from exc
 
-        broker_id = str(resp.get("id") or "")
+        # Robinhood returns the order id under "id"; "order_id" is a fallback
+        # in case the field name changes in a future schema version.
+        if not isinstance(resp, dict):
+            with self._lock:
+                self._submitted.pop(client_id, None)
+            raise BrokerRejection(f"Robinhood place_equity_order non-dict response: {resp!r}")
+        broker_id = str(resp.get("id") or resp.get("order_id") or "")
         if not broker_id:
-            raise BrokerRejection(f"Robinhood place_equity_order returned no id: {resp}")
+            with self._lock:
+                self._submitted.pop(client_id, None)
+            raise BrokerRejection(
+                f"Robinhood place_equity_order returned no id. Full response: {resp}"
+            )
         with self._lock:
             self._submitted[client_id] = broker_id
         log.info(
@@ -359,11 +391,18 @@ class RobinhoodBroker:
             )
         except Exception as exc:  # noqa: BLE001
             raise BrokerUnavailable(f"Robinhood get_equity_orders failed: {exc}") from exc
-        # Returns a list; grab the single matching order.
-        orders = resp.get("results", resp if isinstance(resp, list) else [resp])
+        if not isinstance(resp, dict):
+            raise BrokerUnavailable(f"Robinhood get_equity_orders non-dict response: {resp!r}")
+        results = resp.get("results")
+        if isinstance(results, list):
+            orders = results
+        elif isinstance(resp, list):
+            orders = resp
+        else:
+            orders = [resp]
         if not orders:
             raise BrokerUnavailable(f"Robinhood returned no order for id={broker_order_id}")
-        return self._translate_order(orders[0] if isinstance(orders, list) else resp)
+        return self._translate_order(orders[0])
 
     def find_order_by_client_id(self, client_order_id: OrderId) -> BrokerOrderStatus | None:
         """Scan recent orders for a matching ref_id (our idempotency UUID).
@@ -381,9 +420,12 @@ class RobinhoodBroker:
             )
         except Exception:  # noqa: BLE001
             return None
-        orders = resp.get("results", resp if isinstance(resp, list) else [])
-        for o in orders if isinstance(orders, list) else []:
-            if str(o.get("ref_id", "")) == str(client_order_id):
+        if not isinstance(resp, dict):
+            return None
+        results = resp.get("results")
+        orders: list[Any] = results if isinstance(results, list) else (resp if isinstance(resp, list) else [])
+        for o in orders:
+            if isinstance(o, dict) and str(o.get("ref_id", "")) == str(client_order_id):
                 return self._translate_order(o)
         return None
 
@@ -422,7 +464,7 @@ class RobinhoodBroker:
             equity=_decimal(acct.get("equity") or acct.get("portfolio_value")),
             buying_power=_decimal(acct.get("buying_power")),
             pattern_day_trader=bool(acct.get("pattern_day_trader", False)),
-            daytrade_count=int(acct.get("daytrade_count", 0) or 0),
+            daytrade_count=_coerce_daytrade_count(acct.get("daytrade_count")),
         )
 
     def register_event_callback(self, callback: BrokerEventCallback) -> None:
@@ -452,10 +494,15 @@ class RobinhoodBroker:
         if order is None:
             raise BrokerUnavailable(f"Unknown dry-run order id: {broker_order_id}")
 
-        if cached_price is None:
-            cached_price = self._fetch_last_price(order.symbol, order.limit_price)
+        # _dry_run_fills stores None as a sentinel meaning "lookup attempted but
+        # unavailable". Only fetch once; use broker_order_id not in dict to distinguish
+        # first call from a cached None.
+        if broker_order_id not in self._dry_run_fills:
+            price = self._fetch_last_price(order.symbol, order.limit_price)
             with self._lock:
-                self._dry_run_fills[broker_order_id] = cached_price
+                self._dry_run_fills[broker_order_id] = price
+            cached_price = price
+        # cached_price may legitimately be None (price unavailable)
 
         now = datetime.now(UTC)
         return BrokerOrderStatus(
@@ -465,7 +512,7 @@ class RobinhoodBroker:
             side=order.side,
             qty=order.qty,
             filled_qty=order.qty,
-            avg_fill_price=cached_price or None,
+            avg_fill_price=cached_price if cached_price is not None else None,
             state=BrokerOrderState.FILLED,
             submitted_at=now,
             updated_at=now,
@@ -473,7 +520,12 @@ class RobinhoodBroker:
         )
 
     @staticmethod
-    def _fetch_last_price(symbol: str, fallback: Decimal | None) -> Decimal:
+    def _fetch_last_price(symbol: str, fallback: Decimal | None) -> Decimal | None:
+        """Return last traded price from yfinance, fallback limit price, or None.
+
+        Returns None (not zero) when price is unavailable so callers can
+        distinguish "no price" from "zero price" — Decimal(0) is falsy.
+        """
         try:
             import yfinance as yf  # noqa: PLC0415
             ticker = yf.Ticker(symbol)
@@ -482,7 +534,7 @@ class RobinhoodBroker:
                 return Decimal(str(price))
         except Exception:  # noqa: BLE001
             pass
-        return fallback or Decimal("0")
+        return fallback  # may be None
 
     # ── translation helpers ─────────────────────────────────────────────────────
     def _translate_order(self, o: dict[str, Any]) -> BrokerOrderStatus:
@@ -518,7 +570,7 @@ def _to_uuid(v: Any) -> uuid.UUID:  # noqa: ANN401
     try:
         return uuid.UUID(str(v))
     except (ValueError, TypeError):
-        return uuid.UUID(int=0)
+        return uuid.uuid4()  # random; prevents crash-recovery collisions on malformed ref_id
 
 
 def _parse_ts(v: Any) -> datetime | None:  # noqa: ANN401
@@ -534,3 +586,17 @@ def _parse_ts(v: Any) -> datetime | None:  # noqa: ANN401
 
 def _looks_crypto(symbol: str) -> bool:
     return symbol.upper().endswith(("USD", "USDT")) and len(symbol) >= 6
+
+
+def _coerce_daytrade_count(v: Any) -> int:  # noqa: ANN401
+    """Coerce Robinhood daytrade_count to int, logging when the API returns null."""
+    if v is None:
+        import logging  # noqa: PLC0415
+        logging.getLogger(__name__).warning(
+            "Robinhood returned null daytrade_count; defaulting to 0 (PDT status unknown)"
+        )
+        return 0
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return 0

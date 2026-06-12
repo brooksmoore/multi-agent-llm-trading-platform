@@ -298,3 +298,19 @@ def test_reconciler_interval_is_tighter_for_robinhood_broker_kind(tmp_path: Path
     assert app.reconciler._interval_secs == 17  # noqa: SLF001
     app.stop()
     app.stop()
+
+
+def test_unknown_broker_kind_raises_at_init(tmp_path: Path) -> None:
+    """An unrecognised broker_kind must raise ValueError before any side effects."""
+    settings = _make_settings(tmp_path)
+    settings.broker_kind = "interactive_brokers"
+    with pytest.raises(ValueError, match="broker_kind"):
+        App(
+            settings,
+            broker=FakeBroker(),
+            market_data=StubMarketData({}),
+            universe=["SPY"],
+            run_dashboard=False,
+            run_volatility_scanner=False,
+            run_recover_on_start=False,
+        )

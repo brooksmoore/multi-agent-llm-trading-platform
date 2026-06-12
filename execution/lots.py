@@ -302,7 +302,7 @@ class LotLedger:
                 # A sub-cent sliver left after a crypto in-kind fee or a
                 # float-rounded sell is dust, not a position — snap it to zero
                 # and close the lot so it never becomes a phantom open holding.
-                if new_remaining > Decimal("0") and (
+                if new_remaining > Decimal("0") and exit_fill.price > Decimal("0") and (
                     new_remaining * exit_fill.price < DUST_NOTIONAL_USD
                 ):
                     new_remaining = Decimal("0")

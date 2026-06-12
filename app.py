@@ -185,6 +185,19 @@ ALL_JOB_IDS: frozenset[str] = frozenset({
 _AGENT_STATE_LOOKBACK_DAYS = 400
 
 
+_KNOWN_BROKER_KINDS = {"alpaca", "robinhood"}
+
+
+def _validate_settings(settings: "Settings") -> None:
+    """Raise ValueError early if any setting would cause a hard failure later."""
+    kind = (settings.broker_kind or "alpaca").lower()
+    if kind not in _KNOWN_BROKER_KINDS:
+        raise ValueError(
+            f"Unknown broker_kind={kind!r}. "
+            f"Expected one of: {sorted(_KNOWN_BROKER_KINDS)}"
+        )
+
+
 # ─── App ──────────────────────────────────────────────────────────────────────
 
 
@@ -219,6 +232,9 @@ class App:
         self._run_dashboard = run_dashboard
         self._run_volatility_scanner = run_volatility_scanner
         self._run_recover_on_start = run_recover_on_start
+
+        # Fail fast before any side effects — validate settings up front.
+        _validate_settings(settings)
 
         # Path setup ----------------------------------------------------------
         data_dir = Path(settings.data_dir)
@@ -1775,7 +1791,7 @@ class App:
                         base = Decimal(str(cur_alloc[k]))
                     except Exception:
                         base = None
-                if base and base > 0:
+                if base is not None and base > 0:
                     mult = new_d / base
                 else:
                     # No baseline → treat the allocation as already-normalised
