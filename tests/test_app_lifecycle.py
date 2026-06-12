@@ -278,9 +278,6 @@ def test_reconciler_interval_is_tighter_for_robinhood_broker_kind(tmp_path: Path
     """
     settings = _make_settings(tmp_path)
     settings.broker_kind = "robinhood"
-    # Non-live dry-run path does not require a real token, but the field must be
-    # present (the live guard only fires when robinhood_live_enabled=True).
-    settings.robinhood_auth_token = "dummy-for-dry-run"
     settings.robinhood_live_enabled = False
     settings.reconciler_interval_robinhood_secs = 17  # non-default to prove selection
 

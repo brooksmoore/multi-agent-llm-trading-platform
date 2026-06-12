@@ -57,3 +57,7 @@ htmlcov/
 *.pem
 *.key
 *.p12
+
+# Robinhood OAuth tokens (CRITICAL — never commit)
+.robinhood_token.json
+robinhood_token.json

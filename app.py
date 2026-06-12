@@ -2296,22 +2296,25 @@ class App:
         """Construct RobinhoodBroker (agentic MCP).
 
         live_trading_enabled defaults False → dry-run (logs intended orders, sends
-        nothing). Real-money guard: refuse to arm live without an auth token.
+        nothing). TokenProvider loads the token file written by scripts/robinhood_oauth.py
+        and auto-refreshes before expiry.
         """
         from execution.robinhood_broker import RobinhoodBroker  # noqa: PLC0415
+        from execution.robinhood_token import TokenProvider  # noqa: PLC0415
         live = bool(self.settings.robinhood_live_enabled)
-        if live and not self.settings.robinhood_auth_token:
+        try:
+            token_provider = TokenProvider(self.settings.robinhood_token_path)
+        except FileNotFoundError as exc:
             raise RuntimeError(
-                "robinhood_live_enabled=True but robinhood_auth_token is empty "
-                "(real-money guard)"
-            )
+                f"{exc}\nRun:  uv run python scripts/robinhood_oauth.py"
+            ) from exc
         if live:
             log.warning(
                 "RobinhoodBroker armed for LIVE trading — real money. Ensure the MCP "
                 "tool schema has been verified against list_tools() first."
             )
         return RobinhoodBroker(
-            auth_token=self.settings.robinhood_auth_token,
+            token_provider=token_provider,
             mcp_url=self.settings.robinhood_mcp_url,
             live_trading_enabled=live,
         )

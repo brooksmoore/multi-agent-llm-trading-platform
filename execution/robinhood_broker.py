@@ -34,6 +34,7 @@ from typing import Any
 
 import httpx
 
+from execution.robinhood_token import TokenProvider
 from core.types import (
     AssetClass,
     Order,
@@ -108,9 +109,9 @@ class _McpHttpClient:
     (one lock serialises requests, since the OMS may call from multiple threads).
     """
 
-    def __init__(self, url: str, auth_token: str) -> None:
+    def __init__(self, url: str, token_provider: TokenProvider) -> None:
         self._url = url
-        self._auth_token = auth_token
+        self._token_provider = token_provider
         self._client = httpx.Client(timeout=_HTTP_TIMEOUT_SECS)
         self._session_id: str | None = None
         self._next_id = 1
@@ -122,9 +123,7 @@ class _McpHttpClient:
         h = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
-            # TODO-VERIFY: Robinhood may use OAuth bearer, a custom header, or a
-            # signed request. Bearer is the MCP-conventional default.
-            "Authorization": f"Bearer {self._auth_token}",
+            "Authorization": f"Bearer {self._token_provider.get_token()}",
         }
         if self._session_id:
             h["Mcp-Session-Id"] = self._session_id
@@ -253,13 +252,13 @@ class RobinhoodBroker:
 
     def __init__(
         self,
-        auth_token: str,
+        token_provider: TokenProvider | None = None,
         *,
         mcp_url: str = DEFAULT_MCP_URL,
         live_trading_enabled: bool = False,
     ) -> None:
         self._live = live_trading_enabled
-        self._mcp = _McpHttpClient(mcp_url, auth_token) if auth_token else None
+        self._mcp = _McpHttpClient(mcp_url, token_provider) if token_provider else None
         self._callback: BrokerEventCallback | None = None
         # client_order_id (str) → broker_order_id. An entry is set to
         # _INFLIGHT before the MCP call and replaced with the real broker id

@@ -37,25 +37,25 @@ def _order(side: OrderSide = OrderSide.BUY, symbol: str = "AAPL") -> Order:
 
 
 def test_satisfies_broker_protocol() -> None:
-    rb = RobinhoodBroker(auth_token="", live_trading_enabled=False)
+    rb = RobinhoodBroker(live_trading_enabled=False)
     assert isinstance(rb, Broker)
 
 
 def test_dry_run_does_not_send_and_returns_synthetic_id() -> None:
-    rb = RobinhoodBroker(auth_token="", live_trading_enabled=False)
+    rb = RobinhoodBroker(live_trading_enabled=False)
     bid = rb.submit_order(_order())
     assert bid.startswith("DRYRUN-")
 
 
-def test_dry_run_default_even_with_token() -> None:
-    # Token present but live flag off → still dry-run, never sends.
-    rb = RobinhoodBroker(auth_token="tok", live_trading_enabled=False)
+def test_dry_run_default_even_with_no_token() -> None:
+    # No token → still dry-run, never sends.
+    rb = RobinhoodBroker(token_provider=None, live_trading_enabled=False)
     bid = rb.submit_order(_order())
     assert bid.startswith("DRYRUN-")
 
 
 def test_submit_is_idempotent_on_order_id() -> None:
-    rb = RobinhoodBroker(auth_token="", live_trading_enabled=False)
+    rb = RobinhoodBroker(live_trading_enabled=False)
     o = _order()
     first = rb.submit_order(o)
     second = rb.submit_order(o)
@@ -63,7 +63,7 @@ def test_submit_is_idempotent_on_order_id() -> None:
 
 
 def test_build_order_args_translation() -> None:
-    rb = RobinhoodBroker(auth_token="", live_trading_enabled=False)
+    rb = RobinhoodBroker(live_trading_enabled=False)
     o = _order(side=OrderSide.SELL, symbol="NVDA")
     args = rb._build_order_args(o)
     assert args["symbol"] == "NVDA"
@@ -75,7 +75,7 @@ def test_build_order_args_translation() -> None:
 
 
 def test_get_account_dry_run_is_neutral() -> None:
-    rb = RobinhoodBroker(auth_token="", live_trading_enabled=False)
+    rb = RobinhoodBroker(live_trading_enabled=False)
     acct = rb.get_account()
     assert acct.equity == Decimal("0")
     assert acct.pattern_day_trader is False
@@ -84,13 +84,13 @@ def test_get_account_dry_run_is_neutral() -> None:
 def test_list_positions_dry_run_raises_unavailable() -> None:
     import pytest
     from execution.broker import BrokerUnavailable
-    rb = RobinhoodBroker(auth_token="", live_trading_enabled=False)
+    rb = RobinhoodBroker(live_trading_enabled=False)
     with pytest.raises(BrokerUnavailable):
         rb.list_positions()
 
 
 def test_translate_order_state_mapping() -> None:
-    rb = RobinhoodBroker(auth_token="", live_trading_enabled=False)
+    rb = RobinhoodBroker(live_trading_enabled=False)
     status = rb._translate_order({
         "id": "abc123",
         "client_order_id": str(new_id()),
@@ -107,7 +107,7 @@ def test_translate_order_state_mapping() -> None:
 
 
 def test_unknown_state_falls_back() -> None:
-    rb = RobinhoodBroker(auth_token="", live_trading_enabled=False)
+    rb = RobinhoodBroker(live_trading_enabled=False)
     status = rb._translate_order({"id": "x", "status": "some_new_rh_state"})
     assert status.state == BrokerOrderState.UNKNOWN
 
