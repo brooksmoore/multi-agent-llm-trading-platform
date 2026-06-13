@@ -263,7 +263,9 @@ def test_journal_weekly_and_daily_written_to_logs_dir(tmp_path: Path) -> None:
 def test_no_real_money_path_in_settings(tmp_path: Path) -> None:
     """app.py refuses to build with alpaca_paper=False."""
     settings = _settings(tmp_path)
-    settings = settings.model_copy(update={"alpaca_paper": False})
+    # Pin broker_kind=alpaca so this exercises the Alpaca paper-money guard
+    # regardless of what BROKER_KIND the real .env sets (pydantic reads it).
+    settings = settings.model_copy(update={"alpaca_paper": False, "broker_kind": "alpaca"})
     with pytest.raises(RuntimeError, match="alpaca_paper=False"):
         App(
             settings,

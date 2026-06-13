@@ -23,18 +23,23 @@ may arrive as application/json or as text/event-stream; both are handled.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 import threading
 import uuid
+from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
-import httpx
+from mcp.client.auth import OAuthClientProvider, TokenStorage
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
 
-from execution.robinhood_token import TokenProvider
 from core.types import (
     AssetClass,
     Order,
@@ -57,7 +62,6 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MCP_URL = "https://agent.robinhood.com/mcp/trading"
 _HTTP_TIMEOUT_SECS = 30.0
-_MCP_PROTOCOL_VERSION = "2025-06-18"
 
 # Robinhood agentic account (agentic_allowed=True). Personal margin account
 # 891728651 must NEVER be used for bot orders.
@@ -71,6 +75,7 @@ _RH_TOOLS = {
     "get_orders":     "get_equity_orders",
     "get_positions":  "get_equity_positions",
     "get_accounts":   "get_accounts",
+    "get_portfolio":  "get_portfolio",
 }
 
 # Verified RH order state vocabulary (get_equity_orders response).
@@ -99,144 +104,156 @@ def _decimal(v: Any) -> Decimal:  # noqa: ANN401
         return Decimal("0")
 
 
-# ── Minimal MCP-over-HTTP JSON-RPC client ─────────────────────────────────────
+def _data(resp: Any) -> dict[str, Any]:  # noqa: ANN401
+    """Unwrap Robinhood's `{"data": {...}, "guide": "..."}` envelope.
+
+    Every RH MCP tool wraps its payload under `data`. Returns the inner dict,
+    or the response itself if it isn't enveloped (defensive).
+    """
+    if isinstance(resp, dict):
+        inner = resp.get("data")
+        if isinstance(inner, dict):
+            return inner
+        return resp
+    return {}
 
 
-class _McpHttpClient:
-    """Synchronous MCP client speaking JSON-RPC 2.0 over streamable HTTP.
+def _data_list(resp: Any, key: str) -> list[Any]:  # noqa: ANN401
+    """Return `data[key]` as a list (e.g. data.orders, data.positions)."""
+    v = _data(resp).get(key)
+    return v if isinstance(v, list) else []
 
-    Only the slice we need: `initialize` handshake + `tools/call`. Thread-safe
-    (one lock serialises requests, since the OMS may call from multiple threads).
+
+# ── MCP client via the official SDK (OAuth + streamable HTTP) ─────────────────
+
+
+class _FileTokenStorage(TokenStorage):
+    """Persists OAuth tokens + dynamic client registration to a JSON file.
+
+    Written by scripts/robinhood_mcp_connect.py during the one-time browser
+    authorisation; read (and refreshed in place) by the bot at runtime.
     """
 
-    def __init__(self, url: str, token_provider: TokenProvider) -> None:
-        self._url = url
-        self._token_provider = token_provider
-        self._client = httpx.Client(timeout=_HTTP_TIMEOUT_SECS)
-        self._session_id: str | None = None
-        self._next_id = 1
-        self._lock = threading.Lock()       # serialises all RPC calls
-        self._init_lock = threading.Lock()  # serialises the initialize handshake
-        self._initialized = False
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._data: dict[str, Any] = {}
+        if path.exists():
+            self._data = json.loads(path.read_text())
 
-    def _headers(self) -> dict[str, str]:
-        h = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "Authorization": f"Bearer {self._token_provider.get_token()}",
-        }
-        if self._session_id:
-            h["Mcp-Session-Id"] = self._session_id
-        return h
+    def _save(self) -> None:
+        self._path.write_text(json.dumps(self._data, indent=2, default=str))
+        with contextlib.suppress(Exception):
+            self._path.chmod(0o600)
 
-    def _rpc(self, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
-        """Send one JSON-RPC request, return the `result` object. Raises on error."""
-        with self._lock:
-            req_id = self._next_id
-            self._next_id += 1
-            payload = {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": method,
-                "params": params or {},
-            }
+    async def get_tokens(self) -> OAuthToken | None:
+        raw = self._data.get("tokens")
+        return OAuthToken.model_validate(raw) if raw else None
+
+    async def set_tokens(self, tokens: OAuthToken) -> None:
+        self._data["tokens"] = tokens.model_dump(mode="json")
+        self._save()
+
+    async def get_client_info(self) -> OAuthClientInformationFull | None:
+        raw = self._data.get("client_info")
+        return OAuthClientInformationFull.model_validate(raw) if raw else None
+
+    async def set_client_info(self, info: OAuthClientInformationFull) -> None:
+        self._data["client_info"] = info.model_dump(mode="json")
+        self._save()
+
+
+def _extract_tool_dict(result: Any) -> dict[str, Any]:  # noqa: ANN401
+    """Normalise an MCP CallToolResult into the dict the broker expects.
+
+    Prefer structuredContent; else JSON-parse the first text block. Mirrors the
+    prior hand-rolled client's contract so downstream parsing is unchanged.
+    """
+    structured = getattr(result, "structuredContent", None)
+    if isinstance(structured, dict):
+        return structured
+    for block in getattr(result, "content", []) or []:
+        text = getattr(block, "text", None)
+        if text is not None:
             try:
-                resp = self._client.post(self._url, headers=self._headers(), json=payload)
-            except httpx.HTTPError as exc:
-                raise BrokerUnavailable(f"Robinhood MCP transport error: {exc}") from exc
+                parsed = json.loads(text)
+                return parsed if isinstance(parsed, dict) else {"text": text}
+            except json.JSONDecodeError:
+                return {"text": text}
+    return {}
 
-            # Capture a server-assigned session id from the initialize response.
-            sid = resp.headers.get("Mcp-Session-Id")
-            if sid:
-                self._session_id = sid
 
-            if resp.status_code >= 500:
-                raise BrokerUnavailable(f"Robinhood MCP {resp.status_code}: {resp.text[:200]}")
-            if resp.status_code in (401, 403):
-                raise BrokerError(f"Robinhood MCP auth failed ({resp.status_code})")
-            if resp.status_code >= 400:
-                raise BrokerRejection(f"Robinhood MCP {resp.status_code}: {resp.text[:200]}")
+class _McpSdkClient:
+    """Thread-safe synchronous facade over the async MCP SDK OAuth client.
 
-            body = self._parse_body(resp)
-            if "error" in body and body["error"]:
-                err = body["error"]
-                raise BrokerRejection(f"Robinhood MCP error: {err}")
-            result = body.get("result", {})
-            return result if isinstance(result, dict) else {}
+    The OMS calls broker methods synchronously from worker threads, but the MCP
+    SDK is async. We run a dedicated event loop in a background thread and bridge
+    each call via run_coroutine_threadsafe. Tokens are loaded from disk and
+    auto-refreshed by the SDK's OAuthClientProvider; no browser is opened at
+    runtime — if a refresh ever fails, we raise a clear "re-auth" BrokerError.
+    """
 
-    @staticmethod
-    def _parse_body(resp: httpx.Response) -> dict[str, Any]:
-        """Parse a JSON-RPC response that may be application/json or SSE."""
-        ctype = resp.headers.get("content-type", "")
-        if "text/event-stream" in ctype:
-            # Streamable HTTP: take the last `data:` line carrying a JSON-RPC msg.
-            last: dict[str, Any] = {}
-            for line in resp.text.splitlines():
-                line = line.strip()
-                if line.startswith("data:"):
-                    try:
-                        last = json.loads(line[5:].strip())
-                    except json.JSONDecodeError:
-                        continue
-            return last
-        try:
-            parsed = resp.json()
-            return parsed if isinstance(parsed, dict) else {}
-        except json.JSONDecodeError as exc:
-            raise BrokerUnavailable(f"Robinhood MCP non-JSON response: {resp.text[:200]}") from exc
+    def __init__(self, url: str, tokens_path: str) -> None:
+        self._url = url
+        self._storage = _FileTokenStorage(Path(tokens_path).expanduser())
+        self._client_metadata = OAuthClientMetadata(
+            client_name="Multi-Agent Asset Bot",
+            redirect_uris=["http://localhost:4321/callback"],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+            scope="internal",
+        )
+        self._lock = threading.Lock()
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever, daemon=True, name="rh-mcp-loop"
+        )
+        self._thread.start()
 
-    def ensure_initialized(self) -> None:
-        if self._initialized:
-            return
-        # _init_lock serialises concurrent first callers; _rpc uses _lock for
-        # individual requests, so we can't hold _lock here (deadlock).
-        with self._init_lock:
-            if self._initialized:
-                return
-            self._rpc(
-                "initialize",
-                {
-                    "protocolVersion": _MCP_PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {"name": "multi-agent-bot", "version": "1.0"},
-                },
-            )
-            with contextlib.suppress(httpx.HTTPError):
-                self._client.post(
-                    self._url,
-                    headers=self._headers(),
-                    json={"jsonrpc": "2.0", "method": "notifications/initialized"},
-                )
-            self._initialized = True
+    async def _reauth_required(self, *_: Any) -> Any:  # noqa: ANN401
+        raise BrokerError(
+            "Robinhood token expired and headless refresh failed. "
+            "Re-run: uv run python scripts/robinhood_mcp_connect.py"
+        )
 
-    def list_tools(self) -> list[dict[str, Any]]:
-        """Return the server's advertised tools. Use this to reconcile `_RH_TOOLS`."""
-        self.ensure_initialized()
-        result = self._rpc("tools/list", {})
-        tools = result.get("tools", [])
-        return tools if isinstance(tools, list) else []
+    def _oauth(self) -> OAuthClientProvider:
+        return OAuthClientProvider(
+            server_url=self._url,
+            client_metadata=self._client_metadata,
+            storage=self._storage,
+            redirect_handler=self._reauth_required,
+            callback_handler=self._reauth_required,
+        )
+
+    async def _call_async(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        async with (
+            streamablehttp_client(self._url, auth=self._oauth()) as (read, write, _),
+            ClientSession(read, write) as session,
+        ):
+            await session.initialize()
+            result = await session.call_tool(name, arguments)
+            if getattr(result, "isError", False):
+                raise BrokerRejection(f"Robinhood MCP tool error: {_extract_tool_dict(result)}")
+            return _extract_tool_dict(result)
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Invoke an MCP tool, returning the parsed structured result."""
-        self.ensure_initialized()
-        result = self._rpc("tools/call", {"name": name, "arguments": arguments})
-        # MCP tool results carry `content` (list of blocks) and optionally
-        # `structuredContent`. Prefer structured; else parse the first text block.
-        structured = result.get("structuredContent")
-        if isinstance(structured, dict):
-            return structured
-        for block in result.get("content", []):
-            if block.get("type") == "text":
-                try:
-                    parsed = json.loads(block["text"])
-                    return parsed if isinstance(parsed, dict) else {"text": block["text"]}
-                except (json.JSONDecodeError, KeyError):
-                    return {"text": block.get("text", "")}
-        return result
+        """Invoke an MCP tool synchronously, returning the parsed structured result."""
+        with self._lock:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._call_async(name, arguments), self._loop
+            )
+            try:
+                return fut.result(timeout=_HTTP_TIMEOUT_SECS * 2)
+            except FutureTimeout as exc:
+                raise BrokerUnavailable(f"Robinhood MCP call '{name}' timed out") from exc
+            except (BrokerError, BrokerRejection, BrokerUnavailable):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise BrokerUnavailable(f"Robinhood MCP call '{name}' failed: {exc}") from exc
 
     def close(self) -> None:
         with contextlib.suppress(Exception):
-            self._client.close()
+            self._loop.call_soon_threadsafe(self._loop.stop)
 
 
 # ── Broker adapter ────────────────────────────────────────────────────────────
@@ -252,13 +269,13 @@ class RobinhoodBroker:
 
     def __init__(
         self,
-        token_provider: TokenProvider | None = None,
+        mcp_client: _McpSdkClient | None = None,
         *,
         mcp_url: str = DEFAULT_MCP_URL,
         live_trading_enabled: bool = False,
     ) -> None:
         self._live = live_trading_enabled
-        self._mcp = _McpHttpClient(mcp_url, token_provider) if token_provider else None
+        self._mcp = mcp_client
         self._callback: BrokerEventCallback | None = None
         # client_order_id (str) → broker_order_id. An entry is set to
         # _INFLIGHT before the MCP call and replaced with the real broker id
@@ -286,8 +303,10 @@ class RobinhoodBroker:
                 # Another thread is mid-placement with the same order id.
                 # ref_id idempotency at the server protects against the duplicate;
                 # return a sentinel so the caller retries reconciliation.
-                log.warning("submit_order: concurrent submit detected for %s; returning inflight", client_id)
-                raise BrokerUnavailable(f"Concurrent submit in progress for order {client_id}; retry")
+                log.warning("submit_order: concurrent submit for %s; signalling retry", client_id)
+                raise BrokerUnavailable(
+                    f"Concurrent submit in progress for order {client_id}; retry"
+                )
             self._submitted[client_id] = self._INFLIGHT  # claim before releasing lock
 
         if not self._live or self._mcp is None:
@@ -392,13 +411,7 @@ class RobinhoodBroker:
             raise BrokerUnavailable(f"Robinhood get_equity_orders failed: {exc}") from exc
         if not isinstance(resp, dict):
             raise BrokerUnavailable(f"Robinhood get_equity_orders non-dict response: {resp!r}")
-        results = resp.get("results")
-        if isinstance(results, list):
-            orders = results
-        elif isinstance(resp, list):
-            orders = resp
-        else:
-            orders = [resp]
+        orders = _data_list(resp, "orders")
         if not orders:
             raise BrokerUnavailable(f"Robinhood returned no order for id={broker_order_id}")
         return self._translate_order(orders[0])
@@ -421,9 +434,7 @@ class RobinhoodBroker:
             return None
         if not isinstance(resp, dict):
             return None
-        results = resp.get("results")
-        orders: list[Any] = results if isinstance(results, list) else (resp if isinstance(resp, list) else [])
-        for o in orders:
+        for o in _data_list(resp, "orders"):
             if isinstance(o, dict) and str(o.get("ref_id", "")) == str(client_order_id):
                 return self._translate_order(o)
         return None
@@ -438,8 +449,8 @@ class RobinhoodBroker:
             )
         except Exception as exc:  # noqa: BLE001
             raise BrokerUnavailable(f"Robinhood get_equity_positions failed: {exc}") from exc
-        raw = resp.get("results", resp if isinstance(resp, list) else [])
-        return [self._translate_position(p) for p in (raw if isinstance(raw, list) else [])]
+        raw = _data_list(resp, "positions")
+        return [self._translate_position(p) for p in raw]
 
     def get_account(self) -> BrokerAccount:
         if not self._live or self._mcp is None:
@@ -447,23 +458,27 @@ class RobinhoodBroker:
                 cash=Decimal("0"), equity=Decimal("0"), buying_power=Decimal("0"),
                 pattern_day_trader=False, daytrade_count=0,
             )
+        # Balances come from get_portfolio, NOT get_accounts (which carries no
+        # cash/equity/buying_power). The agentic account is a CASH account, so
+        # PDT fields don't exist and default safely to False/0.
         try:
-            resp = self._mcp.call_tool(_RH_TOOLS["get_accounts"], {})
+            resp = self._mcp.call_tool(
+                _RH_TOOLS["get_portfolio"],
+                {"account_number": _AGENTIC_ACCOUNT},
+            )
         except Exception as exc:  # noqa: BLE001
-            raise BrokerUnavailable(f"Robinhood get_accounts failed: {exc}") from exc
-        # get_accounts returns a list; find the agentic account.
-        accounts = resp.get("results", resp if isinstance(resp, list) else [resp])
-        acct: dict[str, Any] = {}
-        for a in accounts if isinstance(accounts, list) else [accounts]:
-            if str(a.get("account_number", "")) == _AGENTIC_ACCOUNT:
-                acct = a
-                break
+            raise BrokerUnavailable(f"Robinhood get_portfolio failed: {exc}") from exc
+        data = _data(resp)
+        # buying_power is a nested object: data.buying_power.buying_power is the
+        # authoritative spendable figure.
+        bp_obj = data.get("buying_power")
+        bp = bp_obj.get("buying_power") if isinstance(bp_obj, dict) else bp_obj
         return BrokerAccount(
-            cash=_decimal(acct.get("cash")),
-            equity=_decimal(acct.get("equity") or acct.get("portfolio_value")),
-            buying_power=_decimal(acct.get("buying_power")),
-            pattern_day_trader=bool(acct.get("pattern_day_trader", False)),
-            daytrade_count=_coerce_daytrade_count(acct.get("daytrade_count")),
+            cash=_decimal(data.get("cash")),
+            equity=_decimal(data.get("total_value")),
+            buying_power=_decimal(bp),
+            pattern_day_trader=False,   # cash account — no PDT concept
+            daytrade_count=0,
         )
 
     def register_event_callback(self, callback: BrokerEventCallback) -> None:
@@ -546,15 +561,23 @@ class RobinhoodBroker:
             symbol=str(o.get("symbol", "")),
             side=side,
             qty=_decimal(o.get("quantity")),
-            filled_qty=_decimal(o.get("filled_quantity")),
+            # RH reports filled qty as `cumulative_quantity` (per get_equity_orders
+            # guide). The reconciler keys fills off this — reading the wrong field
+            # would make every fill invisible. Fallback kept for safety.
+            filled_qty=_decimal(o.get("cumulative_quantity") or o.get("filled_quantity")),
             avg_fill_price=_decimal(o.get("average_price")) or None,
             state=state,
             submitted_at=_parse_ts(o.get("created_at")) or now,
-            updated_at=_parse_ts(o.get("updated_at")) or now,
+            updated_at=_parse_ts(o.get("last_transaction_at") or o.get("updated_at")) or now,
             rejection_reason=o.get("reject_reason"),
         )
 
     def _translate_position(self, p: dict[str, Any]) -> BrokerPosition:
+        # NOTE: get_equity_positions carries NO market price — current_price is
+        # best-effort here and will be 0 unless RH later adds it. For live
+        # valuation/PnL, current price must come from get_equity_quotes (TODO).
+        # qty uses `quantity` (total held) for reconciliation, not
+        # shares_available_for_sells.
         return BrokerPosition(
             symbol=str(p.get("symbol", "")),
             qty=_decimal(p.get("quantity")),
@@ -585,17 +608,3 @@ def _parse_ts(v: Any) -> datetime | None:  # noqa: ANN401
 
 def _looks_crypto(symbol: str) -> bool:
     return symbol.upper().endswith(("USD", "USDT")) and len(symbol) >= 6
-
-
-def _coerce_daytrade_count(v: Any) -> int:  # noqa: ANN401
-    """Coerce Robinhood daytrade_count to int, logging when the API returns null."""
-    if v is None:
-        import logging  # noqa: PLC0415
-        logging.getLogger(__name__).warning(
-            "Robinhood returned null daytrade_count; defaulting to 0 (PDT status unknown)"
-        )
-        return 0
-    try:
-        return int(v)
-    except (ValueError, TypeError):
-        return 0

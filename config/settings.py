@@ -35,9 +35,10 @@ class Settings(BaseSettings):
     # the adapter logs intended orders and sends nothing. Set True only after the
     # MCP tool schema is verified and a dry-run→tiny-live test has passed.
     robinhood_mcp_url: str = "https://agent.robinhood.com/mcp/trading"
-    # Path to the token file written by scripts/robinhood_oauth.py.
-    # Default is ~/.robinhood_token.json; override via ROBINHOOD_TOKEN_PATH.
-    robinhood_token_path: str = "~/.robinhood_token.json"
+    # Path to the OAuth token file written by scripts/robinhood_mcp_connect.py
+    # (one-time browser authorisation). The bot reads + auto-refreshes it.
+    # Override via ROBINHOOD_TOKENS_PATH.
+    robinhood_tokens_path: str = "~/.robinhood_mcp_tokens.json"
     robinhood_live_enabled: bool = False
 
     # ── Market data source ─────────────────────────────────────────────────────

@@ -188,7 +188,7 @@ _AGENT_STATE_LOOKBACK_DAYS = 400
 _KNOWN_BROKER_KINDS = {"alpaca", "robinhood"}
 
 
-def _validate_settings(settings: "Settings") -> None:
+def _validate_settings(settings: Settings) -> None:
     """Raise ValueError early if any setting would cause a hard failure later."""
     kind = (settings.broker_kind or "alpaca").lower()
     if kind not in _KNOWN_BROKER_KINDS:
@@ -2296,25 +2296,27 @@ class App:
         """Construct RobinhoodBroker (agentic MCP).
 
         live_trading_enabled defaults False → dry-run (logs intended orders, sends
-        nothing). TokenProvider loads the token file written by scripts/robinhood_oauth.py
-        and auto-refreshes before expiry.
+        nothing). The MCP SDK client loads the OAuth token file written by the
+        one-time scripts/robinhood_mcp_connect.py and auto-refreshes it.
         """
-        from execution.robinhood_broker import RobinhoodBroker  # noqa: PLC0415
-        from execution.robinhood_token import TokenProvider  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        from execution.robinhood_broker import RobinhoodBroker, _McpSdkClient  # noqa: PLC0415
         live = bool(self.settings.robinhood_live_enabled)
-        try:
-            token_provider = TokenProvider(self.settings.robinhood_token_path)
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"{exc}\nRun:  uv run python scripts/robinhood_oauth.py"
-            ) from exc
+        tokens_path = Path(self.settings.robinhood_tokens_path).expanduser()
+        mcp_client = None
         if live:
+            if not tokens_path.exists():
+                raise RuntimeError(
+                    f"robinhood_live_enabled=True but no token file at {tokens_path}.\n"
+                    "Run:  uv run python scripts/robinhood_mcp_connect.py"
+                )
+            mcp_client = _McpSdkClient(self.settings.robinhood_mcp_url, str(tokens_path))
             log.warning(
-                "RobinhoodBroker armed for LIVE trading — real money. Ensure the MCP "
-                "tool schema has been verified against list_tools() first."
+                "RobinhoodBroker armed for LIVE trading — real money on agentic account."
             )
         return RobinhoodBroker(
-            token_provider=token_provider,
+            mcp_client=mcp_client,
             mcp_url=self.settings.robinhood_mcp_url,
             live_trading_enabled=live,
         )

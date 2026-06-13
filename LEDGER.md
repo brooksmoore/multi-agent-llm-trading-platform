@@ -116,3 +116,40 @@ The implementation satisfies the DoD "walk-forward CV" structural requirement (n
 **📝 N-2: GROK_HANDOFF_BACKTEST_HARNESS thread is now audit-clean. Per WORKFLOW.md §2 DONE_ convention, this thread is eligible to be renamed `DONE_GROK_HANDOFF_BACKTEST_HARNESS.md`. Auditor renamed accordingly — see next line.**
 
 *Thread renamed to DONE_GROK_HANDOFF_BACKTEST_HARNESS.md per WORKFLOW.md §2.*
+
+---
+
+## Build 003 — 2026-06-13 · Claude (Opus 4.8, builder-on-Grok's-behalf) · Scope: Robinhood live-broker auth + response parsing
+
+**Work:** Solved Robinhood agentic MCP authentication (multi-hour roadblock) and corrected the broker's response parsing against verified live tool shapes.
+
+**Files touched:** `execution/robinhood_broker.py`, `app.py`, `config/settings.py`, `tests/test_robinhood_broker.py`, `tests/test_smoke.py`, `scripts/robinhood_mcp_connect.py` (new), `.gitignore`, `pyproject.toml`/`uv.lock` (+mcp). Deleted: `execution/robinhood_token.py`, `scripts/robinhood_oauth.py`, `scripts/robinhood_probe.py`.
+
+**Reproduce:** `uv run pytest -q` → 761 passing.
+
+---
+
+### ✅ Verified
+
+**✅ V-1: Auth root-caused + fixed via official MCP SDK.**
+Hand-rolled PKCE script could never trigger Robinhood's consent screen — it skipped the MCP `401 → /.well-known discovery → dynamic register → authorize` handshake, so `robinhood.com/oauth` just rendered the Agentic dashboard (logged-in, incognito, and post-disconnect all identical). Switched transport to the `mcp` Python SDK (`OAuthClientProvider` + `streamablehttp_client`). One-time `scripts/robinhood_mcp_connect.py` ran the flow → consent appeared → authorised. Token persisted to `~/.robinhood_mcp_tokens.json` (access ~4d + long-lived refresh).
+
+**✅ V-2: Headless autonomy confirmed.** Reconnect with no browser + SDK auto-refresh verified. `_McpSdkClient` bridges the async SDK into the sync `Broker` via a daemon event loop; runtime redirect/callback handlers raise `BrokerError` so it never opens a browser unattended. Live read-only `get_account`/`list_positions` exercised end-to-end through real broker code.
+
+**✅ V-3: Response-envelope + field bugs fixed against LIVE shapes.** Every RH tool wraps payload in `data` (not `results`). Fixed `get_account` (→ `get_portfolio`: `total_value`/`cash`/nested `buying_power.buying_power`), `list_positions` (`data.positions`), `get_order` + `find_order_by_client_id` (`data.orders`). `_translate_order` filled-qty now reads `cumulative_quantity` (was `filled_quantity`, which does not exist — would have made every fill invisible to the Reconciler on real money) and timestamp `last_transaction_at`. 4 new offline tests with canned real-shape responses.
+
+---
+
+### 🔴 Open
+
+**🔴 O-1 (task_4baf2497 follow-on): `BrokerPosition.current_price` = 0.** `get_equity_positions` carries no market price; live valuation/PnL needs `get_equity_quotes`. Affects dashboard valuation, NOT reconciliation (qty is correct). `TODO` marked in `_translate_position`.
+
+---
+
+### 📝 Notes
+
+**📝 N-1: Agentic account is a CASH account** (981398050) — no PDT concept, so `pattern_day_trader=False`/`daytrade_count=0` are correct constants, not placeholders. Personal margin account 891728651 must never receive bot orders.
+
+**📝 N-2: Shared generic OAuth client** ("Robinhood Trading", one grant slot per account). If the user reconnects Claude Desktop to RH it may contend for the grant — leave Claude Desktop disconnected so the bot owns it.
+
+**📝 N-3: Still UNFUNDED.** All live calls returned zeros (accurate). Fund 981398050 before flipping `ROBINHOOD_LIVE_ENABLED=true`. Verify funded `get_portfolio` balances populate, then run a tiny live test.
