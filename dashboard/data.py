@@ -459,7 +459,8 @@ class DashboardData:
         try:
             latest = conn.execute(
                 "SELECT ts, total_nav FROM equity_snapshots "
-                "WHERE total_nav IS NOT NULL ORDER BY ts DESC LIMIT 1"
+                "WHERE total_nav IS NOT NULL AND CAST(total_nav AS REAL) > 0 "
+                "ORDER BY ts DESC LIMIT 1"
             ).fetchone()
             if latest is None:
                 return (None, None)
@@ -467,7 +468,8 @@ class DashboardData:
             today_prefix = str(latest[0])[:10]
             first = conn.execute(
                 "SELECT total_nav FROM equity_snapshots "
-                "WHERE total_nav IS NOT NULL AND substr(ts,1,10) = ? "
+                "WHERE total_nav IS NOT NULL AND CAST(total_nav AS REAL) > 0 "
+                "AND substr(ts,1,10) = ? "
                 "ORDER BY ts ASC LIMIT 1",
                 (today_prefix,),
             ).fetchone()
@@ -550,7 +552,10 @@ class DashboardData:
         finally:
             conn.close()
         return [
-            NavPoint(ts=ts, total_nav=_as_decimal(nav) if nav is not None else None)
+            # Non-positive NAV (0 from a dry-run/failed get_account) is treated as
+            # missing, not a real datapoint — otherwise it plots as a crash to zero
+            # and wrecks the chart scale. None points are filtered by the API layer.
+            NavPoint(ts=ts, total_nav=_pos_decimal(nav))
             for ts, nav in rows
         ]
 
@@ -885,6 +890,18 @@ class DashboardData:
             )
             for ts, sym, qty, mv in rows
         ]
+
+
+def _pos_decimal(v: Any) -> Decimal | None:
+    """Decimal for a strictly-positive value, else None.
+
+    Used for NAV points: a 0 (dry-run / failed get_account) is 'missing', not a
+    real crash-to-zero datapoint, so it must not plot.
+    """
+    if v is None:
+        return None
+    d = _as_decimal(v)
+    return d if d > 0 else None
 
 
 def _as_decimal(v: Any) -> Decimal:

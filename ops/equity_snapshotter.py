@@ -206,7 +206,18 @@ class EquitySnapshotter:
             if err is not None:
                 log.warning("snapshotter: broker.get_account failed: %s", err)
             elif acct is not None:
-                total_nav = acct.equity
+                # Treat a non-positive broker equity as "unavailable", not a real
+                # data point. A dry-run / unfunded / failed get_account returns 0,
+                # which would otherwise be written verbatim and plot as a NAV crash
+                # to zero (poisoning the chart scale). Leave total_nav None so the
+                # row is skipped by the NAV curve, same as a broker failure.
+                if acct.equity is not None and acct.equity > 0:
+                    total_nav = acct.equity
+                else:
+                    log.warning(
+                        "snapshotter: broker.get_account returned non-positive "
+                        "equity (%s); recording NAV as NULL", acct.equity,
+                    )
 
             positions_result, err = _call_with_timeout(
                 lambda: list(self._broker.list_positions()),  # type: ignore[union-attr]
