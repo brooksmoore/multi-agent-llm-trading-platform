@@ -152,6 +152,15 @@ class EquitySnapshotter:
         self._lot_ledger = lot_ledger
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # Dedup state: skip writing a snapshot when every equity value is
+        # identical to the last row written *and* it falls on the same calendar
+        # day. Snapshots run every ~60s, so closed markets (weekends/overnight)
+        # otherwise produce thousands of frozen, byte-identical rows that bloat
+        # the DB and distort downstream return series. We still anchor at least
+        # one row per calendar day so day-P&L and the daily-resampled Sharpe
+        # always have a point to start from.
+        self._last_row_values: tuple[str | None, ...] | None = None
+        self._last_row_date: str | None = None
         self._init_db()
 
     def _init_db(self) -> None:
@@ -266,13 +275,40 @@ class EquitySnapshotter:
                 log.exception("snapshotter: tracker.get_state(%s) failed", agent_id)
                 sleeves[agent_id] = (Decimal("0"), Decimal("0"))
 
+        # ── Skip byte-identical rows on the same calendar day (dedup). ────────
+        # The equity row's value columns fully determine whether anything
+        # changed; position market values derive from the same marks, so when
+        # the equity values are unchanged the position rows are too.
+        row_values = self._equity_row_values(total_nav, sleeves)
+        row_date = ts[:10]
+        if row_values == self._last_row_values and row_date == self._last_row_date:
+            return
+
         # ── Per-agent position rows (historical attribution) ──────────────────
         agent_pos_rows = self._build_agent_position_rows(ts, marks)
 
         try:
             self._write_rows(ts, total_nav, sleeves, positions_rows, agent_pos_rows)
+            self._last_row_values = row_values
+            self._last_row_date = row_date
         except Exception:
             log.exception("snapshotter: write failed")
+
+    @staticmethod
+    def _equity_row_values(
+        total_nav: Decimal | None,
+        sleeves: dict[AgentId, tuple[Decimal, Decimal]],
+    ) -> tuple[str | None, ...]:
+        """The equity_snapshots value columns as written, for dedup comparison."""
+        haiku_eq, haiku_pk = sleeves.get(AgentId.HAIKU, (Decimal("0"), Decimal("0")))
+        sonnet_eq, sonnet_pk = sleeves.get(AgentId.SONNET, (Decimal("0"), Decimal("0")))
+        opus_eq, opus_pk = sleeves.get(AgentId.OPUS, (Decimal("0"), Decimal("0")))
+        mgr_eq, mgr_pk = sleeves.get(AgentId.MANAGER, (Decimal("0"), Decimal("0")))
+        return (
+            str(total_nav) if total_nav is not None else None,
+            str(haiku_eq), str(sonnet_eq), str(opus_eq), str(mgr_eq),
+            str(haiku_pk), str(sonnet_pk), str(opus_pk), str(mgr_pk),
+        )
 
     def _build_agent_position_rows(
         self,
@@ -410,6 +446,18 @@ class EquitySnapshotter:
                 # If we don't commit first and the checkpoint then fails, the
                 # whole transaction is lost and the prune effectively no-ops.
                 conn.commit()
+                # Deletes leave free pages behind; the file never shrinks on its
+                # own (no auto_vacuum). Reclaim them with VACUUM, but only when
+                # there's a meaningful amount to recover — VACUUM rewrites the
+                # entire file and briefly locks it, so we don't want to pay that
+                # on every prune. ~16MB (4096B * 4000 pages) is the threshold.
+                freelist = conn.execute("PRAGMA freelist_count").fetchone()
+                if freelist is not None and int(freelist[0]) > 4000:
+                    conn.execute("VACUUM")
+                    log.info(
+                        "EquitySnapshotter: VACUUM reclaimed %d free pages",
+                        int(freelist[0]),
+                    )
             finally:
                 conn.close()
             log.info("EquitySnapshotter: pruned old snapshots (7d full / 7-30d 5-min / >30d dropped)")

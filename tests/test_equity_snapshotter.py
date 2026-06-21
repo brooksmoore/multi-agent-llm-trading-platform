@@ -326,3 +326,34 @@ def test_agent_position_snapshot_null_mark_when_missing(tmp_path: Path) -> None:
 
     assert len(rows) == 1
     assert rows[0] == (None, None, None)
+
+
+def _count_equity_rows(db_path: Path) -> int:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM equity_snapshots").fetchone()[0])
+    finally:
+        conn.close()
+
+
+def test_identical_ticks_same_day_are_deduped(tmp_path: Path) -> None:
+    """Frozen markets produce byte-identical snapshots every ~60s; only the
+    first should be persisted. A value change writes a new row, and a new
+    calendar day always anchors a row even when nothing moved."""
+    _, _, broker, snap = _build(tmp_path)
+    db = tmp_path / "equity.db"
+
+    # Three identical ticks on the same day → one row.
+    snap.tick_once(now=datetime(2026, 5, 4, 16, 0, tzinfo=UTC))
+    snap.tick_once(now=datetime(2026, 5, 4, 16, 1, tzinfo=UTC))
+    snap.tick_once(now=datetime(2026, 5, 4, 16, 2, tzinfo=UTC))
+    assert _count_equity_rows(db) == 1
+
+    # NAV changes → new row.
+    broker.account_equity = Decimal("100500")
+    snap.tick_once(now=datetime(2026, 5, 4, 16, 3, tzinfo=UTC))
+    assert _count_equity_rows(db) == 2
+
+    # Same values but a new calendar day → anchor row still written.
+    snap.tick_once(now=datetime(2026, 5, 5, 13, 30, tzinfo=UTC))
+    assert _count_equity_rows(db) == 3

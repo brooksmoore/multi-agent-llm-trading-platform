@@ -621,28 +621,38 @@ class DashboardData:
         rf_daily = rf_annual / 252.0
 
         equity_col = f"{agent_short_id.lower()}_equity"
-        series: list[float] = []
+        # Resample the per-minute snapshot stream down to ONE observation per
+        # calendar day (the last positive equity recorded that day). Snapshots
+        # are written every ~60s, so the raw stream is dominated by frozen,
+        # zero-return rows (weekends, overnight, idle minutes). Feeding those
+        # straight into the return series deflates volatility toward zero and
+        # drags mean-excess negative via the per-row risk-free subtraction,
+        # which manufactured wildly negative Sharpe/Sortino even for sleeves up
+        # on the period. Daily returns also make the sqrt(252) annualization
+        # below correct (it assumes one observation per trading day).
+        daily: dict[str, float] = {}
         conn = self._open_snapshot_ro()
         if conn is not None:
             try:
                 cutoff = (datetime.now(UTC) - timedelta(days=28)).isoformat()
                 rows = conn.execute(
-                    f"SELECT {equity_col} FROM equity_snapshots "
+                    f"SELECT ts, {equity_col} FROM equity_snapshots "
                     f"WHERE ts >= ? AND {equity_col} IS NOT NULL "
                     f"ORDER BY ts ASC",
                     (cutoff,),
                 ).fetchall()
-                for (raw,) in rows:
+                for ts_raw, raw in rows:
                     try:
                         v = float(_as_decimal(raw))
                     except Exception:
                         continue
                     if v > 0:
-                        series.append(v)
+                        daily[str(ts_raw)[:10]] = v
             except sqlite3.Error:
                 pass
             finally:
                 conn.close()
+        series: list[float] = [daily[day] for day in sorted(daily)]
 
         # Daily returns from successive equity points.
         rets = [

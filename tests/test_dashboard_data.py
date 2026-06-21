@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -312,3 +312,50 @@ def test_budget_reset_if_new_day_does_not_break_dashboard(budget: BudgetLedger) 
     budget.reset_if_new_day(date(2026, 5, 1))
     s = DashboardData(budget=budget).spend_breakdown()
     assert s.today_total == Decimal("0")
+
+
+def test_agent_performance_resamples_per_minute_snapshots_to_daily(
+    tmp_path: Path,
+) -> None:
+    """Regression: Sharpe/Sortino must be computed on daily returns, not the
+    raw per-minute snapshot stream. The snapshotter writes a row every ~60s, so
+    most rows are frozen, zero-return duplicates (weekends/overnight/idle). The
+    old code fed those straight into the return series and annualized with
+    sqrt(252), which deflated volatility and dragged mean-excess negative — a
+    sleeve whose equity rose every single day still scored a negative Sharpe.
+    Here equity steps strictly UP each day; a correct daily resample must
+    therefore report a positive Sharpe."""
+    import sqlite3
+
+    db = tmp_path / "equity_snapshots.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE equity_snapshots ("
+        "ts TEXT NOT NULL, total_nav TEXT, haiku_equity TEXT, "
+        "sonnet_equity TEXT, opus_equity TEXT, manager_equity TEXT, "
+        "haiku_peak TEXT, sonnet_peak TEXT, opus_peak TEXT, manager_peak TEXT)"
+    )
+    # Anchor inside the 28-day lookback window relative to "now".
+    start = datetime.now(UTC) - timedelta(days=12)
+    rows = []
+    for day in range(10):  # 10 calendar days, monotonically rising equity
+        equity = 30000.0 + day * 50.0
+        day_start = (start + timedelta(days=day)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        for minute in range(60):  # 60 identical (zero-return) rows per day
+            ts = (day_start + timedelta(minutes=minute)).isoformat()
+            rows.append((ts, str(equity)))
+    conn.executemany(
+        "INSERT INTO equity_snapshots (ts, haiku_equity) VALUES (?, ?)", rows
+    )
+    conn.commit()
+    conn.close()
+
+    perf = DashboardData(snapshot_db_path=db).agent_performance("haiku")
+    # Monotonically rising equity => strictly positive Sharpe/Sortino.
+    assert perf.sharpe_4w is not None and perf.sharpe_4w > 0
+    # No down days at all => Sortino has no downside samples => None.
+    assert perf.sortino_4w is None
+    # No drawdown on a monotonic series.
+    assert perf.max_dd_4w == 0.0

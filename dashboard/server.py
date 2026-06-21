@@ -97,6 +97,24 @@ def build_app(data: DashboardData, spy: SPYProvider | None = None) -> Flask:
                     ap["drawdown_pct"] = dd.drawdown_pct
                     ap["drawdown_bucket"] = dd.bucket
 
+        # Reconciliation: the leaderboard ranks on per-sleeve attributed equity
+        # (independent tracker accounting), while total_nav is the broker's
+        # authoritative account equity. The two drift as fees/dividends/mark
+        # timing/orphaned lots accumulate; surfacing the residual keeps the
+        # rankings honest instead of silently trusting the richer number.
+        sleeve_sum = 0.0
+        have_sleeve = False
+        for ap in agents_payload:
+            eq = ap.get("sleeve_equity_live")
+            if eq is None:
+                eq = ap.get("sleeve_equity")
+            if eq is not None:
+                sleeve_sum += float(eq)
+                have_sleeve = True
+        recon_residual: float | None = None
+        if have_sleeve and ts.total_nav is not None:
+            recon_residual = sleeve_sum - float(ts.total_nav)
+
         positions = [
             {
                 "symbol": p.symbol,
@@ -138,6 +156,8 @@ def build_app(data: DashboardData, spy: SPYProvider | None = None) -> Flask:
                     "regime": ts.regime_label,
                     "vix_bucket": ts.vix_bucket,
                     "heartbeat_age_s": ts.heartbeat_age_s,
+                    "sleeve_sum": sleeve_sum if have_sleeve else None,
+                    "recon_residual": recon_residual,
                 },
                 "agents": agents_payload,
                 "positions": positions,
@@ -497,6 +517,7 @@ _HTML = r"""<!doctype html>
       <div class="label">NAV</div>
       <div class="big num" id="nav">—</div>
       <div class="sub"><span id="nav-status" class="pill dim">—</span> · regime: <span id="regime">—</span></div>
+      <div class="sub" id="recon" style="display:none"></div>
     </div>
     <div class="card">
       <div class="label">Day P&amp;L</div>
@@ -750,6 +771,21 @@ function renderTop(t) {
     document.getElementById('day-pnl-pct').textContent = fmtPct(pct, true);
   } else {
     document.getElementById('day-pnl-pct').textContent = '—';
+  }
+  // Reconciliation residual: sleeve-attributed sum vs broker NAV. Surfaced
+  // only when it exceeds $1 so the leaderboard's ranking equity stays honest.
+  const recon = document.getElementById('recon');
+  if (t.recon_residual !== null && t.recon_residual !== undefined
+      && Math.abs(t.recon_residual) >= 1) {
+    const sign = t.recon_residual > 0 ? '+' : '−';
+    const pct = (t.total_nav && t.total_nav > 0)
+      ? ' (' + fmtPct(Math.abs(t.recon_residual) / t.total_nav) + ')' : '';
+    recon.textContent = '⚠ sleeves ' + sign + fmtUsd(Math.abs(t.recon_residual))
+      + pct + ' vs broker NAV';
+    recon.style.color = 'var(--warn, #d9a441)';
+    recon.style.display = '';
+  } else {
+    recon.style.display = 'none';
   }
   const status = document.getElementById('nav-status');
   if (t.halted) { status.className = 'pill halt'; status.textContent = 'HALTED'; }

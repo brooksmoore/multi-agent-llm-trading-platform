@@ -3,15 +3,15 @@
 > Standardized header. Keep these fields at the very top, always current.
 > Detailed history lives in `blueprint/` and the `CLAUDE_CODE_*_HANDOFF.md` files. This file is the at-a-glance map.
 
-- **One-liner:** Four Claude models (Haiku/Sonnet/Opus + non-trading Manager) each run a $1K Alpaca paper sleeve; LLMs set target weights, Python sets every dollar and clears every risk check. Goal: beat SPY net of taxes + API costs, ≤ $1/day spend.
+- **One-liner:** Four Claude models — Haiku/Sonnet/Opus each on a $30K Alpaca paper sleeve plus a $10K non-trading Manager reserve (~$100K total book); LLMs set target weights, Python sets every dollar and clears every risk check. Goal: beat SPY net of taxes + API costs, ≤ $1/day spend.
 - **Stage:** paper-validating
 - **Live gate:** OFF (never flipped)
-- **Tests:** 761 passing (Robinhood broker 14 incl. live-shape envelope parsing, log rate-limiter 4, opus book-building 2, dashboard, calibration, lifecycle + all prior suites; CL-1 gate auditor-owned)
+- **Tests:** 763 passing (dashboard Sharpe daily-resample regression +1, snapshot dedup +1; Robinhood broker 14 incl. live-shape envelope parsing, log rate-limiter 4, opus book-building 2, dashboard, calibration, lifecycle + all prior suites; CL-1 gate auditor-owned)
 - **Intelligence type:** Full LLM reasoning, heavily fenced (cognitive diversity across model sizes).
 - **Single most important next thing:** Fund agentic account 981398050. Staying on Alpaca paper until then (Robinhood dry-run can't mark orphaned Alpaca positions → broken dashboard equity; decided 2026-06-13). At funding: reset books → BROKER_KIND=robinhood + ROBINHOOD_LIVE_ENABLED=true for a clean live cutover. RH adapter built, OAuth solved (MCP SDK, token ~/.robinhood_mcp_tokens.json), response parsing fixed + verified read-only.
 - **Honest odds this makes money:** 20–30% to beat SPY over 12 months (per `blueprint/01_HONEST_ASSESSMENT.md`). Worth building as a research instrument regardless.
 - **Security posture:** Secrets gitignored (.env/.pem/.key, 2026-06-07). Least-agency is the core strength (LLMs set weights only, Python sets dollars, RiskGate un-bypassable). XML tag spoofing closed (CL-5 ext, 2026-06-12). See `DEFINITION_OF_DONE.md`.
-- **Last updated:** 2026-06-12
+- **Last updated:** 2026-06-21
 
 ---
 
@@ -19,6 +19,7 @@
 `idea → skeleton → core-done → runner-wiring → paper-validating → live-gated → live`
 
 ## Recent movement
+- 2026-06-21 (Audit 003): Dashboard audit. **Fixed real Sharpe/Sortino methodology bug** — `agent_performance()` computed returns on the per-minute snapshot stream (~40% frozen zero-return rows from weekends/overnight/dupes) then annualized with sqrt(252) as if daily, manufacturing negative risk-adjusted returns for every sleeve despite positive equity. Now resamples to one obs/calendar-day before computing returns (`dashboard/data.py`). Post-fix Sharpe: Haiku +0.04, Sonnet +0.77, Opus −2.37 (vs buggy −0.92 / −1.54 / −4.07). Opus stays negative — honest (bleeding open positions, N=0 closed trades). Fixed stale one-liner ($1K → $30K sleeves, ~$100K book). **Also shipped:** (1) NAV reconciliation residual now surfaced on the dashboard — sleeve-attributed sum ($102,192.59) vs broker `total_nav` ($101,932.23) = +$260.35 (0.26%) drift rendered as a warning under NAV when |residual|≥$1 (`dashboard/server.py`); keeps leaderboard ranking honest. Root cause is design-level: tracker accounting (fees/divs/mark-timing/orphaned lots) runs richer than Alpaca account equity. (2) Snapshotter DB bloat fixed — `tick_once` now dedups byte-identical rows on the same calendar day (anchors ≥1 row/day) so frozen weekends/overnight stop writing thousands of duplicates; `prune_old_snapshots` now VACUUMs when freelist >4000 pages (~16MB). `equity_snapshots.db` was 104MB. 763 tests passing (+2: daily-resample regression, snapshot dedup; residual path verified via Flask test client). Note: `test_llm_cache` is order-dependent/flaky under random test ordering (pre-existing, unrelated to these changes — passes in isolation and with `-p no:randomly`).
 - 2026-06-07: Portfolio review baseline established. Highest ceiling / highest variance / most expensive to run.
 - 2026-06-07: Security pass — gitignore hardened (.env/.pem/.key); DEFINITION_OF_DONE.md added. Flagged: news/EDGAR adapters need a prompt-injection handoff (model on hood_agent_1's) before live.
 - 2026-06-07: Backtest harness advanced (Sonnet rules baseline with identical 12-1 mom signal math, fail-before TDD tests, deflated SR + walk-forward scaffold in engine, CL-1 "no conviction leaks to sizer" gate). Per STATUS + cross-learning handoff. Tests green on touched modules; no invariants or live gates touched.
